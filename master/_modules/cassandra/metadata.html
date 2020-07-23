@@ -2600,7 +2600,7 @@
             <span class="n">triggers_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">triggers_success</span><span class="p">,</span> <span class="n">triggers_result</span><span class="p">)</span>
             <span class="c1"># in_memory property is stored in scylla private table</span>
             <span class="c1"># add it to table properties if enabled</span>
-            <span class="n">scylla_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">scylla_success</span><span class="p">,</span> <span class="n">scylla_result</span><span class="p">)</span>
+            <span class="n">scylla_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">scylla_success</span><span class="p">,</span> <span class="n">scylla_result</span><span class="p">,</span> <span class="n">expected_failures</span><span class="o">=</span><span class="p">(</span><span class="n">InvalidRequest</span><span class="p">,))</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">scylla_result</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;in_memory&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="kc">True</span><span class="p">:</span>
                     <span class="n">table_result</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;in_memory&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
@@ -2788,7 +2788,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">aggregates_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">aggregates_success</span><span class="p">,</span> <span class="n">aggregates_result</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">indexes_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">indexes_success</span><span class="p">,</span> <span class="n">indexes_result</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">views_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">views_success</span><span class="p">,</span> <span class="n">views_result</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">scylla_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">scylla_success</span><span class="p">,</span> <span class="n">scylla_result</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">scylla_result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_handle_results</span><span class="p">(</span><span class="n">scylla_success</span><span class="p">,</span> <span class="n">scylla_result</span><span class="p">,</span> <span class="n">expected_failures</span><span class="o">=</span><span class="p">(</span><span class="n">InvalidRequest</span><span class="p">,))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_aggregate_results</span><span class="p">()</span>
 
@@ -3470,6 +3470,8 @@
 			latest
 		
 	</a></li>
+        <li><a href="../../../3.22.0-scylla/index.html">3.22.0</a></li>
+        <li><a href="../../../3.21.0-scylla/index.html">3.21.0</a></li>
     </ul>
 </div>
             
