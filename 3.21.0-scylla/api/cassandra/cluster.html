@@ -319,12 +319,12 @@ If set &lt;= 0, the driver will bypass schema agreement waits altogether.</p>
 
 <dl class="attribute">
 <dt id="cassandra.cluster.Cluster.connection_class">
-<code class="sig-name descname">connection_class</code><em class="property"> = &lt;class 'cassandra.io.libevreactor.LibevConnection'&gt;</em><a class="headerlink" href="#cassandra.cluster.Cluster.connection_class" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">connection_class</code><em class="property"> = &lt;class 'cassandra.io.asyncorereactor.AsyncoreConnection'&gt;</em><a class="headerlink" href="#cassandra.cluster.Cluster.connection_class" title="Permalink to this definition">¶</a></dt>
 <dd><p>This determines what event loop system will be used for managing
 I/O with Cassandra.  These are the current options:</p>
 <ul class="simple">
 <li><p><a class="reference internal" href="io/asyncorereactor.html#cassandra.io.asyncorereactor.AsyncoreConnection" title="cassandra.io.asyncorereactor.AsyncoreConnection"><code class="xref py py-class docutils literal notranslate"><span class="pre">cassandra.io.asyncorereactor.AsyncoreConnection</span></code></a></p></li>
-<li><p><a class="reference internal" href="io/libevreactor.html#cassandra.io.libevreactor.LibevConnection" title="cassandra.io.libevreactor.LibevConnection"><code class="xref py py-class docutils literal notranslate"><span class="pre">cassandra.io.libevreactor.LibevConnection</span></code></a></p></li>
+<li><p><code class="xref py py-class docutils literal notranslate"><span class="pre">cassandra.io.libevreactor.LibevConnection</span></code></p></li>
 <li><p><a class="reference internal" href="io/eventletreactor.html#cassandra.io.eventletreactor.EventletConnection" title="cassandra.io.eventletreactor.EventletConnection"><code class="xref py py-class docutils literal notranslate"><span class="pre">cassandra.io.eventletreactor.EventletConnection</span></code></a> (requires monkey-patching - see doc for details)</p></li>
 <li><p><a class="reference internal" href="io/geventreactor.html#cassandra.io.geventreactor.GeventConnection" title="cassandra.io.geventreactor.GeventConnection"><code class="xref py py-class docutils literal notranslate"><span class="pre">cassandra.io.geventreactor.GeventConnection</span></code></a> (requires monkey-patching - see doc for details)</p></li>
 <li><p><a class="reference internal" href="io/twistedreactor.html#cassandra.io.twistedreactor.TwistedConnection" title="cassandra.io.twistedreactor.TwistedConnection"><code class="xref py py-class docutils literal notranslate"><span class="pre">cassandra.io.twistedreactor.TwistedConnection</span></code></a></p></li>
