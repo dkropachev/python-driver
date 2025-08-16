@@ -16,6 +16,7 @@ from __future__ import absolute_import  # to enable import io from stdlib
 from collections import namedtuple
 import logging
 import socket
+from typing import Optional
 from uuid import UUID
 
 import io
@@ -42,6 +43,7 @@ from cassandra.policies import ColDesc
 from cassandra import WriteType
 from cassandra.cython_deps import HAVE_CYTHON, HAVE_NUMPY
 from cassandra import util
+from cassandra.protocol_features import ProtocolFeatures
 
 log = logging.getLogger(__name__)
 
@@ -541,11 +543,35 @@ _PAGING_OPTIONS_FLAG = 0x80000000
 
 
 class _QueryMessage(_MessageType):
+    """
+    Represents a query frame sent to the database.
 
+    This message encapsulates all parameters required for executing a query,
+    including consistency settings, paging controls, and metadata options.
+
+    Attributes:
+        query_params: Encoded query parameters or a prepared statement ID with bound values.
+        consistency_level: The desired consistency level for the query.
+        serial_consistency_level: Optional serial consistency level for conditional updates (e.g., LOCAL_SERIAL).
+        fetch_size: Optional number of rows to fetch per page.
+        paging_state: Optional opaque paging state token for continuing from a previous query.
+        timestamp: Optional client-supplied timestamp for the query.
+        skip_meta: Optional flag indicating if result metadata should be skipped in the response.
+        continuous_paging_options: Optional configuration for continuous paging behavior.
+        keyspace: Optional keyspace to associate with the query.
+        can_have_result_metadata: Optional flag indicating if the query is expected to have result metadata.
+
+    When skip_meta is not set to True or False it resolves it the safest way possible.
+    Every protocol before 5 has result metadata invalidation loopholes, when metadata on server
+     and client stays different without client noticing it.
+    To solve this problem for protocol 4 scylla introduced SCYLLA_USE_METADATA_ID feature
+     that allows client spot when result metadata on client divert from server.
+    Read https://github.com/scylladb/scylla-drivers/issues/81 for more details
+    """
     def __init__(self, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
-                 paging_state=None, timestamp=None, skip_meta=False,
-                 continuous_paging_options=None, keyspace=None):
+                 paging_state=None, timestamp=None, skip_meta=None,
+                 continuous_paging_options=None, keyspace=None, can_have_result_metadata: bool = False):
         self.query_params = query_params
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
@@ -555,8 +581,9 @@ class _QueryMessage(_MessageType):
         self.skip_meta = skip_meta
         self.continuous_paging_options = continuous_paging_options
         self.keyspace = keyspace
+        self.can_have_result_metadata = can_have_result_metadata
 
-    def _write_query_params(self, f, protocol_version):
+    def _write_query_params(self, f, protocol_version, protocol_features: ProtocolFeatures):
         write_consistency_level(f, self.consistency_level)
         flags = 0x00
         if self.query_params is not None:
@@ -606,7 +633,12 @@ class _QueryMessage(_MessageType):
                     "Keyspaces may only be set on queries with protocol version "
                     "5 or DSE_V2 or higher. Consider setting Cluster.protocol_version.")
 
-        if self.skip_meta is not None and self.skip_meta:
+        if self.skip_meta:
+            flags |= _SKIP_METADATA_FLAG
+        elif self.skip_meta is None and self.can_have_result_metadata and (protocol_version >= 5 or protocol_features.use_metadata_id):
+            # Skip metadata only when protocol allows to invalidate result metadata properly
+            # i.e. protocol version >= 5 or SCYLLA_USE_METADATA_ID present
+            # Read https://github.com/scylladb/scylla-drivers/issues/81 for more details
             flags |= _SKIP_METADATA_FLAG
 
         if ProtocolVersion.uses_int_query_flags(protocol_version):
@@ -648,9 +680,9 @@ class QueryMessage(_QueryMessage):
         super(QueryMessage, self).__init__(None, consistency_level, serial_consistency_level, fetch_size,
                                            paging_state, timestamp, False, continuous_paging_options, keyspace)
 
-    def send_body(self, f, protocol_version, protocol_features):
+    def send_body(self, f, protocol_version, protocol_features: ProtocolFeatures):
         write_longstring(f, self.query)
-        self._write_query_params(f, protocol_version)
+        self._write_query_params(f, protocol_version, protocol_features)
 
 
 class ExecuteMessage(_QueryMessage):
@@ -659,14 +691,14 @@ class ExecuteMessage(_QueryMessage):
 
     def __init__(self, query_id, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
-                 paging_state=None, timestamp=None, skip_meta=False,
-                 continuous_paging_options=None, result_metadata_id=None):
+                 paging_state=None, timestamp=None, skip_meta=None,
+                 continuous_paging_options=None, result_metadata_id=None, can_have_result_metadata: bool = False):
         self.query_id = query_id
         self.result_metadata_id = result_metadata_id
         super(ExecuteMessage, self).__init__(query_params, consistency_level, serial_consistency_level, fetch_size,
-                                             paging_state, timestamp, skip_meta, continuous_paging_options)
+                                             paging_state, timestamp, skip_meta, continuous_paging_options, can_have_result_metadata=can_have_result_metadata)
 
-    def _write_query_params(self, f, protocol_version):
+    def _write_query_params(self, f, protocol_version, protocol_features: ProtocolFeatures):
         if protocol_version == 1:
             if self.serial_consistency_level:
                 raise UnsupportedOperation(
@@ -682,13 +714,13 @@ class ExecuteMessage(_QueryMessage):
                 write_value(f, param)
             write_consistency_level(f, self.consistency_level)
         else:
-            super(ExecuteMessage, self)._write_query_params(f, protocol_version)
+            super(ExecuteMessage, self)._write_query_params(f, protocol_version, protocol_features)
 
     def send_body(self, f, protocol_version, protocol_features):
         write_string(f, self.query_id)
         if ProtocolVersion.uses_prepared_metadata(protocol_version) or protocol_features.use_metadata_id:
-            write_string(f, self.result_metadata_id)
-        self._write_query_params(f, protocol_version)
+            write_string(f, self.result_metadata_id or "")
+        self._write_query_params(f, protocol_version, protocol_features)
 
 
 CUSTOM_TYPE = object()
@@ -733,6 +765,7 @@ class ResultMessage(_MessageType):
     bind_metadata = None
     pk_indexes = None
     schema_change_event = None
+    result_metadata_id = None
 
     def __init__(self, kind):
         self.kind = kind

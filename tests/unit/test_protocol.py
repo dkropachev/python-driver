@@ -16,6 +16,8 @@ import unittest
 
 from unittest.mock import Mock
 
+import pytest
+
 from cassandra import ProtocolVersion, UnsupportedOperation
 from cassandra.protocol import (
     PrepareMessage, QueryMessage, ExecuteMessage, UnsupportedOperation,
@@ -67,6 +69,26 @@ class MessageTest(unittest.TestCase):
                                (b'\x00\x03',), (b'foo',),
                                (b'\x00\x04',),
                                (b'\x00\x00\x00\x01',), (b'\x00\x00',)])
+
+    def test_execute_metadata_id(self):
+        for protocol, use_metadata_id, can_have_result_metadata in [
+            (4, True, True), (4, True, False), (4, False, True), (4, False, False), (5, True, True), (5, True, False),
+            (5, False, True), (5, False, False)]:
+            print(protocol, use_metadata_id, can_have_result_metadata)
+            message = ExecuteMessage('1', [], 4, can_have_result_metadata=can_have_result_metadata)
+            io = Mock()
+
+            message.send_body(io, protocol, ProtocolFeatures(use_metadata_id=use_metadata_id))
+            self._check_calls(io, [(b'\x00\x01',), (b'1',), (b'\x00\x04',), (b'\x01',), (b'\x00\x00',)])
+
+            io.reset_mock()
+            message.result_metadata_id = 'foo'
+            message.send_body(io, 5, ProtocolFeatures())
+
+            self._check_calls(io, [(b'\x00\x01',), (b'1',),
+                                   (b'\x00\x03',), (b'foo',),
+                                   (b'\x00\x04',),
+                                   (b'\x00\x00\x00\x01',), (b'\x00\x00',)])
 
     def test_query_message(self):
         """

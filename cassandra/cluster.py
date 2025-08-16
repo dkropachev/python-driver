@@ -3111,7 +3111,7 @@ class Session(object):
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
-                skip_meta=bool(prepared_statement.result_metadata),
+                can_have_result_metadata=bool(prepared_statement.result_metadata),
                 continuous_paging_options=continuous_paging_options,
                 result_metadata_id=prepared_statement.result_metadata_id)
         elif isinstance(query, BatchStatement):
