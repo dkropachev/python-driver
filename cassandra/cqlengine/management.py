@@ -16,7 +16,6 @@ from collections import namedtuple
 import json
 import logging
 import os
-import six
 import warnings
 from itertools import product
 
@@ -232,7 +231,7 @@ def _sync_table(model, connection=None):
         except CQLEngineException as ex:
             # 1.2 doesn't return cf names, so we have to examine the exception
             # and ignore if it says the column family already exists
-            if "Cannot add already existing column family" not in six.text_type(ex):
+            if "Cannot add already existing column family" not in str(ex):
                 raise
     else:
         log.debug(format_log_context("sync_table checking existing table %s", keyspace=ks_name, connection=connection), cf_name)
@@ -257,7 +256,7 @@ def _sync_table(model, connection=None):
 
                 continue
 
-            if col.primary_key or col.primary_key:
+            if col.primary_key or col.partition_key:
                 msg = format_log_context("Cannot add primary key '{0}' (with db_field '{1}') to existing table {2}", keyspace=ks_name, connection=connection)
                 raise CQLEngineException(msg.format(model_name, db_name, cf_name))
 
@@ -477,15 +476,23 @@ def _update_options(model, connection=None):
         except KeyError:
             msg = format_log_context("Invalid table option: '%s'; known options: %s", keyspace=ks_name, connection=connection)
             raise KeyError(msg % (name, existing_options.keys()))
-        if isinstance(existing_value, six.string_types):
+        if isinstance(existing_value, str):
             if value != existing_value:
                 update_options[name] = value
         else:
             try:
                 for k, v in value.items():
-                    if existing_value[k] != v:
-                        update_options[name] = value
-                        break
+                    # When creating table with compaction 'class': 'org.apache.cassandra.db.compaction.LeveledCompactionStrategy' in Scylla,
+                    # it will be silently changed to 'class': 'LeveledCompactionStrategy' - same for at least SizeTieredCompactionStrategy,
+                    # probably others too. We need to handle this case here.
+                    if k == 'class' and name == 'compaction':
+                        if existing_value[k] != v and existing_value[k] != v.split('.')[-1]:
+                            update_options[name] = value
+                            break
+                    else:
+                        if existing_value[k] != v:
+                            update_options[name] = value
+                            break
             except KeyError:
                 update_options[name] = value
 

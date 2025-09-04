@@ -18,7 +18,6 @@
 # about the encoded request size. Note that the counts would be available using the internal 'metrics' tracking --
 # this is just demonstrating a way to track a few custom attributes.
 
-from __future__ import print_function
 from cassandra.cluster import Cluster
 from greplin import scales
 
@@ -68,8 +67,8 @@ session = Cluster().connect()
 # attach a listener to this session
 ra = RequestAnalyzer(session)
 
-session.execute("SELECT release_version FROM system.local")
-session.execute("SELECT release_version FROM system.local")
+session.execute("SELECT release_version FROM system.local WHERE key='local'")
+session.execute("SELECT release_version FROM system.local WHERE key='local'")
 
 print(ra)
 # 2 requests (0 errors)

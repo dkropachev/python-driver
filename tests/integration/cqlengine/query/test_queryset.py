@@ -13,10 +13,7 @@
 # limitations under the License.
 from __future__ import absolute_import
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from datetime import datetime
 from uuid import uuid4
@@ -27,7 +24,7 @@ from cassandra.cluster import Session
 from cassandra import InvalidRequest
 from tests.integration.cqlengine.base import BaseCassEngTestCase
 from cassandra.cqlengine.connection import NOT_SET
-import mock
+from unittest import mock
 from cassandra.cqlengine import functions
 from cassandra.cqlengine.management import sync_table, drop_table
 from cassandra.cqlengine.models import Model
@@ -42,7 +39,7 @@ from cassandra.cqlengine import operators
 from cassandra.util import uuid_from_time
 from cassandra.cqlengine.connection import get_session
 from tests.integration import PROTOCOL_VERSION, CASSANDRA_VERSION, greaterthancass20, greaterthancass21, \
-    greaterthanorequalcass30, TestCluster
+    greaterthanorequalcass30, TestCluster, requires_collection_indexes
 from tests.integration.cqlengine import execute_count, DEFAULT_KEYSPACE
 
 
@@ -65,6 +62,7 @@ class TzOffset(tzinfo):
 
 
 class TestModel(Model):
+    __test__ = False
 
     test_id = columns.Integer(primary_key=True)
     attempt_id = columns.Integer(primary_key=True)
@@ -107,6 +105,7 @@ class IndexedCollectionsTestModel(Model):
 
 
 class TestMultiClusteringModel(Model):
+    __test__ = False
 
     one = columns.Integer(primary_key=True)
     two = columns.Integer(primary_key=True)
@@ -387,7 +386,7 @@ class BaseQuerySetUsage(BaseCassEngTestCase):
         drop_table(CustomIndexedTestModel)
         drop_table(TestMultiClusteringModel)
 
-
+@requires_collection_indexes
 class TestQuerySetCountSelectionAndIteration(BaseQuerySetUsage):
 
     @execute_count(2)
@@ -561,7 +560,7 @@ def test_non_quality_filtering():
     num = qa.count()
     assert num == 1, num
 
-
+@requires_collection_indexes
 class TestQuerySetDistinct(BaseQuerySetUsage):
 
     @execute_count(1)
@@ -600,6 +599,7 @@ class TestQuerySetDistinct(BaseQuerySetUsage):
         self.assertEqual(q.count(), 2)
 
 
+@requires_collection_indexes
 class TestQuerySetOrdering(BaseQuerySetUsage):
     @execute_count(2)
     def test_order_by_success_case(self):
@@ -608,7 +608,7 @@ class TestQuerySetOrdering(BaseQuerySetUsage):
         for model, expect in zip(q, expected_order):
             assert model.attempt_id == expect
 
-        q = q.order_by('-attempt_id')
+        q = q.order_by().order_by('-attempt_id')
         expected_order.reverse()
         for model, expect in zip(q, expected_order):
             assert model.attempt_id == expect
@@ -648,6 +648,7 @@ class TestQuerySetOrdering(BaseQuerySetUsage):
         assert [r.three for r in results] == [1, 2, 3, 4, 5]
 
 
+@requires_collection_indexes
 class TestQuerySetSlicing(BaseQuerySetUsage):
 
     @execute_count(1)
@@ -702,6 +703,7 @@ class TestQuerySetSlicing(BaseQuerySetUsage):
             self.assertEqual(model.attempt_id, expect)
 
 
+@requires_collection_indexes
 class TestQuerySetValidation(BaseQuerySetUsage):
 
     def test_primary_key_or_index_must_be_specified(self):
@@ -783,6 +785,7 @@ class TestQuerySetValidation(BaseQuerySetUsage):
         list(CustomIndexedTestModel.objects.filter(test_id=1, description='test'))
 
 
+@requires_collection_indexes
 class TestQuerySetDelete(BaseQuerySetUsage):
 
     @execute_count(9)
@@ -941,6 +944,7 @@ class TestMinMaxTimeUUIDFunctions(BaseCassEngTestCase):
         assert '4' in datas
 
 
+@requires_collection_indexes
 class TestInOperator(BaseQuerySetUsage):
     @execute_count(1)
     def test_kwarg_success_case(self):
@@ -1001,6 +1005,7 @@ class TestInOperator(BaseQuerySetUsage):
 
 
 @greaterthancass20
+@requires_collection_indexes
 class TestContainsOperator(BaseQuerySetUsage):
 
     @execute_count(6)
@@ -1066,6 +1071,7 @@ class TestContainsOperator(BaseQuerySetUsage):
             self.assertEqual(q.count(), 0)
 
 
+@requires_collection_indexes
 class TestValuesList(BaseQuerySetUsage):
 
     @execute_count(2)
@@ -1078,6 +1084,7 @@ class TestValuesList(BaseQuerySetUsage):
         assert item == 10
 
 
+@requires_collection_indexes
 class TestObjectsProperty(BaseQuerySetUsage):
     @execute_count(1)
     def test_objects_property_returns_fresh_queryset(self):
@@ -1108,6 +1115,7 @@ class PageQueryTests(BaseCassEngTestCase):
         assert len(results) == 2
 
 
+@requires_collection_indexes
 class ModelQuerySetTimeoutTestCase(BaseQuerySetUsage):
     def test_default_timeout(self):
         with mock.patch.object(Session, 'execute') as mock_execute:
@@ -1125,6 +1133,7 @@ class ModelQuerySetTimeoutTestCase(BaseQuerySetUsage):
             self.assertEqual(mock_execute.call_args[-1]['timeout'], None)
 
 
+@requires_collection_indexes
 class DMLQueryTimeoutTestCase(BaseQuerySetUsage):
     def setUp(self):
         self.model = TestModel(test_id=1, attempt_id=1, description='timeout test')
@@ -1339,6 +1348,7 @@ class TestModelQueryWithDBField(BaseCassEngTestCase):
         list(DBFieldModel.objects.filter(c0=0, k0=0, k1=0).values_list('c0', 'v0'))
 
 class TestModelSmall(Model):
+    __test__ = False
 
     test_id = columns.Integer(primary_key=True)
 
@@ -1365,11 +1375,21 @@ class TestModelQueryWithFetchSize(BaseCassEngTestCase):
         super(TestModelQueryWithFetchSize, cls).tearDownClass()
         drop_table(TestModelSmall)
 
-    @execute_count(9)
+    @execute_count(19)
     def test_defaultFetchSize(self):
+        # Use smaller batch sizes to avoid hitting the max.  We trigger an InvalidRequest
+        # response for Cassandra 4.1.x and 5.0.x if we just do the whole thing as one
+        # large batch.  We're just using this to populate values for a test, however,
+        # so shifting to smaller batches should be fine.
+        for i in range(0, 5000, 500):
+            with BatchQuery() as b:
+                range_max = i + 500
+                for j in range(i, range_max):
+                    TestModelSmall.batch(b).create(test_id=j)
         with BatchQuery() as b:
-            for i in range(5100):
+            for i in range(5000, 5100):
                 TestModelSmall.batch(b).create(test_id=i)
+
         self.assertEqual(len(TestModelSmall.objects.fetch_size(1)), 5100)
         self.assertEqual(len(TestModelSmall.objects.fetch_size(500)), 5100)
         self.assertEqual(len(TestModelSmall.objects.fetch_size(4999)), 5100)

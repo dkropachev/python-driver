@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from enum import Enum
 import logging
 
 
@@ -22,7 +23,7 @@ class NullHandler(logging.Handler):
 
 logging.getLogger('cassandra').addHandler(NullHandler())
 
-__version_info__ = (3, 25, 0)
+__version_info__ = (3, 29, 3)
 __version__ = '.'.join(map(str, __version_info__))
 
 
@@ -55,7 +56,7 @@ class ConsistencyLevel(object):
 
     QUORUM = 4
     """
-    ``ceil(RF/2)`` replicas must respond to consider the operation a success
+    ``ceil(RF/2) + 1`` replicas must respond to consider the operation a success
     """
 
     ALL = 5
@@ -728,3 +729,39 @@ class UnresolvableContactPoints(DriverException):
     contact points, only when lookup fails for all hosts
     """
     pass
+
+
+class OperationType(Enum):
+    Read = 0
+    Write = 1
+
+
+class RateLimitReached(ConfigurationException):
+    '''
+    Rate limit was exceeded for a partition affected by the request.
+    '''
+    op_type = None
+    rejected_by_coordinator = False
+
+    def __init__(self, op_type=None, rejected_by_coordinator=False):
+        self.op_type = op_type
+        self.rejected_by_coordinator = rejected_by_coordinator
+        message = f"[request_error_rate_limit_reached OpType={op_type.name} RejectedByCoordinator={rejected_by_coordinator}]"
+        Exception.__init__(self, message)
+
+
+class DependencyException(Exception):
+    """
+    Specific exception class for handling issues with driver dependencies
+    """
+
+    excs = []
+    """
+    A sequence of child exceptions
+    """
+
+    def __init__(self, msg, excs=[]):
+        complete_msg = msg
+        if excs:
+            complete_msg += ("\nThe following exceptions were observed: \n - " + '\n - '.join(str(e) for e in excs))
+        Exception.__init__(self, complete_msg)

@@ -15,7 +15,7 @@
 import json
 import subprocess
 import time
-from six.moves.urllib.request import build_opener, Request, HTTPHandler
+from urllib.request import build_opener, Request, HTTPHandler
 
 from cassandra.metadata import SchemaParserV4, SchemaParserDSE68
 
@@ -125,7 +125,7 @@ class SimulacronClient(object):
         if DSE_VERSION:
             system_local_row["dse_version"] = DSE_VERSION.base_version
         column_types = {"cql_version": "ascii", "release_version": "ascii"}
-        system_local = PrimeQuery("SELECT cql_version, release_version FROM system.local",
+        system_local = PrimeQuery("SELECT cql_version, release_version FROM system.local WHERE key='local'",
                                   rows=[system_local_row],
                                   column_types=column_types)
 

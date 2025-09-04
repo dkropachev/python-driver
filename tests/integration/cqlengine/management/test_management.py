@@ -11,12 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
-import mock
+from unittest import mock
 import logging
 from packaging.version import Version
 from cassandra.cqlengine.connection import get_session, get_cluster
@@ -26,14 +23,15 @@ from cassandra.cqlengine.management import _get_table_metadata, sync_table, drop
 from cassandra.cqlengine.models import Model
 from cassandra.cqlengine import columns
 
-from tests.integration import DSE_VERSION, PROTOCOL_VERSION, greaterthancass20, MockLoggingHandler, CASSANDRA_VERSION
+from tests.integration import DSE_VERSION, PROTOCOL_VERSION, greaterthancass20, requires_collection_indexes, \
+    MockLoggingHandler, CASSANDRA_VERSION, SCYLLA_VERSION, xfail_scylla
 from tests.integration.cqlengine.base import BaseCassEngTestCase
 from tests.integration.cqlengine.query.test_queryset import TestModel
 from cassandra.cqlengine.usertype import UserType
 from tests.integration.cqlengine import DEFAULT_KEYSPACE
 
 
-INCLUDE_REPAIR = not CASSANDRA_VERSION >= Version('4-a')  # This should cover DSE 6.0+
+INCLUDE_REPAIR = (not CASSANDRA_VERSION >= Version('4-a')) and SCYLLA_VERSION is None  # This should cover DSE 6.0+
 
 
 class KeyspaceManagementTest(BaseCassEngTestCase):
@@ -257,14 +255,14 @@ class TablePropertiesTests(BaseCassEngTestCase):
 
         table_options = management._get_table_metadata(ModelWithTableProperties).options
 
-        self.assertDictContainsSubset(ModelWithTableProperties.__options__, table_options)
+        self.assertLessEqual(ModelWithTableProperties.__options__.items(), table_options.items())
 
     def test_bogus_option_update(self):
         sync_table(ModelWithTableProperties)
         option = 'no way will this ever be an option'
         try:
             ModelWithTableProperties.__options__[option] = 'what was I thinking?'
-            self.assertRaisesRegexp(KeyError, "Invalid table option.*%s.*" % option, sync_table, ModelWithTableProperties)
+            self.assertRaisesRegex(KeyError, "Invalid table option.*%s.*" % option, sync_table, ModelWithTableProperties)
         finally:
             ModelWithTableProperties.__options__.pop(option, None)
 
@@ -363,21 +361,20 @@ class InconsistentTable(BaseCassEngTestCase):
 
         @test_category object_mapper
         """
-        mock_handler = MockLoggingHandler()
-        logger = logging.getLogger(management.__name__)
-        logger.addHandler(mock_handler)
-        sync_table(BaseInconsistent)
-        sync_table(ChangedInconsistent)
-        self.assertTrue('differing from the model type' in mock_handler.messages.get('warning')[0])
-        if CASSANDRA_VERSION >= Version('2.1'):
-            sync_type(DEFAULT_KEYSPACE, BaseInconsistentType)
-            mock_handler.reset()
-            sync_type(DEFAULT_KEYSPACE, ChangedInconsistentType)
-            self.assertTrue('differing from the model user type' in mock_handler.messages.get('warning')[0])
-        logger.removeHandler(mock_handler)
+        with MockLoggingHandler().set_module_name(management.__name__) as mock_handler:
+            sync_table(BaseInconsistent)
+            sync_table(ChangedInconsistent)
+            self.assertTrue('differing from the model type' in mock_handler.messages.get('warning')[0])
+            if CASSANDRA_VERSION >= Version('2.1'):
+                sync_type(DEFAULT_KEYSPACE, BaseInconsistentType)
+                mock_handler.reset()
+                sync_type(DEFAULT_KEYSPACE, ChangedInconsistentType)
+                self.assertTrue('differing from the model user type' in mock_handler.messages.get('warning')[0])
 
 
 class TestIndexSetModel(Model):
+    __test__ = False
+
     partition = columns.UUID(primary_key=True)
     int_set = columns.Set(columns.Integer, index=True)
     int_list = columns.List(columns.Integer, index=True)
@@ -432,6 +429,8 @@ class IndexTests(BaseCassEngTestCase):
         self.assertIsNotNone(management._get_index_name_by_column(table_meta, 'second_key'))
 
     @greaterthancass20
+    @requires_collection_indexes
+    @xfail_scylla("scylladb/scylladb#22019 - Scylla incorrectly reports target as keys(%s) for sets")
     def test_sync_indexed_set(self):
         """
         Tests that models that have container types with indices can be synced.

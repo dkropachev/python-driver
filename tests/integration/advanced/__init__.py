@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
-from six.moves.urllib.request import build_opener, Request, HTTPHandler
+from urllib.request import build_opener, Request, HTTPHandler
 import re
 import os
 import time

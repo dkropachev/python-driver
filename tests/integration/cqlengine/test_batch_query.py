@@ -13,7 +13,7 @@
 # limitations under the License.
 import warnings
 
-import sure
+import pytest
 
 from cassandra.cqlengine import columns
 from cassandra.cqlengine.management import drop_table, sync_table
@@ -21,9 +21,11 @@ from cassandra.cqlengine.models import Model
 from cassandra.cqlengine.query import BatchQuery
 from tests.integration.cqlengine.base import BaseCassEngTestCase
 
-from mock import patch
+from unittest.mock import patch
 
 class TestMultiKeyModel(Model):
+    __test__ = False
+
     partition   = columns.Integer(primary_key=True)
     cluster     = columns.Integer(primary_key=True)
     count       = columns.Integer(required=False)
@@ -217,13 +219,13 @@ class BatchQueryCallbacksTests(BaseCassEngTestCase):
         def my_callback(*args, **kwargs):
             call_history.append(args)
 
-        with warnings.catch_warnings(record=True) as w:
+        with pytest.warns() as w:
             with BatchQuery() as batch:
                 batch.add_callback(my_callback)
                 batch.execute()
             batch.execute()
         self.assertEqual(len(w), 2)  # package filter setup to warn always
-        self.assertRegexpMatches(str(w[0].message), r"^Batch.*multiple.*")
+        self.assertRegex(str(w[0].message), r"^Batch.*multiple.*")
 
     def test_disable_multiple_callback_warning(self):
         """
@@ -243,6 +245,7 @@ class BatchQueryCallbacksTests(BaseCassEngTestCase):
 
         with patch('cassandra.cqlengine.query.BatchQuery.warn_multiple_exec', False):
             with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
                 with BatchQuery() as batch:
                     batch.add_callback(my_callback)
                     batch.execute()

@@ -1,3 +1,131 @@
+3.29.3
+======
+Mart 11, 2025
+
+Bug Fixes
+---------
+
+* Fix regression after #443 when _is_gevent_monkey_patched was broken (#452)
+
+Others
+------
+* Fix sync_table to raise error on adding partition key (#433)
+* Upgrade CICD Runners to ubuntu-24.04 (#451)
+* Make connection tests to fail when failed to import connection class from EVENT_LOOP_MANAGER
+
+3.29.2
+======
+September 9, 2024
+
+Features
+--------
+* Convert to pytest for running unit and integration tests (PYTHON-1297)
+* Add support for Cassandra 4.1.x and 5.0 releases to CI (PYTHON-1393)
+* Extend driver vector support to arbitrary subtypes and fix handling of variable length types (PYTHON-1369)
+
+Bug Fixes
+---------
+* Python NumpyProtocolHandler does not work with NumPy 1.24.0 or greater (PYTHON-1359)
+* cibuildwheel appears to not be stripping Cython-generated shared objects (PYTHON-1387)
+* Windows build for Python 3.12 compiled without libev support (PYTHON-1386)
+
+Others
+------
+* Update README.rst with badges for version and license (PR 1210)
+* Remove dependency on old mock external module (PR 1201)
+* Removed future print_function, division, and with and some pre 3.7 handling (PR 1208)
+* Update geomet dependency (PR 1207)
+* Remove problematic escape sequences in some docstrings to avoid SyntaxWarning in Python 3.12 (PR 1205)
+* Use timezone-aware API to avoid deprecated warning (PR 1213)
+
+3.29.1
+======
+March 19, 2024
+
+Bug Fixes
+---------
+* cassandra-driver for Python 3.12 Linux is compiled without libev support (PYTHON-1378)
+* Consider moving to native wheel builds for OS X and removing universal2 wheels (PYTHON-1379)
+
+3.29.0
+======
+December 19, 2023
+
+Features
+--------
+* Add support for Python 3.9 through 3.12, drop support for 3.7 (PYTHON-1283)
+* Removal of dependency on six module (PR 1172)
+* Raise explicit exception when deserializing a vector with a subtype that isn’t a constant size (PYTHON-1371)
+
+Others
+------
+* Remove outdated Python pre-3.7 references (PR 1186)
+* Remove backup(.bak) files (PR 1185)
+* Fix doc typo in add_callbacks (PR 1177)
+
+3.28.0
+======
+June 5, 2023
+
+Features
+--------
+* Add support for vector type (PYTHON-1352)
+* Cryptography module is now an optional dependency (PYTHON-1351)
+
+Bug Fixes
+---------
+* Store IV along with encrypted text when using column-level encryption (PYTHON-1350)
+* Create session-specific protocol handlers to contain session-specific CLE policies (PYTHON-1356)
+
+Others
+------
+* Use Cython for smoke builds (PYTHON-1343)
+* Don't fail when inserting UDTs with prepared queries with some missing fields (PR 1151)
+* Convert print statement to function in docs (PR 1157)
+* Update comment for retry policy (DOC-3278)
+* Added error handling blog reference (DOC-2813)
+
+3.27.0
+======
+May 1, 2023
+
+Features
+--------
+* Add support for client-side encryption (PYTHON-1341)
+
+3.26.0
+======
+March 13, 2023
+
+Features
+--------
+* Add support for execution profiles in execute_concurrent (PR 1122)
+
+Bug Fixes
+---------
+* Handle empty non-final result pages (PR 1110)
+* Do not re-use stream IDs for in-flight requests (PR 1114)
+* Asyncore race condition cause logging exception on shutdown (PYTHON-1266)
+
+Others
+------
+* Fix deprecation warning in query tracing (PR 1103)
+* Remove mutable default values from some tests (PR 1116)
+* Remove dependency on unittest2 (PYTHON-1289)
+* Fix deprecation warnings for asyncio.coroutine annotation in asyncioreactor (PYTHON-1290)
+* Fix typos in source files (PR 1126)
+* HostFilterPolicyInitTest fix for Python 3.11 (PR 1131)
+* Fix for DontPrepareOnIgnoredHostsTest (PYTHON-1287)
+* tests.integration.simulacron.test_connection failures (PYTHON-1304)
+* tests.integration.standard.test_single_interface.py appears to be failing for C* 4.0 (PYTHON-1329)
+* Authentication tests appear to be failing fraudulently (PYTHON-1328)
+* PreparedStatementTests.test_fail_if_different_query_id_on_reprepare() failing unexpectedly (PTYHON-1327)
+* Refactor deprecated unittest aliases for Python 3.11 compatibility (PR 1112)
+
+Deprecations
+------------
+* This release removes support for Python 2.7.x as well as Python 3.5.x and 3.6.x
+
 3.25.0
 ======
 March 18, 2021

@@ -19,8 +19,6 @@ from functools import wraps, partial, total_ordering
 from heapq import heappush, heappop
 import io
 import logging
-import six
-from six.moves import range
 import socket
 import struct
 import sys
@@ -28,12 +26,15 @@ from threading import Thread, Event, RLock, Condition
 import time
 import ssl
 import weakref
+import random
+import itertools
 
+from cassandra.protocol_features import ProtocolFeatures
 
 if 'gevent.monkey' in sys.modules:
     from gevent.queue import Queue, Empty
 else:
-    from six.moves.queue import Queue, Empty  # noqa
+    from queue import Queue, Empty  # noqa
 
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut, ProtocolVersion
 from cassandra.marshal import int32_pack
@@ -108,13 +109,17 @@ else:
         return snappy.decompress(byts)
     locally_supported_compressions['snappy'] = (snappy.compress, decompress)
 
-DRIVER_NAME, DRIVER_VERSION = 'Scylla Python Driver', sys.modules['cassandra'].__version__
+DRIVER_NAME, DRIVER_VERSION = 'ScyllaDB Python Driver', sys.modules['cassandra'].__version__
 
 PROTOCOL_VERSION_MASK = 0x7f
 
 HEADER_DIRECTION_FROM_CLIENT = 0x00
 HEADER_DIRECTION_TO_CLIENT = 0x80
 HEADER_DIRECTION_MASK = 0x80
+
+# shard aware default for opening per shard connection
+DEFAULT_LOCAL_PORT_LOW = 49152
+DEFAULT_LOCAL_PORT_HIGH = 65535
 
 frame_header_v1_v2 = struct.Struct('>BbBi')
 frame_header_v3 = struct.Struct('>BhBi')
@@ -304,16 +309,17 @@ class SniEndPoint(EndPoint):
 
 class SniEndPointFactory(EndPointFactory):
 
-    def __init__(self, proxy_address, port):
+    def __init__(self, proxy_address, port, node_domain=None):
         self._proxy_address = proxy_address
         self._port = port
+        self._node_domain = node_domain
 
     def create(self, row):
         host_id = row.get("host_id")
         if host_id is None:
             raise ValueError("No host_id to create the SniEndPoint")
-
-        return SniEndPoint(self._proxy_address, str(host_id), self._port)
+        address = "{}.{}".format(host_id, self._node_domain) if self._node_domain else str(host_id)
+        return SniEndPoint(self._proxy_address, str(address), self._port)
 
     def create_from_sni(self, sni):
         return SniEndPoint(self._proxy_address, sni, self._port)
@@ -605,12 +611,6 @@ def defunct_on_error(f):
 
 DEFAULT_CQL_VERSION = '3.0.0'
 
-if six.PY3:
-    def int_from_buf_item(i):
-        return i
-else:
-    int_from_buf_item = ord
-
 
 class _ConnectionIOBuffer(object):
     """
@@ -664,6 +664,17 @@ class _ConnectionIOBuffer(object):
             self._cql_frame_buffer.seek(0, 2)  # 2 == SEEK_END
         else:
             self.reset_io_buffer()
+
+
+class ShardawarePortGenerator:
+    @classmethod
+    def generate(cls, shard_id, total_shards):
+        start = random.randrange(DEFAULT_LOCAL_PORT_LOW, DEFAULT_LOCAL_PORT_HIGH)
+        available_ports = itertools.chain(range(start, DEFAULT_LOCAL_PORT_HIGH), range(DEFAULT_LOCAL_PORT_LOW, start))
+
+        for port in available_ports:
+            if port % total_shards == shard_id:
+                yield port
 
 
 class Connection(object):
@@ -741,17 +752,17 @@ class Connection(object):
     _socket = None
 
     _socket_impl = socket
-    _ssl_impl = ssl
 
     _check_hostname = False
     _product_type = None
 
     _owning_pool = None
 
-    shard_id = 0
-    sharding_info = None
-
     _is_checksumming_enabled = False
+
+    _on_orphaned_stream_released = None
+
+    features = None
 
     @property
     def _iobuf(self):
@@ -762,13 +773,13 @@ class Connection(object):
                  ssl_options=None, sockopts=None, compression=True,
                  cql_version=None, protocol_version=ProtocolVersion.MAX_SUPPORTED, is_control_connection=False,
                  user_type_map=None, connect_timeout=None, allow_beta_protocol_version=False, no_compact=False,
-                 ssl_context=None, owning_pool=None):
-
+                 ssl_context=None, owning_pool=None, shard_id=None, total_shards=None,
+                 on_orphaned_stream_released=None):
         # TODO next major rename host to endpoint and remove port kwarg.
         self.endpoint = host if isinstance(host, EndPoint) else DefaultEndPoint(host, port)
 
         self.authenticator = authenticator
-        self.ssl_options = ssl_options.copy() if ssl_options else None
+        self.ssl_options = ssl_options.copy() if ssl_options else {}
         self.ssl_context = ssl_context
         self.sockopts = sockopts
         self.compression = compression
@@ -785,18 +796,23 @@ class Connection(object):
         self._continuous_paging_sessions = {}
         self._socket_writable = True
         self.orphaned_request_ids = set()
-        self._owning_pool = owning_pool
+        self._on_orphaned_stream_released = on_orphaned_stream_released
 
         if ssl_options:
-            self._check_hostname = bool(self.ssl_options.pop('check_hostname', False))
-            if self._check_hostname:
-                if not getattr(ssl, 'match_hostname', None):
-                    raise RuntimeError("ssl_options specify 'check_hostname', but ssl.match_hostname is not provided. "
-                                       "Patch or upgrade Python to use this option.")
             self.ssl_options.update(self.endpoint.ssl_options or {})
         elif self.endpoint.ssl_options:
             self.ssl_options = self.endpoint.ssl_options
 
+        # PYTHON-1331
+        #
+        # We always use SSLContext.wrap_socket() now but legacy configs may have other params that were passed to ssl.wrap_socket()...
+        # and either could have 'check_hostname'.  Remove these params into a separate map and use them to build an SSLContext if
+        # we need to do so.
+        #
+        # Note the use of pop() here; we are very deliberately removing these params from ssl_options if they're present.  After this
+        # operation ssl_options should contain only args needed for the ssl_context.wrap_socket() call.
+        if not self.ssl_context and self.ssl_options:
+            self.ssl_context = self._build_ssl_context_from_options()
 
         if protocol_version >= 3:
             self.max_request_id = min(self.max_in_flight - 1, (2 ** 15) - 1)
@@ -812,6 +828,9 @@ class Connection(object):
 
         self.lock = RLock()
         self.connected_event = Event()
+        self.features = ProtocolFeatures(shard_id=shard_id)
+        self.total_shards = total_shards
+        self.original_endpoint = self.endpoint
 
     @property
     def host(self):
@@ -842,7 +861,7 @@ class Connection(object):
         raise NotImplementedError()
 
     @classmethod
-    def factory(cls, endpoint, timeout, *args, **kwargs):
+    def factory(cls, endpoint, timeout, host_conn = None, *args, **kwargs):
         """
         A factory function which returns connections which have
         succeeded in connecting and are ready for service (or
@@ -851,6 +870,10 @@ class Connection(object):
         start = time.time()
         kwargs['connect_timeout'] = timeout
         conn = cls(endpoint, *args, **kwargs)
+        if host_conn is not None:
+            host_conn._pending_connections.append(conn)
+            if host_conn.is_shutdown:
+                conn.close()
         elapsed = time.time() - start
         conn.connected_event.wait(timeout - elapsed)
         if conn.last_error:
@@ -863,21 +886,66 @@ class Connection(object):
         else:
             return conn
 
+    def _build_ssl_context_from_options(self):
+
+        # Extract a subset of names from self.ssl_options which apply to SSLContext creation
+        ssl_context_opt_names = ['ssl_version', 'cert_reqs', 'check_hostname', 'keyfile', 'certfile', 'ca_certs', 'ciphers']
+        opts = {k:self.ssl_options.get(k, None) for k in ssl_context_opt_names if k in self.ssl_options}
+
+        # Python >= 3.10 requires either PROTOCOL_TLS_CLIENT or PROTOCOL_TLS_SERVER so we'll get ahead of things by always
+        # being explicit
+        ssl_version = opts.get('ssl_version', None) or ssl.PROTOCOL_TLS_CLIENT
+        cert_reqs = opts.get('cert_reqs', None) or ssl.CERT_REQUIRED
+        rv = ssl.SSLContext(protocol=int(ssl_version))
+        rv.check_hostname = bool(opts.get('check_hostname', False))
+        rv.options = int(cert_reqs)
+
+        certfile = opts.get('certfile', None)
+        keyfile = opts.get('keyfile', None)
+        if certfile:
+            rv.load_cert_chain(certfile, keyfile)
+        ca_certs = opts.get('ca_certs', None)
+        if ca_certs:
+            rv.load_verify_locations(ca_certs)
+        ciphers = opts.get('ciphers', None)
+        if ciphers:
+            rv.set_ciphers(ciphers)
+
+        return rv
+
     def _wrap_socket_from_context(self):
-        ssl_options = self.ssl_options or {}
+
+        # Extract a subset of names from self.ssl_options which apply to SSLContext.wrap_socket (or at least the parts
+        # of it that don't involve building an SSLContext under the covers)
+        wrap_socket_opt_names = ['server_side', 'do_handshake_on_connect', 'suppress_ragged_eofs', 'server_hostname']
+        opts = {k:self.ssl_options.get(k, None) for k in wrap_socket_opt_names if k in self.ssl_options}
+
         # PYTHON-1186: set the server_hostname only if the SSLContext has
         # check_hostname enabled and it is not already provided by the EndPoint ssl options
-        if (self.ssl_context.check_hostname and
-                'server_hostname' not in ssl_options):
-            ssl_options = ssl_options.copy()
-            ssl_options['server_hostname'] = self.endpoint.address
-        self._socket = self.ssl_context.wrap_socket(self._socket, **ssl_options)
+        #opts['server_hostname'] = self.endpoint.address
+        if (self.ssl_context.check_hostname and 'server_hostname' not in opts):
+            server_hostname = self.endpoint.address
+            opts['server_hostname'] = server_hostname
+
+        return self.ssl_context.wrap_socket(self._socket, **opts)
 
     def _initiate_connection(self, sockaddr):
+        if self.features.shard_id is not None:
+            for port in ShardawarePortGenerator.generate(self.features.shard_id, self.total_shards):
+                try:
+                    self._socket.bind(('', port))
+                    break
+                except Exception as ex:
+                    log.debug("port=%d couldn't bind cause: %s", port, str(ex))
+            log.debug('connection (%r) port=%d should be shard_id=%d', id(self), port, port % self.total_shards)
+
         self._socket.connect(sockaddr)
 
-    def _match_hostname(self):
-        ssl.match_hostname(self._socket.getpeercert(), self.endpoint.address)
+    # PYTHON-1331
+    #
+    # Allow implementations specific to an event loop to add additional behaviours
+    def _validate_hostname(self):
+        pass
 
     def _get_socket_addresses(self):
         address, port = self.endpoint.resolve()
@@ -894,20 +962,26 @@ class Connection(object):
     def _connect_socket(self):
         sockerr = None
         addresses = self._get_socket_addresses()
+        port = None
         for (af, socktype, proto, _, sockaddr) in addresses:
             try:
                 self._socket = self._socket_impl.socket(af, socktype, proto)
                 if self.ssl_context:
-                    self._wrap_socket_from_context()
-                elif self.ssl_options:
-                    if not self._ssl_impl:
-                        raise RuntimeError("This version of Python was not compiled with SSL support")
-                    self._socket = self._ssl_impl.wrap_socket(self._socket, **self.ssl_options)
+                    self._socket = self._wrap_socket_from_context()
                 self._socket.settimeout(self.connect_timeout)
                 self._initiate_connection(sockaddr)
                 self._socket.settimeout(None)
+
+                local_addr = self._socket.getsockname()
+                log.debug("Connection %s: '%s' -> '%s'", id(self), local_addr, sockaddr)
+
+                # PYTHON-1331
+                #
+                # Most checking is done via the check_hostname param on the SSLContext.
+                # Subclasses can add additional behaviours via _validate_hostname() so
+                # run that here.
                 if self._check_hostname:
-                    self._match_hostname()
+                    self._validate_hostname()
                 sockerr = None
                 break
             except socket.error as err:
@@ -1036,7 +1110,7 @@ class Connection(object):
         # queue the decoder function with the request
         # this allows us to inject custom functions per request to encode, decode messages
         self._requests[request_id] = (cb, decoder, result_metadata)
-        msg = encoder(msg, request_id, self.protocol_version, compressor=self.compressor,
+        msg = encoder(msg, request_id, self.protocol_version, self.features, compressor=self.compressor,
                       allow_beta_protocol_version=self.allow_beta_protocol_version)
 
         if self._is_checksumming_enabled:
@@ -1125,7 +1199,7 @@ class Connection(object):
         buf = self._io_buffer.cql_frame_buffer.getvalue()
         pos = len(buf)
         if pos:
-            version = int_from_buf_item(buf[0]) & PROTOCOL_VERSION_MASK
+            version = buf[0] & PROTOCOL_VERSION_MASK
             if version not in ProtocolVersion.SUPPORTED_VERSIONS:
                 raise ProtocolError("This version of the driver does not support protocol version %d" % version)
             frame_header = frame_header_v3 if version >= 3 else frame_header_v1_v2
@@ -1216,8 +1290,8 @@ class Connection(object):
                         self.in_flight -= 1
                         self.orphaned_request_ids.remove(stream_id)
                         need_notify_of_release = True
-                if need_notify_of_release and self._owning_pool:
-                    self._owning_pool.on_orphaned_stream_released()
+                if need_notify_of_release and self._on_orphaned_stream_released:
+                    self._on_orphaned_stream_released()
 
                 try:
                     callback, decoder, result_metadata = self._requests.pop(stream_id)
@@ -1229,7 +1303,7 @@ class Connection(object):
                     return
 
         try:
-            response = decoder(header.version, self.user_type_map, stream_id,
+            response = decoder(header.version, self.features, self.user_type_map, stream_id,
                                header.flags, header.opcode, body, self.decompressor, result_metadata)
         except Exception as exc:
             log.exception("Error decoding response from Cassandra. "
@@ -1284,7 +1358,7 @@ class Connection(object):
 
     @defunct_on_error
     def _handle_options_response(self, options_response):
-        self.shard_id, self.sharding_info = ShardingInfo.parse_sharding_info(options_response)
+        self.features = ProtocolFeatures.parse_from_supported(options_response.options)
         if self.is_defunct:
             return
 
@@ -1303,6 +1377,9 @@ class Connection(object):
         supported_cql_versions = options_response.cql_versions
         remote_supported_compressions = options_response.options['COMPRESSION']
         self._product_type = options_response.options.get('PRODUCT_TYPE', [None])[0]
+
+        options = {}
+        self.features.add_startup_options(options)
 
         if self.cql_version:
             if self.cql_version not in supported_cql_versions:
@@ -1325,7 +1402,7 @@ class Connection(object):
                           remote_supported_compressions)
             else:
                 compression_type = None
-                if isinstance(self.compression, six.string_types):
+                if isinstance(self.compression, str):
                     # the user picked a specific compression type ('snappy' or 'lz4')
                     if self.compression not in remote_supported_compressions:
                         raise ProtocolError(
@@ -1354,13 +1431,14 @@ class Connection(object):
                     self._compressor, self.decompressor = \
                         locally_supported_compressions[compression_type]
 
-        self._send_startup_message(compression_type, no_compact=self.no_compact)
+        self._send_startup_message(compression_type, no_compact=self.no_compact, extra_options=options)
 
     @defunct_on_error
-    def _send_startup_message(self, compression=None, no_compact=False):
+    def _send_startup_message(self, compression=None, no_compact=False, extra_options=None):
         log.debug("Sending StartupMessage on %s", self)
         opts = {'DRIVER_NAME': DRIVER_NAME,
-                'DRIVER_VERSION': DRIVER_VERSION}
+                'DRIVER_VERSION': DRIVER_VERSION,
+                **extra_options}
         if compression:
             opts['COMPRESSION'] = compression
         if no_compact:

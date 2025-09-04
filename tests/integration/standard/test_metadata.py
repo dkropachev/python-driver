@@ -12,27 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from collections import defaultdict
 import difflib
 import logging
-import six
 import sys
 import time
 import os
 from packaging.version import Version
-from mock import Mock, patch
+from unittest.mock import Mock, patch
+import pytest
 
 from cassandra import AlreadyExists, SignatureDescriptor, UserFunctionDescriptor, UserAggregateDescriptor
+from cassandra.connection import Connection
 
 from cassandra.encoder import Encoder
 from cassandra.metadata import (IndexMetadata, Token, murmur3, Function, Aggregate, protect_name, protect_names,
                                 RegisteredTableExtension, _RegisteredExtensionType, get_schema_parser,
                                 group_keys_by_replica, NO_VALID_REPLICA)
+from cassandra.protocol import QueryMessage, ProtocolHandler
 from cassandra.util import SortedSet
 
 from tests.integration import (get_cluster, use_singledc, PROTOCOL_VERSION, execute_until_pass,
@@ -42,8 +41,10 @@ from tests.integration import (get_cluster, use_singledc, PROTOCOL_VERSION, exec
                                get_supported_protocol_versions, greaterthancass20,
                                greaterthancass21, assert_startswith, greaterthanorequalcass40,
                                greaterthanorequaldse67, lessthancass40,
-                               TestCluster, DSE_VERSION)
+                               TestCluster, DSE_VERSION, requires_java_udf, requires_composite_type,
+                               requires_collection_indexes, SCYLLA_VERSION, xfail_scylla, xfail_scylla_version_lt)
 
+from tests.util import wait_until
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,12 @@ class MetaDataRemovalTest(unittest.TestCase):
 
         @test_category metadata
         """
-        self.assertEqual(len(self.cluster.metadata.all_hosts()), 3)
+        # wait until we have only 3 hosts
+        wait_until(condition=lambda: len(self.cluster.metadata.all_hosts()) == 3, delay=0.5, max_attempts=5)
+
+        # verify the un-existing host was filtered
+        for host in self.cluster.metadata.all_hosts():
+            self.assertNotEqual(host.endpoint.address, '126.0.0.186')
 
 
 class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
@@ -154,11 +160,11 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         self.assertEqual(len(no_token.metadata.token_map.token_to_host_owner), 0)
 
         # Do a simple query to ensure queries are working
-        query = "SELECT * FROM system.local"
+        query = "SELECT * FROM system.local WHERE key='local'"
         no_schema_rs = no_schema_session.execute(query)
         no_token_rs = no_token_session.execute(query)
-        self.assertIsNotNone(no_schema_rs[0])
-        self.assertIsNotNone(no_token_rs[0])
+        self.assertIsNotNone(no_schema_rs.one())
+        self.assertIsNotNone(no_token_rs.one())
         no_schema.shutdown()
         no_token.shutdown()
 
@@ -239,7 +245,8 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
             cc,
             self.cluster.metadata.get_host(cc.host).release_version,
             self.cluster.metadata.get_host(cc.host).dse_version,
-            1
+            1,
+            None,
         )
 
         for option in tablemeta.options:
@@ -471,7 +478,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         tablemeta = self.get_table_metadata()
         self.check_create_statement(tablemeta, create_statement)
 
-    @unittest.expectedFailure
+    @pytest.mark.skip(reason='https://github.com/scylladb/scylladb/issues/6058')
     def test_indexes(self):
         create_statement = self.make_create_statement(["a"], ["b", "c"], ["d", "e", "f"])
         create_statement += " WITH CLUSTERING ORDER BY (b ASC, c ASC)"
@@ -497,7 +504,8 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         self.assertIn('CREATE INDEX e_index', statement)
 
     @greaterthancass21
-    @unittest.expectedFailure
+    @requires_collection_indexes
+    @xfail_scylla('scylladb/scylladb#22013 - scylla does not show full index in system_schema.indexes')
     def test_collection_indexes(self):
 
         self.session.execute("CREATE TABLE %s.%s (a int PRIMARY KEY, b map<text, text>)"
@@ -527,13 +535,14 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
             tablemeta = self.get_table_metadata()
             self.assertIn('(full(b))', tablemeta.export_as_string())
 
-    @unittest.expectedFailure
     def test_compression_disabled(self):
         create_statement = self.make_create_statement(["a"], ["b"], ["c"])
         create_statement += " WITH compression = {}"
         self.session.execute(create_statement)
         tablemeta = self.get_table_metadata()
-        expected = "compression = {}" if CASSANDRA_VERSION < Version("3.0") else "compression = {'enabled': 'false'}"
+        expected = "compression = {'enabled': 'false'}"
+        if SCYLLA_VERSION is not None or CASSANDRA_VERSION < Version("3.0"):
+            expected = "compression = {}"
         self.assertIn(expected, tablemeta.export_as_string())
 
     def test_non_size_tiered_compaction(self):
@@ -562,7 +571,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
             self.assertNotIn("min_threshold", cql)
             self.assertNotIn("max_threshold", cql)
 
-    @unittest.expectedFailure
+    @requires_java_udf
     def test_refresh_schema_metadata(self):
         """
         test for synchronously refreshing all cluster metadata
@@ -835,7 +844,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
             self.assertEqual(cluster.metadata.keyspaces[self.keyspace_name].user_types, {})
             cluster.shutdown()
 
-    @unittest.expectedFailure
+    @requires_java_udf
     def test_refresh_user_function_metadata(self):
         """
         test for synchronously refreshing UDF metadata in keyspace
@@ -872,7 +881,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
 
         cluster2.shutdown()
 
-    @unittest.expectedFailure
+    @requires_java_udf
     def test_refresh_user_aggregate_metadata(self):
         """
         test for synchronously refreshing UDA metadata in keyspace
@@ -916,7 +925,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         cluster2.shutdown()
 
     @greaterthanorequalcass30
-    @unittest.expectedFailure
+    @requires_collection_indexes
     def test_multiple_indices(self):
         """
         test multiple indices on the same column.
@@ -966,9 +975,6 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         table_meta = ks_meta.tables[t]
         view_meta = table_meta.views[v]
 
-        self.assertFalse(table_meta.extensions)
-        self.assertFalse(view_meta.extensions)
-
         original_table_cql = table_meta.export_as_string()
         original_view_cql = view_meta.export_as_string()
 
@@ -984,8 +990,6 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         class Ext1(Ext0):
             name = t + '##'
 
-        self.assertFalse(table_meta.extensions)
-        self.assertFalse(view_meta.extensions)
         self.assertIn(Ext0.name, _RegisteredExtensionType._extension_registry)
         self.assertIn(Ext1.name, _RegisteredExtensionType._extension_registry)
         # There will bee the RLAC extension here.
@@ -1002,7 +1006,7 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         update_v = s.prepare('UPDATE system_schema.views SET extensions=? WHERE keyspace_name=? AND view_name=?')
         # extensions registered, one present
         # --------------------------------------
-        ext_map = {Ext0.name: six.b("THA VALUE")}
+        ext_map = {Ext0.name: b"THA VALUE"}
         [(s.execute(update_t, (ext_map, ks, t)), s.execute(update_v, (ext_map, ks, v)))
          for _ in self.cluster.metadata.all_hosts()]  # we're manipulating metadata - do it on all hosts
         self.cluster.refresh_table_metadata(ks, t)
@@ -1024,8 +1028,8 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
 
         # extensions registered, one present
         # --------------------------------------
-        ext_map = {Ext0.name: six.b("THA VALUE"),
-                   Ext1.name: six.b("OTHA VALUE")}
+        ext_map = {Ext0.name: b"THA VALUE",
+                   Ext1.name: b"OTHA VALUE"}
         [(s.execute(update_t, (ext_map, ks, t)), s.execute(update_v, (ext_map, ks, v)))
          for _ in self.cluster.metadata.all_hosts()]  # we're manipulating metadata - do it on all hosts
         self.cluster.refresh_table_metadata(ks, t)
@@ -1047,6 +1051,41 @@ class SchemaMetadataTests(BasicSegregatedKeyspaceUnitTestCase):
         self.assertIn(Ext0.after_table_cql(view_meta, Ext0.name, ext_map[Ext0.name]), new_cql)
         self.assertIn(Ext1.after_table_cql(view_meta, Ext1.name, ext_map[Ext1.name]), new_cql)
 
+    def test_metadata_pagination(self):
+        self.cluster.refresh_schema_metadata()
+        for i in range(12):
+            self.session.execute("CREATE TABLE %s.%s_%d (a int PRIMARY KEY, b map<text, text>)"
+                                 % (self.keyspace_name, self.function_table_name, i))
+
+        self.cluster.schema_metadata_page_size = 5
+        self.cluster.refresh_schema_metadata()
+        self.assertEqual(len(self.cluster.metadata.keyspaces[self.keyspace_name].tables), 12)
+
+    def test_metadata_pagination_keyspaces(self):
+        """
+        test for covering
+        https://github.com/scylladb/python-driver/issues/174
+        """
+        
+        self.cluster.refresh_schema_metadata()
+        keyspaces = [f"keyspace{idx}" for idx in range(15)]
+
+        for ks in keyspaces:
+            self.session.execute(
+                f"CREATE KEYSPACE IF NOT EXISTS {ks} WITH REPLICATION = {{ 'class' : 'SimpleStrategy', 'replication_factor' : 3 }}"
+            )
+
+        self.cluster.schema_metadata_page_size = 2000
+        self.cluster.refresh_schema_metadata()
+        before_ks_num = len(self.cluster.metadata.keyspaces)
+
+        self.cluster.schema_metadata_page_size = 10
+        self.cluster.refresh_schema_metadata()
+
+        after_ks_num = len(self.cluster.metadata.keyspaces)
+
+        self.assertEqual(before_ks_num, after_ks_num)
+
 
 class TestCodeCoverage(unittest.TestCase):
 
@@ -1058,7 +1097,7 @@ class TestCodeCoverage(unittest.TestCase):
         cluster = TestCluster()
         cluster.connect()
 
-        self.assertIsInstance(cluster.metadata.export_schema_as_string(), six.string_types)
+        self.assertIsInstance(cluster.metadata.export_schema_as_string(), str)
         cluster.shutdown()
 
     def test_export_keyspace_schema(self):
@@ -1071,8 +1110,8 @@ class TestCodeCoverage(unittest.TestCase):
 
         for keyspace in cluster.metadata.keyspaces:
             keyspace_metadata = cluster.metadata.keyspaces[keyspace]
-            self.assertIsInstance(keyspace_metadata.export_as_string(), six.string_types)
-            self.assertIsInstance(keyspace_metadata.as_cql_query(), six.string_types)
+            self.assertIsInstance(keyspace_metadata.export_as_string(), str)
+            self.assertIsInstance(keyspace_metadata.as_cql_query(), str)
         cluster.shutdown()
 
     def assert_equal_diff(self, received, expected):
@@ -1169,7 +1208,8 @@ CREATE TABLE export_udts.users (
         cluster.shutdown()
 
     @greaterthancass21
-    @unittest.expectedFailure
+    @xfail_scylla_version_lt(reason='scylladb/scylladb#10707 - Column name in CREATE INDEX is not quoted',
+                             oss_scylla_version="5.2", ent_scylla_version="2023.1.1")
     def test_case_sensitivity(self):
         """
         Test that names that need to be escaped in CREATE statements are
@@ -1239,7 +1279,7 @@ CREATE TABLE export_udts.users (
         cluster.shutdown()
 
     @local
-    @unittest.expectedFailure
+    @pytest.mark.xfail(reason='AssertionError: \'RAC1\' != \'r1\' - probably a bug in driver or in Scylla')
     def test_replicas(self):
         """
         Ensure cluster.metadata.get_replicas return correctly when not attached to keyspace
@@ -1252,8 +1292,8 @@ CREATE TABLE export_udts.users (
 
         cluster.connect('test3rf')
 
-        self.assertNotEqual(list(cluster.metadata.get_replicas('test3rf', six.b('key'))), [])
-        host = list(cluster.metadata.get_replicas('test3rf', six.b('key')))[0]
+        self.assertNotEqual(list(cluster.metadata.get_replicas('test3rf', b'key')), [])
+        host = list(cluster.metadata.get_replicas('test3rf', b'key'))[0]
         self.assertEqual(host.datacenter, 'dc1')
         self.assertEqual(host.rack, 'r1')
         cluster.shutdown()
@@ -1293,6 +1333,38 @@ class TokenMetadataTest(unittest.TestCase):
         self.assertTrue(issubclass(tmap.token_class, Token))
         self.assertEqual(expected_node_count, len(tmap.ring))
         cluster.shutdown()
+
+
+class MetadataTimeoutTest(unittest.TestCase):
+    """
+    Test of TokenMap creation and other behavior.
+    """
+    def test_timeout(self):
+        cluster = TestCluster()
+        cluster.metadata_request_timeout = None
+
+        stmts = []
+
+        class ConnectionWrapper(cluster.connection_class):
+            def __init__(self, *args, **kwargs):
+                super(ConnectionWrapper, self).__init__(*args, **kwargs)
+
+            def send_msg(self, msg, request_id, cb, encoder=ProtocolHandler.encode_message,
+                         decoder=ProtocolHandler.decode_message, result_metadata=None):
+                if isinstance(msg, QueryMessage):
+                    stmts.append(msg.query)
+                return super(ConnectionWrapper, self).send_msg(msg, request_id, cb, encoder, decoder, result_metadata)
+
+        cluster.connection_class = ConnectionWrapper
+        s = cluster.connect()
+        s.execute("SELECT now() FROM system.local WHERE key='local'")
+        s.shutdown()
+
+        for stmt in stmts:
+            if "SELECT now() FROM system.local WHERE key='local'" in stmt:
+                continue
+            if "USING TIMEOUT 2000ms" not in stmt:
+                self.fail(f"query `{stmt}` does not contain `USING TIMEOUT 2000ms`")
 
 
 class KeyspaceAlterMetadata(unittest.TestCase):
@@ -1433,7 +1505,7 @@ class IndexMapTests(unittest.TestCase):
         self.assertIsInstance(table_meta.indexes[idx], IndexMetadata)
         self.drop_basic_table()
 
-
+@requires_java_udf
 class FunctionTest(unittest.TestCase):
     """
     Base functionality for Function and Aggregate metadata test classes
@@ -1506,7 +1578,7 @@ class FunctionTest(unittest.TestCase):
             super(FunctionTest.VerifiedAggregate, self).__init__(test_case, Aggregate, test_case.keyspace_aggregate_meta, **kwargs)
 
 
-@unittest.expectedFailure
+@requires_java_udf
 class FunctionMetadata(FunctionTest):
 
     def make_function_kwargs(self, called_on_null=True):
@@ -1605,7 +1677,7 @@ class FunctionMetadata(FunctionTest):
 
         with self.VerifiedFunction(self, **kwargs) as vf:
             fn_meta = self.keyspace_function_meta[vf.signature]
-            self.assertRegexpMatches(fn_meta.as_cql_query(), "CREATE FUNCTION.*%s\(\) .*" % kwargs['name'])
+            self.assertRegex(fn_meta.as_cql_query(), r'CREATE FUNCTION.*%s\(\) .*' % kwargs['name'])
 
     def test_functions_follow_keyspace_alter(self):
         """
@@ -1653,14 +1725,15 @@ class FunctionMetadata(FunctionTest):
         kwargs['called_on_null_input'] = True
         with self.VerifiedFunction(self, **kwargs) as vf:
             fn_meta = self.keyspace_function_meta[vf.signature]
-            self.assertRegexpMatches(fn_meta.as_cql_query(), "CREATE FUNCTION.*\) CALLED ON NULL INPUT RETURNS .*")
+            self.assertRegex(fn_meta.as_cql_query(), r'CREATE FUNCTION.*\) CALLED ON NULL INPUT RETURNS .*')
 
         kwargs['called_on_null_input'] = False
         with self.VerifiedFunction(self, **kwargs) as vf:
             fn_meta = self.keyspace_function_meta[vf.signature]
-            self.assertRegexpMatches(fn_meta.as_cql_query(), "CREATE FUNCTION.*\) RETURNS NULL ON NULL INPUT RETURNS .*")
+            self.assertRegex(fn_meta.as_cql_query(), r'CREATE FUNCTION.*\) RETURNS NULL ON NULL INPUT RETURNS .*')
 
 
+@requires_java_udf
 class AggregateMetadata(FunctionTest):
 
     @classmethod
@@ -1705,7 +1778,6 @@ class AggregateMetadata(FunctionTest):
                 'return_type': "does not matter for creation",
                 'deterministic': False}
 
-    @unittest.expectedFailure
     def test_return_type_meta(self):
         """
         Test to verify to that the return type of a an aggregate is honored in the metadata
@@ -1723,7 +1795,6 @@ class AggregateMetadata(FunctionTest):
         with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('sum_int', 'int', init_cond='1')) as va:
             self.assertEqual(self.keyspace_aggregate_meta[va.signature].return_type, 'int')
 
-    @unittest.expectedFailure
     def test_init_cond(self):
         """
         Test to verify that various initial conditions are correctly surfaced in various aggregate functions
@@ -1750,14 +1821,14 @@ class AggregateMetadata(FunctionTest):
         for init_cond in (-1, 0, 1):
             cql_init = encoder.cql_encode_all_types(init_cond)
             with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('sum_int', 'int', init_cond=cql_init)) as va:
-                sum_res = s.execute("SELECT %s(v) AS sum FROM t" % va.function_kwargs['name'])[0].sum
+                sum_res = s.execute("SELECT %s(v) AS sum FROM t" % va.function_kwargs['name']).one().sum
                 self.assertEqual(sum_res, int(init_cond) + sum(expected_values))
 
         # list<text>
         for init_cond in ([], ['1', '2']):
             cql_init = encoder.cql_encode_all_types(init_cond)
             with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('extend_list', 'list<text>', init_cond=cql_init)) as va:
-                list_res = s.execute("SELECT %s(v) AS list_res FROM t" % va.function_kwargs['name'])[0].list_res
+                list_res = s.execute("SELECT %s(v) AS list_res FROM t" % va.function_kwargs['name']).one().list_res
                 self.assertListEqual(list_res[:len(init_cond)], init_cond)
                 self.assertEqual(set(i for i in list_res[len(init_cond):]),
                                  set(str(i) for i in expected_values))
@@ -1768,13 +1839,12 @@ class AggregateMetadata(FunctionTest):
         for init_cond in ({}, {1: 2, 3: 4}, {5: 5}):
             cql_init = encoder.cql_encode_all_types(init_cond)
             with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('update_map', 'map<int, int>', init_cond=cql_init)) as va:
-                map_res = s.execute("SELECT %s(v) AS map_res FROM t" % va.function_kwargs['name'])[0].map_res
-                self.assertDictContainsSubset(expected_map_values, map_res)
+                map_res = s.execute("SELECT %s(v) AS map_res FROM t" % va.function_kwargs['name']).one().map_res
+                self.assertLessEqual(expected_map_values.items(), map_res.items())
                 init_not_updated = dict((k, init_cond[k]) for k in set(init_cond) - expected_key_set)
-                self.assertDictContainsSubset(init_not_updated, map_res)
+                self.assertLessEqual(init_not_updated.items(), map_res.items())
         c.shutdown()
 
-    @unittest.expectedFailure
     def test_aggregates_after_functions(self):
         """
         Test to verify that aggregates are listed after function in metadata
@@ -1797,7 +1867,6 @@ class AggregateMetadata(FunctionTest):
             self.assertNotIn(-1, (aggregate_idx, func_idx), "AGGREGATE or FUNCTION not found in keyspace_cql: " + keyspace_cql)
             self.assertGreater(aggregate_idx, func_idx)
 
-    @unittest.expectedFailure
     def test_same_name_diff_types(self):
         """
         Test to verify to that aggregates with different signatures are differentiated in metadata
@@ -1820,7 +1889,6 @@ class AggregateMetadata(FunctionTest):
                 self.assertEqual(len(aggregates), 2)
                 self.assertNotEqual(aggregates[0].argument_types, aggregates[1].argument_types)
 
-    @unittest.expectedFailure
     def test_aggregates_follow_keyspace_alter(self):
         """
         Test to verify to that aggregates maintain equality after a keyspace is altered
@@ -1845,7 +1913,6 @@ class AggregateMetadata(FunctionTest):
             finally:
                 self.session.execute('ALTER KEYSPACE %s WITH durable_writes = true' % self.keyspace_name)
 
-    @unittest.expectedFailure
     def test_cql_optional_params(self):
         """
         Test to verify that the initial_cond and final_func parameters are correctly honored
@@ -1938,7 +2005,8 @@ class BadMetaTest(unittest.TestCase):
             connection,
             cls.cluster.metadata.get_host(connection.host).release_version,
             cls.cluster.metadata.get_host(connection.host).dse_version,
-            timeout=20
+            20,
+            None,
         ).__class__
         cls.cluster.control_connection.reconnect = Mock()
 
@@ -1980,7 +2048,7 @@ class BadMetaTest(unittest.TestCase):
             self.assertIn("/*\nWarning:", m.export_as_string())
 
     @greaterthancass21
-    @unittest.expectedFailure
+    @requires_java_udf
     def test_bad_user_function(self):
         self.session.execute("""CREATE FUNCTION IF NOT EXISTS %s (key int, val int)
                                 RETURNS NULL ON NULL INPUT
@@ -1999,7 +2067,7 @@ class BadMetaTest(unittest.TestCase):
                 self.assertIn("/*\nWarning:", m.export_as_string())
 
     @greaterthancass21
-    @unittest.expectedFailure
+    @requires_java_udf
     def test_bad_user_aggregate(self):
         self.session.execute("""CREATE FUNCTION IF NOT EXISTS sum_int (key int, val int)
                                 RETURNS NULL ON NULL INPUT
@@ -2020,7 +2088,7 @@ class BadMetaTest(unittest.TestCase):
 
 class DynamicCompositeTypeTest(BasicSharedKeyspaceUnitTestCase):
 
-    @unittest.expectedFailure
+    @requires_composite_type
     def test_dct_alias(self):
         """
         Tests to make sure DCT's have correct string formatting

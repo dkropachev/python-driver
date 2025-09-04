@@ -3,14 +3,14 @@ try:
     from cassandra.io.asyncioreactor import AsyncioConnection
     import asynctest
     ASYNCIO_AVAILABLE = True
-except (ImportError, SyntaxError):
+except (ImportError, SyntaxError, AttributeError):
     AsyncioConnection = None
     ASYNCIO_AVAILABLE = False
 
 from tests import is_monkey_patched, connection_class
 from tests.unit.io.utils import TimerCallback, TimerTestMixin
 
-from mock import patch
+from unittest.mock import patch
 
 import unittest
 import time

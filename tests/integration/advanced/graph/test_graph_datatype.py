@@ -12,13 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import time
-import six
 import logging
 from packaging.version import Version
 from collections import namedtuple
@@ -70,13 +66,13 @@ class GraphBasicDataTypesTests(BasicGraphUnitTestCase):
 
             if any(type_indicator.startswith(t) for t in
                    ('int', 'short', 'long', 'bigint', 'decimal', 'smallint', 'varint')):
-                typ = six.integer_types
+                typ = int
             elif any(type_indicator.startswith(t) for t in ('float', 'double')):
                 typ = float
             elif any(type_indicator.startswith(t) for t in ('duration', 'date', 'negdate', 'time',
                                                             'blob', 'timestamp', 'point', 'linestring', 'polygon',
                                                             'inet', 'uuid')):
-                typ = six.text_type
+                typ = str
             else:
                 pass
                 self.fail("Received unexpected type: %s" % type_indicator)
@@ -88,10 +84,10 @@ class GenericGraphDataTypeTest(GraphUnitTestCase):
     def _test_all_datatypes(self, schema, graphson):
         ep = self.get_execution_profile(graphson)
 
-        for data in six.itervalues(schema.fixtures.datatypes()):
+        for data in schema.fixtures.datatypes().values():
             typ, value, deserializer = data
             vertex_label = VertexLabel([typ])
-            property_name = next(six.iterkeys(vertex_label.non_pk_properties))
+            property_name = next(iter(vertex_label.non_pk_properties.keys()))
             schema.create_vertex_label(self.session, vertex_label, execution_profile=ep)
             vertex = list(schema.add_vertex(self.session, vertex_label, property_name, value, execution_profile=ep))[0]
 
@@ -170,9 +166,9 @@ class GenericGraphDataTypeTest(GraphUnitTestCase):
                        ), 'hello')]
         }
 
-        for typ, value in six.itervalues(data):
+        for typ, value in data.values():
             vertex_label = VertexLabel([typ])
-            property_name = next(six.iterkeys(vertex_label.non_pk_properties))
+            property_name = next(iter(vertex_label.non_pk_properties.keys()))
             schema.create_vertex_label(self.session, vertex_label, execution_profile=ep)
 
             vertex = list(schema.add_vertex(self.session, vertex_label, property_name, value, execution_profile=ep))[0]

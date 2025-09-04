@@ -26,9 +26,8 @@ import io
 import random
 from functools import wraps
 from itertools import cycle
-import six
-from six import binary_type, BytesIO
-from mock import Mock
+from io import BytesIO
+from unittest.mock import Mock, MagicMock
 
 import errno
 import logging
@@ -36,12 +35,6 @@ import math
 import os
 from socket import error as socket_error
 import ssl
-
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
-
 import time
 
 
@@ -185,7 +178,7 @@ class TimerTestMixin(object):
         timer = self.create_timer(timeout, callback.invoke)
         timer.cancel()
         # Release context allow for timer thread to run.
-        time.sleep(.2)
+        time.sleep(timeout * 2)
         timer_manager = self._timers
         # Assert that the cancellation was honored
         self.assertFalse(timer_manager._queue)
@@ -205,7 +198,7 @@ class ReactorTestMixin(object):
         return setattr(connection, self.socket_attr_name, obj)
 
     def make_header_prefix(self, message_class, version=2, stream_id=0):
-        return binary_type().join(map(uint8_pack, [
+        return bytes().join(map(uint8_pack, [
             0xff & (HEADER_DIRECTION_TO_CLIENT | version),
             0,  # flags (compression)
             stream_id,
@@ -214,7 +207,7 @@ class ReactorTestMixin(object):
 
     def make_connection(self):
         c = self.connection_class(DefaultEndPoint('1.2.3.4'), cql_version='3.0.1', connect_timeout=5)
-        mocket = Mock()
+        mocket = MagicMock()
         mocket.send.side_effect = lambda x: len(x)
         self.set_socket(c, mocket)
         return c
@@ -233,7 +226,7 @@ class ReactorTestMixin(object):
         write_string(buf, msg)
         return buf.getvalue()
 
-    def make_msg(self, header, body=binary_type()):
+    def make_msg(self, header, body=bytes()):
         return header + uint32_pack(len(body)) + body
 
     def test_successful_connection(self):
@@ -292,7 +285,7 @@ class ReactorTestMixin(object):
         c.process_io_buffer = Mock()
 
         def chunk(size):
-            return six.b('a') * size
+            return b'a' * size
 
         buf_size = c.in_buffer_size
 
@@ -439,7 +432,7 @@ class ReactorTestMixin(object):
 
         self.get_socket(c).recv.return_value = message[1:]
         c.handle_read(*self.null_handle_function_args)
-        self.assertEqual(six.binary_type(), c._io_buffer.io_buffer.getvalue())
+        self.assertEqual(bytes(), c._io_buffer.io_buffer.getvalue())
 
         # let it write out a StartupMessage
         c.handle_write(*self.null_handle_function_args)
@@ -466,7 +459,7 @@ class ReactorTestMixin(object):
         # ... then read in the rest
         self.get_socket(c).recv.return_value = message[9:]
         c.handle_read(*self.null_handle_function_args)
-        self.assertEqual(six.binary_type(), c._io_buffer.io_buffer.getvalue())
+        self.assertEqual(bytes(), c._io_buffer.io_buffer.getvalue())
 
         # let it write out a StartupMessage
         c.handle_write(*self.null_handle_function_args)
@@ -502,7 +495,7 @@ class ReactorTestMixin(object):
             for i in range(1, 15):
                 c.process_io_buffer.reset_mock()
                 c._io_buffer._io_buffer = io.BytesIO()
-                message = io.BytesIO(six.b('a') * (2**i))
+                message = io.BytesIO(b'a' * (2**i))
 
                 def recv_side_effect(*args):
                     if random.randint(1,10) % 3 == 0:

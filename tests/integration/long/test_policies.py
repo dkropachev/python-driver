@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from cassandra import ConsistencyLevel, Unavailable
 from cassandra.cluster import ExecutionProfile, EXEC_PROFILE_DEFAULT
@@ -32,7 +29,7 @@ class RetryPolicyTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cluster = get_cluster()
-        cluster.start(wait_for_binary_proto=True)  # make sure other nodes are restarted
+        cluster.start(wait_for_binary_proto=True, wait_other_notice=True)  # make sure other nodes are restarted
 
     def test_should_rethrow_on_unvailable_with_default_policy_if_cas(self):
         """

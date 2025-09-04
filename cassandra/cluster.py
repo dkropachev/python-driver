@@ -19,18 +19,20 @@ This module houses the main classes you will interact with,
 from __future__ import absolute_import
 
 import atexit
+import datetime
 from binascii import hexlify
 from collections import defaultdict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait as wait_futures
 from copy import copy
-from functools import partial, wraps
+from functools import partial, reduce, wraps
 from itertools import groupby, count, chain
 import json
 import logging
 from warnings import warn
 from random import random
-import six
-from six.moves import filter, range, queue as Queue
+import re
+import queue
 import socket
 import sys
 import time
@@ -40,16 +42,17 @@ import uuid
 import weakref
 from weakref import WeakValueDictionary
 
-from cassandra import (ConsistencyLevel, AuthenticationFailed,
+from cassandra import (ConsistencyLevel, AuthenticationFailed, InvalidRequest,
                        OperationTimedOut, UnsupportedOperation,
                        SchemaTargetType, DriverException, ProtocolVersion,
-                       UnresolvableContactPoints)
+                       UnresolvableContactPoints, DependencyException)
 from cassandra.auth import _proxy_execute_key, PlainTextAuthProvider
 from cassandra.connection import (ConnectionException, ConnectionShutdown,
                                   ConnectionHeartbeat, ProtocolVersionUnsupported,
                                   EndPoint, DefaultEndPoint, DefaultEndPointFactory,
                                   ContinuousPagingState, SniEndPointFactory, ConnectionBusy)
 from cassandra.cqltypes import UserType
+import cassandra.cqltypes as types
 from cassandra.encoder import Encoder
 from cassandra.protocol import (QueryMessage, ResultMessage,
                                 ErrorMessage, ReadTimeoutErrorMessage,
@@ -78,9 +81,9 @@ from cassandra.query import (SimpleStatement, PreparedStatement, BoundStatement,
                              named_tuple_factory, dict_factory, tuple_factory, FETCH_SIZE_UNSET,
                              HostTargetingStatement)
 from cassandra.marshal import int64_pack
+from cassandra.tablets import Tablet, Tablets
 from cassandra.timestamps import MonotonicTimestampGenerator
-from cassandra.compat import Mapping
-from cassandra.util import _resolve_contact_points_to_string_map, Version
+from cassandra.util import _resolve_contact_points_to_string_map, Version, maybe_add_timeout_to_query
 
 from cassandra.datastax.insights.reporter import MonitorReporter
 from cassandra.datastax.insights.util import version_supports_insights
@@ -91,6 +94,7 @@ from cassandra.datastax.graph import (graph_object_row_factory, GraphOptions, Gr
                                       GraphSON3Serializer)
 from cassandra.datastax.graph.query import _request_timeout_key, _GraphSONContextRowFactory
 from cassandra.datastax import cloud as dscloud
+from cassandra.scylla.cloud import CloudConfiguration
 
 try:
     from cassandra.io.twistedreactor import TwistedConnection
@@ -99,7 +103,9 @@ except ImportError:
 
 try:
     from cassandra.io.eventletreactor import EventletConnection
-except ImportError:
+except (ImportError, AttributeError):
+    # AttributeError was add for handling python 3.12 https://github.com/eventlet/eventlet/issues/812
+    # TODO: remove it when eventlet issue would be fixed
     EventletConnection = None
 
 try:
@@ -107,35 +113,73 @@ try:
 except ImportError:
     from cassandra.util import WeakSet  # NOQA
 
-if six.PY3:
-    long = int
+def _is_gevent_monkey_patched():
+    if 'gevent.monkey' not in sys.modules:
+        return False
+    try:
+        import gevent.socket
+        return socket.socket is gevent.socket.socket    # Another case related to PYTHON-1364
+    except (AttributeError, ImportError):
+        return False
+
+def _try_gevent_import():
+    if _is_gevent_monkey_patched():
+        from cassandra.io.geventreactor import GeventConnection
+        return (GeventConnection,None)
+    else:
+        return (None,None)
 
 def _is_eventlet_monkey_patched():
     if 'eventlet.patcher' not in sys.modules:
         return False
-    import eventlet.patcher
-    return eventlet.patcher.is_monkey_patched('socket')
-
-
-def _is_gevent_monkey_patched():
-    if 'gevent.monkey' not in sys.modules:
-        return False
-    import gevent.socket
-    return socket.socket is gevent.socket.socket
-
-
-# default to gevent when we are monkey patched with gevent, eventlet when
-# monkey patched with eventlet, otherwise if libev is available, use that as
-# the default because it's fastest. Otherwise, use asyncore.
-if _is_gevent_monkey_patched():
-    from cassandra.io.geventreactor import GeventConnection as DefaultConnection
-elif _is_eventlet_monkey_patched():
-    from cassandra.io.eventletreactor import EventletConnection as DefaultConnection
-else:
     try:
-        from cassandra.io.libevreactor import LibevConnection as DefaultConnection  # NOQA
-    except ImportError:
-        from cassandra.io.asyncorereactor import AsyncoreConnection as DefaultConnection  # NOQA
+        import eventlet.patcher
+        return eventlet.patcher.is_monkey_patched('socket')
+    except (ImportError, AttributeError):
+        # AttributeError was add for handling python 3.12 https://github.com/eventlet/eventlet/issues/812
+        # TODO: remove it when eventlet issue would be fixed
+        return False
+
+def _try_eventlet_import():
+    if _is_eventlet_monkey_patched():
+        from cassandra.io.eventletreactor import EventletConnection
+        return (EventletConnection,None)
+    else:
+        return (None,None)
+
+def _try_libev_import():
+    try:
+        from cassandra.io.libevreactor import LibevConnection
+        return (LibevConnection,None)
+    except DependencyException as e:
+        return (None, e)
+
+def _try_asyncore_import():
+    try:
+        from cassandra.io.asyncorereactor import AsyncoreConnection
+        return (AsyncoreConnection,None)
+    except DependencyException as e:
+        return (None, e)
+
+def _try_asyncio_import():
+    from cassandra.io.asyncioreactor import AsyncioConnection
+    return (AsyncioConnection, None)
+
+def _connection_reduce_fn(val,import_fn):
+    (rv, excs) = val
+    # If we've already found a workable Connection class return immediately
+    if rv:
+        return val
+    (import_result, exc) = import_fn()
+    if exc:
+        excs.append(exc)
+    return (rv or import_result, excs)
+
+conn_fns = (_try_gevent_import, _try_eventlet_import, _try_libev_import, _try_asyncore_import, _try_asyncio_import)
+(conn_class, excs) = reduce(_connection_reduce_fn, conn_fns, (None,[]))
+if not conn_class:
+    raise DependencyException("Exception loading connection class dependencies", excs)
+DefaultConnection = conn_class
 
 # Forces load of utf8 encoding module to avoid deadlock that occurs
 # if code that is being imported tries to import the module in a seperate
@@ -483,7 +527,8 @@ class ProfileManager(object):
 
     def distance(self, host):
         distances = set(p.load_balancing_policy.distance(host) for p in self.profiles.values())
-        return HostDistance.LOCAL if HostDistance.LOCAL in distances else \
+        return HostDistance.LOCAL_RACK if HostDistance.LOCAL_RACK in distances else \
+            HostDistance.LOCAL if HostDistance.LOCAL in distances else \
             HostDistance.REMOTE if HostDistance.REMOTE in distances else \
             HostDistance.IGNORED
 
@@ -532,7 +577,7 @@ EXEC_PROFILE_GRAPH_DEFAULT = object()
 Key for the default graph execution profile, used when no other profile is selected in
 ``Session.execute_graph(execution_profile)``.
 
-Use this as the key in :doc:`Cluster(execution_profiles) </execution_profiles>`
+Use this as the key in :doc:`Cluster(execution_profiles) </execution-profiles>`
 to override the default graph profile.
 """
 
@@ -551,6 +596,20 @@ use Spark/analytics as the traversal source.
 
 Selected using ``Session.execute_graph(execution_profile=EXEC_PROFILE_GRAPH_ANALYTICS_DEFAULT)``.
 """
+
+
+class ShardAwareOptions:
+    disable = None
+    disable_shardaware_port = False
+
+    def __init__(self, opts=None, disable=None, disable_shardaware_port=None):
+        self.disable = disable
+        self.disable_shardaware_port = disable_shardaware_port
+        if opts:
+            if isinstance(opts, ShardAwareOptions):
+                self.__dict__.update(opts.__dict__)
+            elif isinstance(opts, dict):
+                self.__dict__.update(opts)
 
 
 class _ConfigMode(object):
@@ -586,7 +645,7 @@ class Cluster(object):
 
     Defaults to loopback interface.
 
-    Note: When using :class:`.DCAwareLoadBalancingPolicy` with no explicit
+    Note: When using :class:`.DCAwareRoundRobinPolicy` with no explicit
     local_dc set (as is the default), the DC is chosen from an arbitrary
     host in contact_points. In this case, contact_points should contain
     only nodes from a single, local DC.
@@ -777,9 +836,9 @@ class Cluster(object):
     Using ssl_options without ssl_context is deprecated and will be removed in the
     next major release.
 
-    An optional dict which will be used as kwargs for ``ssl.SSLContext.wrap_socket`` (or
-    ``ssl.wrap_socket()`` if used without ssl_context) when new sockets are created.
-    This should be used when client encryption is enabled in Cassandra.
+    An optional dict which will be used as kwargs for ``ssl.SSLContext.wrap_socket`` 
+    when new sockets are created. This should be used when client encryption is enabled 
+    in Cassandra.
 
     The following documentation only applies when ssl_options is used without ssl_context.
 
@@ -795,6 +854,12 @@ class Cluster(object):
     should almost always require the option ``'cert_reqs': ssl.CERT_REQUIRED``. Note also that this functionality was not built into
     Python standard library until (2.7.9, 3.2). To enable this mechanism in earlier versions, patch ``ssl.match_hostname``
     with a custom or `back-ported function <https://pypi.org/project/backports.ssl_match_hostname/>`_.
+
+    .. versionchanged:: 3.29.0
+
+    ``ssl.match_hostname`` has been deprecated since Python 3.7 (and removed in Python 3.12).  This functionality is now implemented
+    via ``ssl.SSLContext.check_hostname``.  All options specified above (including ``check_hostname``) should continue to behave in a
+    way that is consistent with prior implementations.
     """
 
     ssl_context = None
@@ -990,7 +1055,7 @@ class Cluster(object):
     cloud = None
     """
     A dict of the cloud configuration. Example::
-        
+
         {
             # path to the secure connect bundle
             'secure_connect_bundle': '/path/to/secure-connect-dbname.zip',
@@ -1001,6 +1066,24 @@ class Cluster(object):
 
     The zip file will be temporarily extracted in the same directory to
     load the configuration and certificates.
+    """
+
+    shard_aware_options = None
+    """
+    Can be set with :class:`ShardAwareOptions` or with a dict, to disable the automatic shardaware,
+    or to disable the shardaware port (advanced shardaware)
+    """
+
+    column_encryption_policy = None
+    """
+    An instance of :class:`cassandra.policies.ColumnEncryptionPolicy` specifying encryption materials to be
+    used for columns in this cluster.
+    """
+
+    metadata_request_timeout = datetime.timedelta(seconds=2)
+    """
+    Timeout for all queries used by driver it self.
+    Supported only by Scylla clusters.
     """
 
     @property
@@ -1017,6 +1100,17 @@ class Cluster(object):
     @schema_metadata_enabled.setter
     def schema_metadata_enabled(self, enabled):
         self.control_connection._schema_meta_enabled = bool(enabled)
+
+    @property
+    def schema_metadata_page_size(self):
+        """
+        Number controling page size when schema metadata is fetched.
+        """
+        return self.control_connection._schema_meta_page_size
+
+    @schema_metadata_page_size.setter
+    def schema_metadata_page_size(self, size):
+        self.control_connection._schema_meta_page_size = size
 
     @property
     def token_metadata_enabled(self):
@@ -1088,6 +1182,7 @@ class Cluster(object):
                  connect_timeout=5,
                  schema_metadata_enabled=True,
                  token_metadata_enabled=True,
+                 schema_metadata_page_size=1000,
                  address_translator=None,
                  status_event_refresh_window=2,
                  prepare_on_all_hosts=True,
@@ -1104,15 +1199,49 @@ class Cluster(object):
                  monitor_reporting_enabled=True,
                  monitor_reporting_interval=30,
                  client_id=None,
-                 cloud=None):
+                 cloud=None,
+                 scylla_cloud=None,
+                 shard_aware_options=None,
+                 metadata_request_timeout=None,
+                 column_encryption_policy=None,
+                 ):
         """
         ``executor_threads`` defines the number of threads in a pool for handling asynchronous tasks such as
         extablishing connection pools or refreshing metadata.
 
         Any of the mutable Cluster attributes may be set as keyword arguments to the constructor.
         """
+
+        # Handle port passed as string
+        if isinstance(port, str):
+            if not port.isdigit():
+                raise ValueError("Only numeric values are supported for port (%s)" % port)
+            port = int(port)
+
+        if port < 1 or port > 65535:
+            raise ValueError("Invalid port number (%s) (1-65535)" % port)
+
         if connection_class is not None:
             self.connection_class = connection_class
+
+        if scylla_cloud is not None:
+            if contact_points is not _NOT_SET or ssl_context or ssl_options:
+                raise ValueError("contact_points, ssl_context, and ssl_options "
+                                 "cannot be specified with a scylla cloud configuration")
+            if shard_aware_options and not shard_aware_options.disable_shardaware_port:
+                raise ValueError("shard_aware_options.disable_shardaware_port=False "
+                                 "cannot be specified with a scylla cloud configuration")
+            uses_twisted = TwistedConnection and issubclass(self.connection_class, TwistedConnection)
+            uses_eventlet = EventletConnection and issubclass(self.connection_class, EventletConnection)
+
+            scylla_cloud_config = CloudConfiguration.create(scylla_cloud, pyopenssl=uses_twisted or uses_eventlet,
+                                                            endpoint_factory=endpoint_factory)
+            ssl_context = scylla_cloud_config.ssl_context
+            endpoint_factory = scylla_cloud_config.endpoint_factory
+            contact_points = scylla_cloud_config.contact_points
+            ssl_options = scylla_cloud_config.ssl_options
+            auth_provider = scylla_cloud_config.auth_provider
+            shard_aware_options = ShardAwareOptions(shard_aware_options, disable_shardaware_port=True)
 
         if cloud is not None:
             self.cloud = cloud
@@ -1143,7 +1272,7 @@ class Cluster(object):
             else:
                 self._contact_points_explicit = True
 
-            if isinstance(contact_points, six.string_types):
+            if isinstance(contact_points, str):
                 raise TypeError("contact_points should not be a string, it should be a sequence (e.g. list) of strings")
 
             if None in contact_points:
@@ -1152,33 +1281,13 @@ class Cluster(object):
 
         self.port = port
 
+        if column_encryption_policy is not None:
+            self.column_encryption_policy = column_encryption_policy
+
         self.endpoint_factory = endpoint_factory or DefaultEndPointFactory(port=self.port)
         self.endpoint_factory.configure(self)
 
-        raw_contact_points = []
-        for cp in [cp for cp in self.contact_points if not isinstance(cp, EndPoint)]:
-            raw_contact_points.append(cp if isinstance(cp, tuple) else (cp, port))
-
-        self.endpoints_resolved = [cp for cp in self.contact_points if isinstance(cp, EndPoint)]
-        self._endpoint_map_for_insights = {repr(ep): '{ip}:{port}'.format(ip=ep.address, port=ep.port)
-                                           for ep in self.endpoints_resolved}
-
-        strs_resolved_map = _resolve_contact_points_to_string_map(raw_contact_points)
-        self.endpoints_resolved.extend(list(chain(
-            *[
-                [DefaultEndPoint(ip, port) for ip, port in xs if ip is not None]
-                for xs in strs_resolved_map.values() if xs is not None
-            ]
-        )))
-
-        self._endpoint_map_for_insights.update(
-            {key: ['{ip}:{port}'.format(ip=ip, port=port) for ip, port in value]
-             for key, value in strs_resolved_map.items() if value is not None}
-        )
-
-        if contact_points and (not self.endpoints_resolved):
-            # only want to raise here if the user specified CPs but resolution failed
-            raise UnresolvableContactPoints(self._endpoint_map_for_insights)
+        self._resolve_hostnames()
 
         self.compression = compression
 
@@ -1190,6 +1299,8 @@ class Cluster(object):
         self.no_compact = no_compact
 
         self.auth_provider = auth_provider
+        if metadata_request_timeout is not None:
+            self.metadata_request_timeout = metadata_request_timeout
 
         if load_balancing_policy is not None:
             if isinstance(load_balancing_policy, type):
@@ -1304,6 +1415,7 @@ class Cluster(object):
         self.reprepare_on_up = reprepare_on_up
         self.monitor_reporting_enabled = monitor_reporting_enabled
         self.monitor_reporting_interval = monitor_reporting_interval
+        self.shard_aware_options = ShardAwareOptions(opts=shard_aware_options)
 
         self._listeners = set()
         self._listener_lock = Lock()
@@ -1319,21 +1431,25 @@ class Cluster(object):
         self._user_types = defaultdict(dict)
 
         self._min_requests_per_connection = {
+            HostDistance.LOCAL_RACK: DEFAULT_MIN_REQUESTS,
             HostDistance.LOCAL: DEFAULT_MIN_REQUESTS,
             HostDistance.REMOTE: DEFAULT_MIN_REQUESTS
         }
 
         self._max_requests_per_connection = {
+            HostDistance.LOCAL_RACK: DEFAULT_MAX_REQUESTS,
             HostDistance.LOCAL: DEFAULT_MAX_REQUESTS,
             HostDistance.REMOTE: DEFAULT_MAX_REQUESTS
         }
 
         self._core_connections_per_host = {
+            HostDistance.LOCAL_RACK: DEFAULT_MIN_CONNECTIONS_PER_LOCAL_HOST,
             HostDistance.LOCAL: DEFAULT_MIN_CONNECTIONS_PER_LOCAL_HOST,
             HostDistance.REMOTE: DEFAULT_MIN_CONNECTIONS_PER_REMOTE_HOST
         }
 
         self._max_connections_per_host = {
+            HostDistance.LOCAL_RACK: DEFAULT_MAX_CONNECTIONS_PER_LOCAL_HOST,
             HostDistance.LOCAL: DEFAULT_MAX_CONNECTIONS_PER_LOCAL_HOST,
             HostDistance.REMOTE: DEFAULT_MAX_CONNECTIONS_PER_REMOTE_HOST
         }
@@ -1351,7 +1467,8 @@ class Cluster(object):
             self, self.control_connection_timeout,
             self.schema_event_refresh_window, self.topology_event_refresh_window,
             self.status_event_refresh_window,
-            schema_metadata_enabled, token_metadata_enabled)
+            schema_metadata_enabled, token_metadata_enabled,
+            schema_meta_page_size=schema_metadata_page_size)
 
         if client_id is None:
             self.client_id = uuid.uuid4()
@@ -1359,6 +1476,31 @@ class Cluster(object):
             self.application_name = application_name
         if application_version is not None:
             self.application_version = application_version
+
+    def _resolve_hostnames(self):
+        raw_contact_points = []
+        for cp in [cp for cp in self.contact_points if not isinstance(cp, EndPoint)]:
+            raw_contact_points.append(cp if isinstance(cp, tuple) else (cp, self.port))
+
+        self.endpoints_resolved = [cp for cp in self.contact_points if isinstance(cp, EndPoint)]
+        self._endpoint_map_for_insights = {repr(ep): '{ip}:{port}'.format(ip=ep.address, port=ep.port)
+                                           for ep in self.endpoints_resolved}
+        strs_resolved_map = _resolve_contact_points_to_string_map(raw_contact_points)
+        self.endpoints_resolved.extend(list(chain(
+            *[
+                [DefaultEndPoint(ip, port) for ip, port in xs if ip is not None]
+                for xs in strs_resolved_map.values() if xs is not None
+            ]
+        )))
+
+        self._endpoint_map_for_insights.update(
+            {key: ['{ip}:{port}'.format(ip=ip, port=port) for ip, port in value]
+             for key, value in strs_resolved_map.items() if value is not None}
+        )
+
+        if self.contact_points and (not self.endpoints_resolved):
+            # only want to raise here if the user specified CPs but resolution failed
+            raise UnresolvableContactPoints(self._endpoint_map_for_insights)
 
     def _create_thread_pool_executor(self, **kwargs):
         """
@@ -1441,7 +1583,7 @@ class Cluster(object):
             # results will include Address instances
             results = session.execute("SELECT * FROM users")
             row = results[0]
-            print row.id, row.location.street, row.location.zipcode
+            print(row.id, row.location.street, row.location.zipcode)
 
         """
         if self.protocol_version < 3:
@@ -1611,13 +1753,13 @@ class Cluster(object):
                 "when using protocol_version 1 or 2.")
         self._max_connections_per_host[host_distance] = max_connections
 
-    def connection_factory(self, endpoint, *args, **kwargs):
+    def connection_factory(self, endpoint, host_conn = None, *args, **kwargs):
         """
         Called to create a new connection with proper configuration.
         Intended for internal use only.
         """
         kwargs = self._make_connection_kwargs(endpoint, kwargs)
-        return self.connection_class.factory(endpoint, self.connect_timeout, *args, **kwargs)
+        return self.connection_class.factory(endpoint, self.connect_timeout, host_conn, *args, **kwargs)
 
     def _make_connection_factory(self, host, *args, **kwargs):
         kwargs = self._make_connection_kwargs(host.endpoint, kwargs)
@@ -1653,6 +1795,20 @@ class Cluster(object):
                     "http://datastax.github.io/python-driver/api/cassandra/cluster.html#cassandra.cluster.Cluster.protocol_version", self.protocol_version, new_version, host_endpoint)
         self.protocol_version = new_version
 
+    def _add_resolved_hosts(self):
+        for endpoint in self.endpoints_resolved:
+            host, new = self.add_host(endpoint, signal=False)
+            if new:
+                host.set_up()
+                for listener in self.listeners:
+                    listener.on_add(host)
+
+        self.profile_manager.populate(
+            weakref.proxy(self), self.metadata.all_hosts())
+        self.load_balancing_policy.populate(
+            weakref.proxy(self), self.metadata.all_hosts()
+        )
+
     def connect(self, keyspace=None, wait_for_all_pools=False):
         """
         Creates and returns a new :class:`~.Session` object.
@@ -1673,18 +1829,8 @@ class Cluster(object):
                           self.contact_points, self.protocol_version)
                 self.connection_class.initialize_reactor()
                 _register_cluster_shutdown(self)
-                for endpoint in self.endpoints_resolved:
-                    host, new = self.add_host(endpoint, signal=False)
-                    if new:
-                        host.set_up()
-                        for listener in self.listeners:
-                            listener.on_add(host)
-
-                self.profile_manager.populate(
-                    weakref.proxy(self), self.metadata.all_hosts())
-                self.load_balancing_policy.populate(
-                    weakref.proxy(self), self.metadata.all_hosts()
-                )
+                
+                self._add_resolved_hosts()
 
                 try:
                     self.control_connection.connect()
@@ -1701,6 +1847,14 @@ class Cluster(object):
                                   "shutting down Cluster:")
                     self.shutdown()
                     raise
+
+                # Update the information about tablet support after connection handshake.
+                self.load_balancing_policy._tablets_routing_v1 = self.control_connection._tablets_routing_v1
+                child_policy = self.load_balancing_policy.child_policy if hasattr(self.load_balancing_policy, 'child_policy') else None
+                while child_policy is not None:
+                    if hasattr(child_policy, '_tablet_routing_v1'):
+                        child_policy._tablet_routing_v1 = self.control_connection._tablets_routing_v1
+                    child_policy = child_policy.child_policy if hasattr(child_policy, 'child_policy') else None
 
                 self.profile_manager.check_supported()  # todo: rename this method
 
@@ -1734,14 +1888,20 @@ class Cluster(object):
         holders.append(self.control_connection)
         return holders
 
+    def get_all_pools(self):
+        pools = []
+        for s in tuple(self.sessions):
+            pools.extend(s.get_pools())
+        return pools
+
     def is_shard_aware(self):
-        return bool(self.get_connection_holders()[:-1][0].host.sharding_info)
+        return bool(self.get_all_pools()[0].host.sharding_info)
 
     def shard_aware_stats(self):
         if self.is_shard_aware():
             return {str(pool.host.endpoint): {'shards_count': pool.host.sharding_info.shards_count,
                                               'connected': len(pool._connections.keys())}
-                    for pool in self.get_connection_holders()[:-1]}
+                    for pool in self.get_all_pools()}
 
     def shutdown(self):
         """
@@ -1784,8 +1944,8 @@ class Cluster(object):
         return session
 
     def _session_register_user_types(self, session):
-        for keyspace, type_map in six.iteritems(self._user_types):
-            for udt_name, klass in six.iteritems(type_map):
+        for keyspace, type_map in self._user_types.items():
+            for udt_name, klass in type_map.items():
                 session.user_type_registered(keyspace, udt_name, klass)
 
     def _cleanup_failed_on_up_handling(self, host):
@@ -1930,6 +2090,17 @@ class Cluster(object):
         reconnector.start()
 
     @run_in_executor
+    def on_down_potentially_blocking(self, host, is_host_addition):
+        self.profile_manager.on_down(host)
+        self.control_connection.on_down(host)
+        for session in tuple(self.sessions):
+            session.on_down(host)
+
+        for listener in self.listeners:
+            listener.on_down(host)
+
+        self._start_reconnector(host, is_host_addition)
+
     def on_down(self, host, is_host_addition, expect_host_to_be_down=False):
         """
         Intended for internal use only.
@@ -1955,18 +2126,9 @@ class Cluster(object):
             host.set_down()
             if (not was_up and not expect_host_to_be_down) or host.is_currently_reconnecting():
                 return
-
         log.warning("Host %s has been marked down", host)
 
-        self.profile_manager.on_down(host)
-        self.control_connection.on_down(host)
-        for session in tuple(self.sessions):
-            session.on_down(host)
-
-        for listener in self.listeners:
-            listener.on_down(host)
-
-        self._start_reconnector(host, is_host_addition)
+        self.on_down_potentially_blocking(host, is_host_addition)
 
     def on_add(self, host, refresh_nodes=True):
         if self.is_shutdown:
@@ -2042,7 +2204,7 @@ class Cluster(object):
         if self.is_shutdown:
             return
 
-        log.debug("Removing host %s", host)
+        log.debug("[cluster] Removing host %s", host)
         host.set_down()
         self.profile_manager.on_remove(host)
         for session in tuple(self.sessions):
@@ -2061,7 +2223,7 @@ class Cluster(object):
             self.on_down(host, is_host_addition, expect_host_to_be_down)
         return is_down
 
-    def add_host(self, endpoint, datacenter=None, rack=None, signal=True, refresh_nodes=True):
+    def add_host(self, endpoint, datacenter=None, rack=None, signal=True, refresh_nodes=True, host_id=None):
         """
         Called when adding initial contact points and when the control
         connection subsequently discovers a new node.
@@ -2069,7 +2231,10 @@ class Cluster(object):
         the metadata.
         Intended for internal use only.
         """
-        host, new = self.metadata.add_or_return_host(Host(endpoint, self.conviction_policy_factory, datacenter, rack))
+        with self.metadata._hosts_lock:
+            if endpoint in self.metadata._host_id_by_endpoint:
+                return self.metadata._hosts[self.metadata._host_id_by_endpoint[endpoint]], False
+        host, new = self.metadata.add_or_return_host(Host(endpoint, self.conviction_policy_factory, datacenter, rack, host_id=host_id))
         if new and signal:
             log.info("New Cassandra host %r discovered", host)
             self.on_add(host, refresh_nodes)
@@ -2308,7 +2473,6 @@ class Cluster(object):
         with self._prepared_statement_lock:
             self._prepared_statements[query_id] = prepared_statement
 
-
 class Session(object):
     """
     A collection of connection pools for each host in the cluster.
@@ -2400,7 +2564,7 @@ class Session(object):
         *Deprecated:* use execution profiles instead
         """
         warn("Setting the consistency level at the session level will be removed in 4.0. Consider using "
-             "execution profiles and setting the desired consitency level to the EXEC_PROFILE_DEFAULT profile."
+             "execution profiles and setting the desired consistency level to the EXEC_PROFILE_DEFAULT profile."
              , DeprecationWarning)
         self._validate_set_legacy_config('default_consistency_level', cl)
 
@@ -2564,6 +2728,17 @@ class Session(object):
         self.session_id = uuid.uuid4()
         self._graph_paging_available = self._check_graph_paging_available()
 
+        if self.cluster.column_encryption_policy is not None:
+            try:
+                self.client_protocol_handler = type(
+                    str(self.session_id) + "-ProtocolHandler",
+                    (ProtocolHandler,),
+                    {"column_encryption_policy": self.cluster.column_encryption_policy})
+            except AttributeError:
+                log.info("Unable to set column encryption policy for session")
+            raise Exception(
+                "column_encryption_policy is temporary disabled, until https://github.com/scylladb/python-driver/issues/365 is sorted out")
+
         if self.cluster.monitor_reporting_enabled:
             cc_host = self.cluster.get_control_connection_host()
             valid_insights_version = (cc_host and version_supports_insights(cc_host.dse_version))
@@ -2665,7 +2840,7 @@ class Session(object):
         """
         custom_payload = custom_payload if custom_payload else {}
         if execute_as:
-            custom_payload[_proxy_execute_key] = six.b(execute_as)
+            custom_payload[_proxy_execute_key] = execute_as.encode()
 
         future = self._create_response_future(
             query, parameters, trace, custom_payload, timeout,
@@ -2729,8 +2904,8 @@ class Session(object):
 
         custom_payload = execution_profile.graph_options.get_options_map()
         if execute_as:
-            custom_payload[_proxy_execute_key] = six.b(execute_as)
-        custom_payload[_request_timeout_key] = int64_pack(long(execution_profile.request_timeout * 1000))
+            custom_payload[_proxy_execute_key] = execute_as.encode()
+        custom_payload[_request_timeout_key] = int64_pack(int(execution_profile.request_timeout * 1000))
 
         future = self._create_response_future(query, parameters=None, trace=trace, custom_payload=custom_payload,
                                               timeout=_NOT_SET, execution_profile=execution_profile)
@@ -2867,7 +3042,7 @@ class Session(object):
 
         prepared_statement = None
 
-        if isinstance(query, six.string_types):
+        if isinstance(query, str):
             query = SimpleStatement(query)
         elif isinstance(query, PreparedStatement):
             query = query.bind(parameters)
@@ -2936,7 +3111,7 @@ class Session(object):
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
-                skip_meta=bool(prepared_statement.result_metadata),
+                can_have_result_metadata=bool(prepared_statement.result_metadata),
                 continuous_paging_options=continuous_paging_options,
                 result_metadata_id=prepared_statement.result_metadata_id)
         elif isinstance(query, BatchStatement):
@@ -3083,7 +3258,7 @@ class Session(object):
         prepared_keyspace = keyspace if keyspace else None
         prepared_statement = PreparedStatement.from_message(
             response.query_id, response.bind_metadata, response.pk_indexes, self.cluster.metadata, query, prepared_keyspace,
-            self._protocol_version, response.column_metadata, response.result_metadata_id)
+            self._protocol_version, response.column_metadata, response.result_metadata_id, self.cluster.column_encryption_policy)
         prepared_statement.custom_payload = future.custom_payload
 
         self.cluster.add_prepared(response.query_id, prepared_statement)
@@ -3335,10 +3510,6 @@ class Session(object):
                 'User type %s does not exist in keyspace %s' % (user_type, keyspace))
 
         field_names = type_meta.field_names
-        if six.PY2:
-            # go from unicode to string to avoid decode errors from implicit
-            # decode when formatting non-ascii values
-            field_names = [fn.encode('utf-8') for fn in field_names]
 
         def encode(val):
             return '{ %s }' % ' , '.join('%s : %s' % (
@@ -3429,7 +3600,7 @@ class ControlConnection(object):
     _SELECT_PEERS = "SELECT * FROM system.peers"
     _SELECT_PEERS_NO_TOKENS_TEMPLATE = "SELECT host_id, peer, data_center, rack, rpc_address, {nt_col_name}, release_version, schema_version FROM system.peers"
     _SELECT_LOCAL = "SELECT * FROM system.local WHERE key='local'"
-    _SELECT_LOCAL_NO_TOKENS = "SELECT host_id, cluster_name, data_center, rack, partitioner, release_version, schema_version FROM system.local WHERE key='local'"
+    _SELECT_LOCAL_NO_TOKENS = "SELECT host_id, cluster_name, data_center, rack, partitioner, release_version, schema_version, rpc_address FROM system.local WHERE key='local'"
     # Used only when token_metadata_enabled is set to False
     _SELECT_LOCAL_NO_TOKENS_RPC_ADDRESS = "SELECT rpc_address FROM system.local WHERE key='local'"
 
@@ -3450,6 +3621,7 @@ class ControlConnection(object):
     _is_shutdown = False
     _timeout = None
     _protocol_version = None
+    _metadata_request_timeout = None
 
     _schema_event_refresh_window = None
     _topology_event_refresh_window = None
@@ -3457,8 +3629,10 @@ class ControlConnection(object):
 
     _schema_meta_enabled = True
     _token_meta_enabled = True
+    _schema_meta_page_size = 1000
 
     _uses_peers_v2 = True
+    _tablets_routing_v1 = False
 
     # for testing purposes
     _time = time
@@ -3468,7 +3642,8 @@ class ControlConnection(object):
                  topology_event_refresh_window,
                  status_event_refresh_window,
                  schema_meta_enabled=True,
-                 token_meta_enabled=True):
+                 token_meta_enabled=True,
+                 schema_meta_page_size=1000):
         # use a weak reference to allow the Cluster instance to be GC'ed (and
         # shutdown) since implementing __del__ disables the cycle detector
         self._cluster = weakref.proxy(cluster)
@@ -3480,6 +3655,7 @@ class ControlConnection(object):
         self._status_event_refresh_window = status_event_refresh_window
         self._schema_meta_enabled = schema_meta_enabled
         self._token_meta_enabled = token_meta_enabled
+        self._schema_meta_page_size = schema_meta_page_size
 
         self._lock = RLock()
         self._schema_agreement_lock = Lock()
@@ -3509,6 +3685,29 @@ class ControlConnection(object):
         if old:
             log.debug("[control connection] Closing old connection %r, replacing with %r", old, conn)
             old.close()
+    
+    def _connect_host_in_lbp(self):
+        errors = {}
+        lbp = (
+            self._cluster.load_balancing_policy
+            if self._cluster._config_mode == _ConfigMode.LEGACY else
+            self._cluster._default_load_balancing_policy
+        )
+
+        for host in lbp.make_query_plan():
+            try:
+                return (self._try_connect(host), None)
+            except ConnectionException as exc:
+                errors[str(host.endpoint)] = exc
+                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
+                self._cluster.signal_connection_failure(host, exc, is_host_addition=False)
+            except Exception as exc:
+                errors[str(host.endpoint)] = exc
+                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
+            if self._is_shutdown:
+                raise DriverException("[control connection] Reconnection in progress during shutdown")
+        
+        return (None, errors)
 
     def _reconnect_internal(self):
         """
@@ -3519,26 +3718,19 @@ class ControlConnection(object):
         to the exception that was raised when an attempt was made to open
         a connection to that host.
         """
-        errors = {}
-        lbp = (
-            self._cluster.load_balancing_policy
-            if self._cluster._config_mode == _ConfigMode.LEGACY else
-            self._cluster._default_load_balancing_policy
-        )
+        (conn, _) = self._connect_host_in_lbp()
+        if conn is not None:
+            return conn
 
-        for host in lbp.make_query_plan():
-            try:
-                return self._try_connect(host)
-            except ConnectionException as exc:
-                errors[str(host.endpoint)] = exc
-                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
-                self._cluster.signal_connection_failure(host, exc, is_host_addition=False)
-            except Exception as exc:
-                errors[str(host.endpoint)] = exc
-                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
-            if self._is_shutdown:
-                raise DriverException("[control connection] Reconnection in progress during shutdown")
+        # Try to re-resolve hostnames as a fallback when all hosts are unreachable
+        self._cluster._resolve_hostnames()
 
+        self._cluster._add_resolved_hosts()
+
+        (conn, errors) = self._connect_host_in_lbp()
+        if conn is not None:
+            return conn
+        
         raise NoHostAvailable("Unable to connect to any servers", errors)
 
     def _try_connect(self, host):
@@ -3570,6 +3762,16 @@ class ControlConnection(object):
                   "registering watchers and refreshing schema and topology",
                   connection)
 
+        # Indirect way to determine if conencted to a ScyllaDB cluster, which does not support peers_v2
+        # If sharding information is available, it's a ScyllaDB cluster, so do not use peers_v2 table.
+        if connection.features.sharding_info is not None:
+            self._uses_peers_v2 = False
+
+        # Cassandra does not support "USING TIMEOUT"
+        self._metadata_request_timeout = None if connection.features.sharding_info is None \
+            else datetime.timedelta(seconds=self._cluster.control_connection_timeout)
+        self._tablets_routing_v1 = connection.features.tablets_routing_v1
+
         # use weak references in both directions
         # _clear_watcher will be called when this ControlConnection is about to be finalized
         # _watch_callback will get the actual callback from the Connection and relay it to
@@ -3584,8 +3786,10 @@ class ControlConnection(object):
 
             sel_peers = self._get_peers_query(self.PeersQueryType.PEERS, connection)
             sel_local = self._SELECT_LOCAL if self._token_meta_enabled else self._SELECT_LOCAL_NO_TOKENS
-            peers_query = QueryMessage(query=sel_peers, consistency_level=ConsistencyLevel.ONE)
-            local_query = QueryMessage(query=sel_local, consistency_level=ConsistencyLevel.ONE)
+            peers_query = QueryMessage(query=maybe_add_timeout_to_query(sel_peers, self._metadata_request_timeout),
+                                       consistency_level=ConsistencyLevel.ONE)
+            local_query = QueryMessage(query=maybe_add_timeout_to_query(sel_local, self._metadata_request_timeout),
+                                       consistency_level=ConsistencyLevel.ONE)
             (peers_success, peers_result), (local_success, local_result) = connection.wait_for_responses(
                 peers_query, local_query, timeout=self._timeout, fail_on_error=False)
 
@@ -3596,7 +3800,8 @@ class ControlConnection(object):
                 # error with the peers v2 query, fallback to peers v1
                 self._uses_peers_v2 = False
                 sel_peers = self._get_peers_query(self.PeersQueryType.PEERS, connection)
-                peers_query = QueryMessage(query=sel_peers, consistency_level=ConsistencyLevel.ONE)
+                peers_query = QueryMessage(query=maybe_add_timeout_to_query(sel_peers, self._metadata_request_timeout),
+                                           consistency_level=ConsistencyLevel.ONE)
                 peers_result = connection.wait_for_response(
                     peers_query, timeout=self._timeout)
 
@@ -3704,7 +3909,12 @@ class ControlConnection(object):
             log.debug("Skipping schema refresh due to lack of schema agreement")
             return False
 
-        self._cluster.metadata.refresh(connection, self._timeout, **kwargs)
+        self._cluster.metadata.refresh(
+            connection,
+            self._timeout,
+            fetch_size=self._schema_meta_page_size,
+            metadata_request_timeout=self._metadata_request_timeout,
+            **kwargs)
 
         return True
 
@@ -3735,8 +3945,10 @@ class ControlConnection(object):
             else:
                 log.debug("[control connection] Refreshing node list and token map")
                 sel_local = self._SELECT_LOCAL
-            peers_query = QueryMessage(query=sel_peers, consistency_level=cl)
-            local_query = QueryMessage(query=sel_local, consistency_level=cl)
+            peers_query = QueryMessage(query=maybe_add_timeout_to_query(sel_peers, self._metadata_request_timeout),
+                                       consistency_level=cl)
+            local_query = QueryMessage(query=maybe_add_timeout_to_query(sel_local, self._metadata_request_timeout),
+                                       consistency_level=cl)
             peers_result, local_result = connection.wait_for_responses(
                 peers_query, local_query, timeout=self._timeout)
 
@@ -3745,9 +3957,10 @@ class ControlConnection(object):
         partitioner = None
         token_map = {}
 
-        found_hosts = set()
+        found_host_ids = set()
+        found_endpoints = set()
+
         if local_result.parsed_rows:
-            found_hosts.add(connection.endpoint)
             local_rows = dict_factory(local_result.column_names, local_result.parsed_rows)
             local_row = local_rows[0]
             cluster_name = local_row["cluster_name"]
@@ -3756,12 +3969,24 @@ class ControlConnection(object):
             partitioner = local_row.get("partitioner")
             tokens = local_row.get("tokens")
 
-            host = self._cluster.metadata.get_host(connection.endpoint)
+            host = self._cluster.metadata.get_host(connection.original_endpoint)
             if host:
                 datacenter = local_row.get("data_center")
                 rack = local_row.get("rack")
                 self._update_location_info(host, datacenter, rack)
+
+                # support the use case of connecting only with public address
+                if isinstance(self._cluster.endpoint_factory, SniEndPointFactory):
+                    new_endpoint = self._cluster.endpoint_factory.create(local_row)
+
+                    if new_endpoint.address:
+                        host.endpoint = new_endpoint
+
                 host.host_id = local_row.get("host_id")
+
+                found_host_ids.add(host.host_id)
+                found_endpoints.add(host.endpoint)
+
                 host.listen_address = local_row.get("listen_address")
                 host.listen_port = local_row.get("listen_port")
                 host.broadcast_address = _NodeInfo.get_broadcast_address(local_row)
@@ -3778,8 +4003,9 @@ class ControlConnection(object):
                         # local rpc_address has not been queried yet, try to fetch it
                         # separately, which might fail because C* < 2.1.6 doesn't have rpc_address
                         # in system.local. See CASSANDRA-9436.
-                        local_rpc_address_query = QueryMessage(query=self._SELECT_LOCAL_NO_TOKENS_RPC_ADDRESS,
-                                                               consistency_level=ConsistencyLevel.ONE)
+                        local_rpc_address_query = QueryMessage(
+                            query=maybe_add_timeout_to_query(self._SELECT_LOCAL_NO_TOKENS_RPC_ADDRESS, self._metadata_request_timeout),
+                            consistency_level=ConsistencyLevel.ONE)
                         success, local_rpc_address_result = connection.wait_for_response(
                             local_rpc_address_query, timeout=self._timeout, fail_on_error=False)
                         if success:
@@ -3800,36 +4026,53 @@ class ControlConnection(object):
                 if partitioner and tokens:
                     token_map[host] = tokens
 
+                self._cluster.metadata.update_host(host, old_endpoint=connection.endpoint)
+                connection.original_endpoint = connection.endpoint = host.endpoint
         # Check metadata.partitioner to see if we haven't built anything yet. If
         # every node in the cluster was in the contact points, we won't discover
         # any new nodes, so we need this additional check.  (See PYTHON-90)
         should_rebuild_token_map = force_token_rebuild or self._cluster.metadata.partitioner is None
         for row in peers_result:
             if not self._is_valid_peer(row):
-                log.warning(
-                    "Found an invalid row for peer (%s). Ignoring host." %
-                    _NodeInfo.get_broadcast_rpc_address(row))
                 continue
 
             endpoint = self._cluster.endpoint_factory.create(row)
+            host_id = row.get("host_id")
 
-            if endpoint in found_hosts:
-                log.warning("Found multiple hosts with the same endpoint (%s). Excluding peer %s", endpoint, row.get("peer"))
+            if endpoint in found_endpoints:
+                log.warning("Found multiple hosts with the same endpoint(%s). Excluding peer %s - %s", endpoint, row.get("peer"), host_id)
                 continue
 
-            found_hosts.add(endpoint)
+            if host_id in found_host_ids:
+                log.warning("Found multiple hosts with the same host_id (%s). Excluding peer %s", host_id, row.get("peer"))
+                continue
 
+            found_host_ids.add(host_id)
+            found_endpoints.add(endpoint)
             host = self._cluster.metadata.get_host(endpoint)
             datacenter = row.get("data_center")
             rack = row.get("rack")
+
+            if host is None:
+                host = self._cluster.metadata.get_host_by_host_id(host_id)
+                if host and host.endpoint != endpoint:
+                    log.debug("[control connection] Updating host ip from %s to %s for (%s)", host.endpoint, endpoint, host_id)
+                    old_endpoint = host.endpoint
+                    host.endpoint = endpoint
+                    self._cluster.metadata.update_host(host, old_endpoint)
+                    reconnector = host.get_and_set_reconnection_handler(None)
+                    if reconnector:
+                        reconnector.cancel()
+                    self._cluster.on_down(host, is_host_addition=False, expect_host_to_be_down=True)
+
             if host is None:
                 log.debug("[control connection] Found new host to connect to: %s", endpoint)
-                host, _ = self._cluster.add_host(endpoint, datacenter, rack, signal=True, refresh_nodes=False)
+                host, _ = self._cluster.add_host(endpoint, datacenter=datacenter, rack=rack, signal=True, refresh_nodes=False, host_id=host_id)
                 should_rebuild_token_map = True
             else:
                 should_rebuild_token_map |= self._update_location_info(host, datacenter, rack)
 
-            host.host_id = row.get("host_id")
+            host.host_id = host_id
             host.broadcast_address = _NodeInfo.get_broadcast_address(row)
             host.broadcast_port = _NodeInfo.get_broadcast_port(row)
             host.broadcast_rpc_address = _NodeInfo.get_broadcast_rpc_address(row)
@@ -3842,12 +4085,13 @@ class ControlConnection(object):
             tokens = row.get("tokens", None)
             if partitioner and tokens and self._token_meta_enabled:
                 token_map[host] = tokens
+            self._cluster.metadata.update_host(host, old_endpoint=endpoint)
 
-        for old_host in self._cluster.metadata.all_hosts():
-            if old_host.endpoint.address != connection.endpoint and old_host.endpoint not in found_hosts:
+        for old_host_id, old_host in self._cluster.metadata.all_hosts_items():
+            if old_host_id not in found_host_ids:
                 should_rebuild_token_map = True
                 log.debug("[control connection] Removing host not found in peers metadata: %r", old_host)
-                self._cluster.remove_host(old_host)
+                self._cluster.metadata.remove_host_by_host_id(old_host_id, old_host.endpoint)
 
         log.debug("[control connection] Finished fetching ring info")
         if partitioner and should_rebuild_token_map:
@@ -3856,9 +4100,40 @@ class ControlConnection(object):
 
     @staticmethod
     def _is_valid_peer(row):
-        return bool(_NodeInfo.get_broadcast_rpc_address(row) and row.get("host_id") and
-                    row.get("data_center") and row.get("rack") and
-                    ('tokens' not in row or row.get('tokens')))
+        broadcast_rpc = _NodeInfo.get_broadcast_rpc_address(row)
+        host_id = row.get("host_id")
+
+        if not broadcast_rpc:
+            log.warning(
+                "Found an invalid row for peer - missing broadcast_rpc (full row: %s). Ignoring host." %
+                row)
+            return False
+
+        if not host_id:
+            log.warning(
+                "Found an invalid row for peer - missing host_id (broadcast_rpc: %s). Ignoring host." %
+                broadcast_rpc)
+            return False
+
+        if not row.get("data_center"):
+            log.warning(
+                "Found an invalid row for peer - missing data_center (broadcast_rpc: %s, host_id: %s). Ignoring host." %
+                (broadcast_rpc, host_id))
+            return False
+
+        if not row.get("rack"):
+            log.warning(
+                "Found an invalid row for peer - missing rack (broadcast_rpc: %s, host_id: %s). Ignoring host." %
+                (broadcast_rpc, host_id))
+            return False
+
+        if "tokens" in row and not row.get("tokens"):
+            log.debug(
+                "Found a zero-token node - tokens is None (broadcast_rpc: %s, host_id: %s). Ignoring host." %
+                (broadcast_rpc, host_id))
+            return False
+
+        return True
 
     def _update_location_info(self, host, datacenter, rack):
         if host.datacenter == datacenter and host.rack == rack:
@@ -3965,8 +4240,10 @@ class ControlConnection(object):
             select_peers_query = self._get_peers_query(self.PeersQueryType.PEERS_SCHEMA, connection)
 
             while elapsed < total_timeout:
-                peers_query = QueryMessage(query=select_peers_query, consistency_level=cl)
-                local_query = QueryMessage(query=self._SELECT_SCHEMA_LOCAL, consistency_level=cl)
+                peers_query = QueryMessage(query=maybe_add_timeout_to_query(select_peers_query, self._metadata_request_timeout),
+                                           consistency_level=cl)
+                local_query = QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_SCHEMA_LOCAL, self._metadata_request_timeout),
+                                           consistency_level=cl)
                 try:
                     timeout = min(self._timeout, total_timeout - elapsed)
                     peers_result, local_result = connection.wait_for_responses(
@@ -4017,7 +4294,7 @@ class ControlConnection(object):
             log.debug("[control connection] Schemas match")
             return None
 
-        return dict((version, list(nodes)) for version, nodes in six.iteritems(versions))
+        return dict((version, list(nodes)) for version, nodes in versions.items())
 
     def _get_peers_query(self, peers_query_type, connection=None):
         """
@@ -4049,9 +4326,8 @@ class ControlConnection(object):
                 query_template = (self._SELECT_SCHEMA_PEERS_TEMPLATE
                                   if peers_query_type == self.PeersQueryType.PEERS_SCHEMA
                                   else self._SELECT_PEERS_NO_TOKENS_TEMPLATE)
-
-                host_release_version = self._cluster.metadata.get_host(connection.endpoint).release_version
-                host_dse_version = self._cluster.metadata.get_host(connection.endpoint).dse_version
+                host_release_version = self._cluster.metadata.get_host(connection.original_endpoint).release_version
+                host_dse_version = self._cluster.metadata.get_host(connection.original_endpoint).dse_version
                 uses_native_address_query = (
                     host_dse_version and Version(host_dse_version) >= self._MINIMUM_NATIVE_ADDRESS_DSE_VERSION)
 
@@ -4137,7 +4413,7 @@ class _Scheduler(Thread):
     is_shutdown = False
 
     def __init__(self, executor):
-        self._queue = Queue.PriorityQueue()
+        self._queue = queue.PriorityQueue()
         self._scheduled_tasks = set()
         self._count = count()
         self._executor = executor
@@ -4195,7 +4471,7 @@ class _Scheduler(Thread):
                     else:
                         self._queue.put_nowait((run_at, i, task))
                         break
-            except Queue.Empty:
+            except queue.Empty:
                 pass
 
             time.sleep(0.1)
@@ -4462,7 +4738,10 @@ class ResponseFuture(object):
         connection = None
         try:
             # TODO get connectTimeout from cluster settings
-            connection, request_id = pool.borrow_connection(timeout=2.0, routing_key=self.query.routing_key if self.query else None)
+            if self.query:
+                connection, request_id = pool.borrow_connection(timeout=2.0, routing_key=self.query.routing_key, keyspace=self.query.keyspace, table=self.query.table)
+            else:
+                connection, request_id = pool.borrow_connection(timeout=2.0)
             self._connection = connection
             result_meta = self.prepared_statement.result_metadata if self.prepared_statement else []
 
@@ -4569,7 +4848,7 @@ class ResponseFuture(object):
     def _set_result(self, host, connection, pool, response):
         try:
             self.coordinator_host = host
-            if pool:
+            if pool and not pool.is_shutdown:
                 pool.return_connection(connection)
 
             trace_id = getattr(response, 'trace_id', None)
@@ -4580,6 +4859,19 @@ class ResponseFuture(object):
 
             self._warnings = getattr(response, 'warnings', None)
             self._custom_payload = getattr(response, 'custom_payload', None)
+
+            if self._custom_payload and self.session.cluster.control_connection._tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
+                protocol = self.session.cluster.protocol_version
+                info = self._custom_payload.get('tablets-routing-v1')
+                ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))')
+                tablet_routing_info = ctype.from_binary(info, protocol)
+                first_token = tablet_routing_info[0]
+                last_token = tablet_routing_info[1]
+                tablet_replicas = tablet_routing_info[2]
+                tablet = Tablet.from_row(first_token, last_token, tablet_replicas)
+                keyspace = self.query.keyspace
+                table = self.query.table
+                self.session.cluster.metadata._tablets.add_tablet(keyspace, table, tablet)
 
             if isinstance(response, ResultMessage):
                 if response.kind == RESULT_KIND_SET_KEYSPACE:
@@ -4837,12 +5129,16 @@ class ResponseFuture(object):
                 return response.to_exception()
             else:
                 return response
+        if len(retry_decision) == 2:
+            retry_type, consistency = retry_decision
+            delay = 0
+        elif len(retry_decision) == 3:
+            retry_type, consistency, delay = retry_decision
 
-        retry_type, consistency = retry_decision
         if retry_type in (RetryPolicy.RETRY, RetryPolicy.RETRY_NEXT_HOST):
             self._query_retries += 1
             reuse = retry_type == RetryPolicy.RETRY
-            self._retry(reuse, consistency, host)
+            self._retry(reuse, consistency, host, delay)
         elif retry_type is RetryPolicy.RETHROW:
             self._set_final_exception(exception_from_response(response))
         else:  # IGNORE
@@ -4852,7 +5148,7 @@ class ResponseFuture(object):
 
         self._errors[host] = exception_from_response(response)
 
-    def _retry(self, reuse_connection, consistency_level, host):
+    def _retry(self, reuse_connection, consistency_level, host, delay):
         if self._final_exception:
             # the connection probably broke while we were waiting
             # to retry the operation
@@ -4864,7 +5160,7 @@ class ResponseFuture(object):
             self.message.consistency_level = consistency_level
 
         # don't retry on the event loop thread
-        self.session.submit(self._retry_task, reuse_connection, host)
+        self.session.cluster.scheduler.schedule(delay, self._retry_task, reuse_connection, host)
 
     def _retry_task(self, reuse_connection, host):
         if self._final_exception:
@@ -5157,6 +5453,11 @@ class ResultSet(object):
         if not self.response_future._continuous_paging_session:
             self.fetch_next_page()
             self._page_iter = iter(self._current_rows)
+
+            # Some servers can return empty pages in this case; Scylla is known to do
+            # so in some circumstances.  Guard against this by recursing to handle
+            # the next(iter) call.  If we have an empty page in that case it will
+            # get handled by the StopIteration handler when we recurse.
             return self.next()
 
         return next(self._page_iter)
@@ -5236,6 +5537,8 @@ class ResultSet(object):
         except AttributeError:
             raise DriverException("Attempted to cancel paging with no active session. This is only for requests with ContinuousdPagingOptions.")
 
+    batch_regex = re.compile(r'^\s*BEGIN\s+[a-zA-Z]*\s*BATCH')
+
     @property
     def was_applied(self):
         """
@@ -5250,7 +5553,8 @@ class ResultSet(object):
         if self.response_future.row_factory not in (named_tuple_factory, dict_factory, tuple_factory):
             raise RuntimeError("Cannot determine LWT result with row factory %s" % (self.response_future.row_factory,))
 
-        is_batch_statement = isinstance(self.response_future.query, BatchStatement)
+        is_batch_statement = isinstance(self.response_future.query, BatchStatement) \
+                            or (isinstance(self.response_future.query, SimpleStatement) and self.batch_regex.match(self.response_future.query.query_string))
         if is_batch_statement and (not self.column_names or self.column_names[0] != "[applied]"):
             raise RuntimeError("No LWT were present in the BatchStatement")
 

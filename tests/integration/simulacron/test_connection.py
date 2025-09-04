@@ -11,15 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import logging
 import time
-
-from mock import Mock, patch
+from unittest.mock import Mock, patch
 
 from cassandra import OperationTimedOut
 from cassandra.cluster import (EXEC_PROFILE_DEFAULT, Cluster, ExecutionProfile,
@@ -265,7 +261,7 @@ class ConnectionTests(SimulacronBase):
         prime_request(PrimeOptions(then={"result": "no_result", "delay_in_ms": never}))
         prime_request(RejectConnections("unbind"))
 
-        self.assertRaisesRegexp(OperationTimedOut, "Connection defunct by heartbeat", future.result)
+        self.assertRaisesRegex(OperationTimedOut, "Connection defunct by heartbeat", future.result)
 
     def test_close_when_query(self):
         """
@@ -467,14 +463,14 @@ class ConnectionTests(SimulacronBase):
         for host in cluster.metadata.all_hosts():
             self.assertIn(host, listener.hosts_marked_down)
 
-        self.assertRaises(NoHostAvailable, session.execute, "SELECT * from system.local")
+        self.assertRaises(NoHostAvailable, session.execute, "SELECT * from system.local WHERE key='local'")
 
         clear_queries()
         prime_request(AcceptConnections())
 
         time.sleep(idle_heartbeat_timeout + idle_heartbeat_interval + 2)
 
-        self.assertIsNotNone(session.execute("SELECT * from system.local"))
+        self.assertIsNotNone(session.execute("SELECT * from system.local WHERE key='local'"))
 
     def test_max_in_flight(self):
         """ Verify we don't exceed max_in_flight when borrowing connections or sending heartbeats """

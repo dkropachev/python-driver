@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from unittest import mock
 
 from cassandra.cqlengine import columns
 from cassandra.cqlengine.connection import NOT_SET
@@ -27,6 +27,7 @@ from cassandra.cqlengine.query import BatchType as cqlengine_BatchType
 
 
 class TestMultiKeyModel(Model):
+    __test__ = False
 
     partition = columns.Integer(primary_key=True)
     cluster = columns.Integer(primary_key=True)

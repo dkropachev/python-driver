@@ -11,13 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
-import mock
-import six
+import unittest
+from unittest import mock
 from uuid import uuid4
 
 from cassandra.cqlengine import columns
@@ -31,12 +26,16 @@ from tests.integration import greaterthancass20
 
 
 class TestConditionalModel(Model):
+    __test__ = False
+
     id = columns.UUID(primary_key=True, default=uuid4)
     count = columns.Integer()
     text = columns.Text(required=False)
 
 
 class TestUpdateModel(Model):
+    __test__ = False
+
     partition = columns.Integer(primary_key=True)
     cluster = columns.Integer(primary_key=True)
     value = columns.Integer(required=False)
@@ -116,7 +115,7 @@ class TestConditional(BaseCassEngTestCase):
         tc = ConditionalClause('some_value', 23)
         tc.set_context_id(3)
 
-        self.assertEqual('"some_value" = %(3)s', six.text_type(tc))
+        self.assertEqual('"some_value" = %(3)s', str(tc))
         self.assertEqual('"some_value" = %(3)s', str(tc))
 
     def test_batch_update_conditional(self):

@@ -1,0 +1,124 @@
+[project]
+name = "scylla-driver"
+description = "Scylla Driver for Apache Cassandra"
+authors = [
+    {name = "ScyllaDB"},
+]
+keywords = ["cassandra", "cql", "orm", "dse", "graph"]
+classifiers = [
+    'Development Status :: 5 - Production/Stable',
+    'Intended Audience :: Developers',
+    'License :: OSI Approved :: Apache Software License',
+    'Natural Language :: English',
+    'Operating System :: OS Independent',
+    'Programming Language :: Python',
+    'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: Implementation :: CPython',
+    'Programming Language :: Python :: Implementation :: PyPy',
+    'Topic :: Software Development :: Libraries :: Python Modules'
+]
+dependencies = [
+    'geomet>=1.1',
+    'pyyaml > 5.0'
+]
+dynamic = ["version", "readme"]
+
+[project.urls]
+"Homepage" = "https://github.com/scylladb/python-driver"
+"Documentation" = "https://scylladb.github.io/python-driver/"
+"Source" = "https://github.com/scylladb/python-driver/"
+"Issues" = "https://github.com/scylladb/python-driver/issues"
+
+[project.optional-dependencies]
+graph =  ['gremlinpython==3.4.6']
+cle = ['cryptography>=35.0']
+test = [
+    "pytest",
+    "PyYAML",
+    "pytz",
+    "sure",
+    "scales",
+    "pure-sasl",
+    "twisted[tls]; python_version >= '3.5'",
+    "twisted[tls]==19.2.1; python_version < '3.5'",
+    "gevent>=1.0; python_version < '3.13' and platform_machine != 'i686' and platform_machine != 'win32'",
+    "gevent==23.9.0; python_version < '3.13' and (platform_machine == 'i686' or platform_machine == 'win32')",
+    "eventlet>=0.33.3; python_version < '3.13'",
+    "cython",
+    "packaging",
+    "futurist; python_version >= '3.7'",
+    "asynctest; python_version >= '3.5'",
+    "pyyaml",
+]
+
+[tool.setuptools]
+include-package-data = true
+packages=[
+    'cassandra', 'cassandra.io', 'cassandra.cqlengine', 'cassandra.graph',
+    'cassandra.datastax', 'cassandra.datastax.insights', 'cassandra.datastax.graph',
+    'cassandra.datastax.graph.fluent', 'cassandra.datastax.cloud', 'cassandra.scylla',
+    'cassandra.column_encryption'
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "cassandra.__version__"}  # any module attribute compatible with ast.literal_eval
+readme = {file = "README.rst", content-type = "text/x-rst"}
+
+[build-system]
+requires = [
+    "setuptools>=42",
+    "Cython",
+]
+
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_file = "cassandra/_version.py"
+tag_regex = '(?P<version>\d*?\.\d*?\.\d*?)-scylla'
+
+#### CI BUILDWHEEL CONFIG ####
+
+[tool.cibuildwheel]
+build-frontend = "build[uv]"
+environment = { CASS_DRIVER_BUILD_CONCURRENCY = "2", CASS_DRIVER_BUILD_EXTENSIONS_ARE_MUST = "yes", CFLAGS = "-g0 -O3" }
+skip = ["cp2*", "cp36*", "pp36*", "cp37*", "pp37*", "*i686", "*musllinux*"]
+build = ["cp3*", "pp3*"]
+
+before-test = "pip install -r {project}/test-requirements.txt"
+
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+manylinux-pypy_x86_64-image = "manylinux_2_28"
+manylinux-pypy_aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.linux]
+
+before-build = "rm -rf ~/.pyxbld && rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux && yum install -y libffi-devel libev libev-devel openssl openssl-devel"
+test-command = [
+  "pytest {package}/tests/unit",
+  "EVENT_LOOP_MANAGER=gevent pytest {package}/tests/unit/io/test_geventreactor.py",
+]
+
+[tool.cibuildwheel.macos]
+build-frontend = "build"
+test-command = [
+    "pytest {project}/tests/unit -k 'not (test_multi_timer_validation or test_empty_connections or test_timer_cancellation)'"
+]
+
+[tool.cibuildwheel.windows]
+build-frontend = "build"
+test-command = [
+    "pytest {project}/tests/unit  -k \"not (test_deserialize_date_range_year or test_datetype or test_libevreactor)\""
+]
+
+# TODO: set CASS_DRIVER_BUILD_EXTENSIONS_ARE_MUST to yes when https://github.com/scylladb/python-driver/issues/429 is fixed
+environment = { CASS_DRIVER_BUILD_CONCURRENCY = "2", CASS_DRIVER_BUILD_EXTENSIONS_ARE_MUST = "no"}
+
+[[tool.cibuildwheel.overrides]]
+select = "pp*"
+test-command = []

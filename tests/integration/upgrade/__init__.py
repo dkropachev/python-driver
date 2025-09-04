@@ -27,10 +27,7 @@ from ccmlib.node import TimeoutError
 import time
 import logging
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 
 def setup_module():
@@ -79,8 +76,12 @@ class UpgradeBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.logger_handler = MockLoggingHandler()
-        logger = logging.getLogger(cluster.__name__)
-        logger.addHandler(cls.logger_handler)
+        cls.logger = logging.getLogger(cluster.__name__)
+        cls.logger.addHandler(cls.logger_handler)
+    
+    @classmethod
+    def tearDownClass(cls):
+        cls.logger.removeHandler(cls.logger_handler)
 
     def _upgrade_step_setup(self):
         """

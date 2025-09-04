@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest
+import unittest
 
 import os, sys, traceback, logging, ssl, time, math, uuid
 from cassandra.cluster import NoHostAvailable
@@ -31,7 +28,7 @@ from tests.integration import (
 
 if not hasattr(ssl, 'match_hostname'):
     try:
-        from backports.ssl_match_hostname import match_hostname
+        from ssl import match_hostname
         ssl.match_hostname = match_hostname
     except ImportError:
         pass  # tests will fail
@@ -54,7 +51,7 @@ DRIVER_CERTFILE_BAD = os.path.abspath("tests/integration/long/ssl/client_bad.key
 USES_PYOPENSSL = "twisted" in EVENT_LOOP_MANAGER or "eventlet" in EVENT_LOOP_MANAGER
 if "twisted" in EVENT_LOOP_MANAGER:
     import OpenSSL
-    ssl_version = OpenSSL.SSL.TLSv1_2_METHOD
+    ssl_version = OpenSSL.SSL.TLS_METHOD
     verify_certs = {'cert_reqs': SSL.VERIFY_PEER,
                     'check_hostname': True}
 else:
@@ -196,7 +193,7 @@ class SSLConnectionTests(unittest.TestCase):
         # attempt a few simple commands.
 
         for i in range(8):
-            rs = session.execute("SELECT * FROM system.local")
+            rs = session.execute("SELECT * FROM system.local WHERE key='local'")
             time.sleep(10)
 
         cluster.shutdown()
@@ -404,7 +401,7 @@ class SSLConnectionWithSSLContextTests(unittest.TestCase):
         @test_category connection:ssl
         """
         if USES_PYOPENSSL:
-            ssl_context = SSL.Context(SSL.TLSv1_2_METHOD)
+            ssl_context = SSL.Context(SSL.TLS_CLIENT_METHOD)
             ssl_context.load_verify_locations(CLIENT_CA_CERTS)
         else:
             ssl_context = ssl.SSLContext(ssl_version)
@@ -428,7 +425,7 @@ class SSLConnectionWithSSLContextTests(unittest.TestCase):
         ssl_options = {}
 
         if USES_PYOPENSSL:
-            ssl_context = SSL.Context(SSL.TLSv1_2_METHOD)
+            ssl_context = SSL.Context(SSL.TLS_CLIENT_METHOD)
             ssl_context.use_certificate_file(abs_driver_certfile)
             with open(abs_driver_keyfile) as keyfile:
                 key = crypto.load_privatekey(crypto.FILETYPE_PEM, keyfile.read(), b'cassandra')
@@ -449,7 +446,7 @@ class SSLConnectionWithSSLContextTests(unittest.TestCase):
         """
         ssl_options = {}
         if USES_PYOPENSSL:
-            ssl_context = SSL.Context(SSL.TLSv1_2_METHOD)
+            ssl_context = SSL.Context(SSL.TLS_CLIENT_METHOD)
             ssl_context.use_certificate_file(DRIVER_CERTFILE)
             with open(DRIVER_KEYFILE_ENCRYPTED) as keyfile:
                 key = crypto.load_privatekey(crypto.FILETYPE_PEM, keyfile.read(), b'cassandra')
@@ -472,7 +469,7 @@ class SSLConnectionWithSSLContextTests(unittest.TestCase):
     def test_cannot_connect_ssl_context_with_invalid_hostname(self):
         ssl_options = {}
         if USES_PYOPENSSL:
-            ssl_context = SSL.Context(SSL.TLSv1_2_METHOD)
+            ssl_context = SSL.Context(SSL.TLS_CLIENT_METHOD)
             ssl_context.use_certificate_file(DRIVER_CERTFILE)
             with open(DRIVER_KEYFILE_ENCRYPTED) as keyfile:
                 key = crypto.load_privatekey(crypto.FILETYPE_PEM, keyfile.read(), b"cassandra")

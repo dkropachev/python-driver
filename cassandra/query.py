@@ -19,18 +19,17 @@ queries.
 """
 
 from collections import namedtuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import struct
 import time
-import six
-from six.moves import range, zip
 import warnings
 
 from cassandra import ConsistencyLevel, OperationTimedOut
-from cassandra.util import unix_time_from_uuid1
+from cassandra.util import unix_time_from_uuid1, maybe_add_timeout_to_query
 from cassandra.encoder import Encoder
 import cassandra.encoder
+from cassandra.policies import ColDesc
 from cassandra.protocol import _UNSET_VALUE
 from cassandra.util import OrderedDict, _sanitize_identifiers
 
@@ -76,7 +75,7 @@ def tuple_factory(colnames, rows):
         >>> session = cluster.connect('mykeyspace')
         >>> session.row_factory = tuple_factory
         >>> rows = session.execute("SELECT name, age FROM users LIMIT 1")
-        >>> print rows[0]
+        >>> print(rows[0])
         ('Bob', 42)
 
     .. versionchanged:: 2.0.0
@@ -132,16 +131,16 @@ def named_tuple_factory(colnames, rows):
         >>> user = rows[0]
 
         >>> # you can access field by their name:
-        >>> print "name: %s, age: %d" % (user.name, user.age)
+        >>> print("name: %s, age: %d" % (user.name, user.age))
         name: Bob, age: 42
 
         >>> # or you can access fields by their position (like a tuple)
         >>> name, age = user
-        >>> print "name: %s, age: %d" % (name, age)
+        >>> print("name: %s, age: %d" % (name, age))
         name: Bob, age: 42
         >>> name = user[0]
         >>> age = user[1]
-        >>> print "name: %s, age: %d" % (name, age)
+        >>> print("name: %s, age: %d" % (name, age))
         name: Bob, age: 42
 
     .. versionchanged:: 2.0.0
@@ -187,7 +186,7 @@ def dict_factory(colnames, rows):
         >>> session = cluster.connect('mykeyspace')
         >>> session.row_factory = dict_factory
         >>> rows = session.execute("SELECT name, age FROM users LIMIT 1")
-        >>> print rows[0]
+        >>> print(rows[0])
         {u'age': 42, u'name': u'Bob'}
 
     .. versionchanged:: 2.0.0
@@ -253,6 +252,13 @@ class Statement(object):
     .. versionadded:: 2.1.3
     """
 
+    table = None
+    """
+    The string name of the table this query acts on. This is used when the tablet
+    feature is enabled and in the same time :class`~.TokenAwarePolicy` is configured
+    in the profile load balancing policy.
+    """
+
     custom_payload = None
     """
     :ref:`custom_payload` to be passed to the server.
@@ -272,7 +278,7 @@ class Statement(object):
 
     def __init__(self, retry_policy=None, consistency_level=None, routing_key=None,
                  serial_consistency_level=None, fetch_size=FETCH_SIZE_UNSET, keyspace=None, custom_payload=None,
-                 is_idempotent=False):
+                 is_idempotent=False, table=None):
         if retry_policy and not hasattr(retry_policy, 'on_read_timeout'):  # just checking one method to detect positional parameter errors
             raise ValueError('retry_policy should implement cassandra.policies.RetryPolicy')
         if retry_policy is not None:
@@ -286,6 +292,8 @@ class Statement(object):
             self.fetch_size = fetch_size
         if keyspace is not None:
             self.keyspace = keyspace
+        if table is not None:
+            self.table = table
         if custom_payload is not None:
             self.custom_payload = custom_payload
         self.is_idempotent = is_idempotent
@@ -442,12 +450,14 @@ class PreparedStatement(object):
     query_string = None
     result_metadata = None
     result_metadata_id = None
+    column_encryption_policy = None
     routing_key_indexes = None
     _routing_key_index_set = None
     serial_consistency_level = None  # TODO never used?
 
     def __init__(self, column_metadata, query_id, routing_key_indexes, query,
-                 keyspace, protocol_version, result_metadata, result_metadata_id):
+                 keyspace, protocol_version, result_metadata, result_metadata_id,
+                 column_encryption_policy=None):
         self.column_metadata = column_metadata
         self.query_id = query_id
         self.routing_key_indexes = routing_key_indexes
@@ -456,14 +466,17 @@ class PreparedStatement(object):
         self.protocol_version = protocol_version
         self.result_metadata = result_metadata
         self.result_metadata_id = result_metadata_id
+        self.column_encryption_policy = column_encryption_policy
         self.is_idempotent = False
 
     @classmethod
     def from_message(cls, query_id, column_metadata, pk_indexes, cluster_metadata,
                      query, prepared_keyspace, protocol_version, result_metadata,
-                     result_metadata_id):
+                     result_metadata_id, column_encryption_policy=None):
         if not column_metadata:
-            return PreparedStatement(column_metadata, query_id, None, query, prepared_keyspace, protocol_version, result_metadata, result_metadata_id)
+            return PreparedStatement(column_metadata, query_id, None,
+                                     query, prepared_keyspace, protocol_version, result_metadata,
+                                     result_metadata_id, column_encryption_policy)
 
         if pk_indexes:
             routing_key_indexes = pk_indexes
@@ -489,7 +502,7 @@ class PreparedStatement(object):
 
         return PreparedStatement(column_metadata, query_id, routing_key_indexes,
                                  query, prepared_keyspace, protocol_version, result_metadata,
-                                 result_metadata_id)
+                                 result_metadata_id, column_encryption_policy)
 
     def bind(self, values):
         """
@@ -548,6 +561,7 @@ class BoundStatement(Statement):
         meta = prepared_statement.column_metadata
         if meta:
             self.keyspace = meta[0].keyspace_name
+            self.table = meta[0].table_name
 
         Statement.__init__(self, retry_policy, consistency_level, routing_key,
                            serial_consistency_level, fetch_size, keyspace, custom_payload,
@@ -577,6 +591,7 @@ class BoundStatement(Statement):
             values = ()
         proto_version = self.prepared_statement.protocol_version
         col_meta = self.prepared_statement.column_metadata
+        ce_policy = self.prepared_statement.column_encryption_policy
 
         # special case for binding dicts
         if isinstance(values, dict):
@@ -623,7 +638,13 @@ class BoundStatement(Statement):
                     raise ValueError("Attempt to bind UNSET_VALUE while using unsuitable protocol version (%d < 4)" % proto_version)
             else:
                 try:
-                    self.values.append(col_spec.type.serialize(value, proto_version))
+                    col_desc = ColDesc(col_spec.keyspace_name, col_spec.table_name, col_spec.name)
+                    uses_ce = ce_policy and ce_policy.contains_column(col_desc)
+                    col_type = ce_policy.column_type(col_desc) if uses_ce else col_spec.type
+                    col_bytes = col_type.serialize(value, proto_version)
+                    if uses_ce:
+                        col_bytes = ce_policy.encrypt(col_desc, col_bytes)
+                    self.values.append(col_bytes)
                 except (TypeError, struct.error) as exc:
                     actual_type = type(value)
                     message = ('Received an argument of invalid type for column "%s". '
@@ -804,7 +825,7 @@ class BatchStatement(Statement):
         Like with other statements, parameters must be a sequence, even
         if there is only one item.
         """
-        if isinstance(statement, six.string_types):
+        if isinstance(statement, str):
             if parameters:
                 encoder = Encoder() if self._session is None else self._session.encoder
                 statement = bind_params(statement, parameters, encoder)
@@ -888,10 +909,8 @@ For example::
 
 
 def bind_params(query, params, encoder):
-    if six.PY2 and isinstance(query, six.text_type):
-        query = query.encode('utf-8')
     if isinstance(params, dict):
-        return query % dict((k, encoder.cql_encode_all_types(v)) for k, v in six.iteritems(params))
+        return query % dict((k, encoder.cql_encode_all_types(v)) for k, v in params.items())
     else:
         return query % tuple(encoder.cql_encode_all_types(v) for v in params)
 
@@ -992,11 +1011,13 @@ class QueryTrace(object):
                     "Trace information was not available within %f seconds. Consider raising Session.max_trace_wait." % (max_wait,))
 
             log.debug("Attempting to fetch trace info for trace ID: %s", self.trace_id)
+            metadata_request_timeout = self._session.cluster.control_connection and self._session.cluster.control_connection._metadata_request_timeout
             session_results = self._execute(
-                SimpleStatement(self._SELECT_SESSIONS_FORMAT, consistency_level=query_cl), (self.trace_id,), time_spent, max_wait)
+                SimpleStatement(maybe_add_timeout_to_query(self._SELECT_SESSIONS_FORMAT, metadata_request_timeout), consistency_level=query_cl), (self.trace_id,), time_spent, max_wait)
 
             # PYTHON-730: There is race condition that the duration mutation is written before started_at the for fast queries
-            is_complete = session_results and session_results[0].duration is not None and session_results[0].started_at is not None
+            session_row = session_results.one() if session_results else None
+            is_complete = session_row is not None and session_row.duration is not None and session_row.started_at is not None
             if not session_results or (wait_for_complete and not is_complete):
                 time.sleep(self._BASE_RETRY_SLEEP * (2 ** attempt))
                 attempt += 1
@@ -1006,7 +1027,6 @@ class QueryTrace(object):
             else:
                 log.debug("Fetching parital trace info for trace ID: %s", self.trace_id)
 
-            session_row = session_results[0]
             self.request_type = session_row.request
             self.duration = timedelta(microseconds=session_row.duration) if is_complete else None
             self.started_at = session_row.started_at
@@ -1018,7 +1038,11 @@ class QueryTrace(object):
             log.debug("Attempting to fetch trace events for trace ID: %s", self.trace_id)
             time_spent = time.time() - start
             event_results = self._execute(
-                SimpleStatement(self._SELECT_EVENTS_FORMAT, consistency_level=query_cl), (self.trace_id,), time_spent, max_wait)
+                SimpleStatement(maybe_add_timeout_to_query(self._SELECT_EVENTS_FORMAT, metadata_request_timeout),
+                                consistency_level=query_cl),
+                (self.trace_id,),
+                time_spent,
+                max_wait)
             log.debug("Fetched trace events for trace ID: %s", self.trace_id)
             self.events = tuple(TraceEvent(r.activity, r.event_id, r.source, r.source_elapsed, r.thread)
                                 for r in event_results)
@@ -1076,7 +1100,7 @@ class TraceEvent(object):
 
     def __init__(self, description, timeuuid, source, source_elapsed, thread_name):
         self.description = description
-        self.datetime = datetime.utcfromtimestamp(unix_time_from_uuid1(timeuuid))
+        self.datetime = datetime.fromtimestamp(unix_time_from_uuid1(timeuuid), tz=timezone.utc)
         self.source = source
         if source_elapsed is not None:
             self.source_elapsed = timedelta(microseconds=source_elapsed)

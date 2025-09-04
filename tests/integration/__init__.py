@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import os
 from cassandra.cluster import Cluster
 
@@ -20,10 +21,7 @@ from tests import connection_class, EVENT_LOOP_MANAGER
 if connection_class is not None:
     Cluster.connection_class = connection_class
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from packaging.version import Version
 import logging
@@ -35,8 +33,8 @@ import platform
 from threading import Event
 from subprocess import call
 from itertools import groupby
-import six
 import shutil
+import pytest
 
 
 from cassandra import OperationTimedOut, ReadTimeout, ReadFailure, WriteTimeout, WriteFailure, AlreadyExists,\
@@ -45,6 +43,7 @@ from cassandra.protocol import ConfigurationException
 from cassandra import ProtocolVersion
 
 try:
+    import ccmlib
     from ccmlib.dse_cluster import DseCluster
     from ccmlib.cluster import Cluster as CCMCluster
     from ccmlib.scylla_cluster import ScyllaCluster as CCMScyllaCluster
@@ -58,6 +57,14 @@ log = logging.getLogger(__name__)
 CLUSTER_NAME = 'test_cluster'
 SINGLE_NODE_CLUSTER_NAME = 'single_node'
 MULTIDC_CLUSTER_NAME = 'multidc_test_cluster'
+
+# When use_single_interface is specified ccm will assign distinct port numbers to each
+# node in the cluster.  This value specifies the default port value used for the first
+# node that comes up.
+#
+# TODO: In the future we may want to make this configurable, but this should only apply
+# if a non-standard port were specified when starting up the cluster.
+DEFAULT_SINGLE_INTERFACE_PORT=9046
 
 CCM_CLUSTER = None
 
@@ -81,7 +88,7 @@ def get_server_versions():
 
     c = TestCluster()
     s = c.connect()
-    row = s.execute('SELECT cql_version, release_version FROM system.local')[0]
+    row = s.execute("SELECT cql_version, release_version FROM system.local WHERE key='local'").one()
 
     cass_version = _tuple_version(row.release_version)
     cql_version = _tuple_version(row.cql_version)
@@ -89,6 +96,12 @@ def get_server_versions():
     c.shutdown()
 
     return (cass_version, cql_version)
+
+
+def get_scylla_version(scylla_ccm_version_string):
+    """ get scylla version from ccm before starting a cluster"""
+    ccm_repo_cache_dir, _ = ccmlib.scylla_repository.setup(version=scylla_ccm_version_string)
+    return  ccmlib.common.get_version_from_build(ccm_repo_cache_dir)
 
 
 def _tuple_version(version_string):
@@ -173,10 +186,10 @@ if os.getenv('DSE_VERSION', None):  # we are testing against DSE
     DSE_CRED = os.getenv('DSE_CREDS', None)
     CASSANDRA_VERSION = _get_cass_version_from_dse(DSE_VERSION.base_version)
     CCM_VERSION = DSE_VERSION.base_version
-else:  # we are testing against Cassandra or DDAC
+else:  # we are testing against Cassandra,DDAC or Scylla
     if SCYLLA_VERSION:
         cv_string = SCYLLA_VERSION
-        mcv_string = os.getenv('MAPPED_SCYLLA_VERSION', None)
+        mcv_string = os.getenv('MAPPED_SCYLLA_VERSION', '3.11.4') # Assume that scylla matches cassandra `3.11.4` behavior
     else:
         cv_string = os.getenv('CASSANDRA_VERSION', None)
         mcv_string = os.getenv('MAPPED_CASSANDRA_VERSION', None)
@@ -287,6 +300,8 @@ def get_unsupported_lower_protocol():
     This is used to determine the lowest protocol version that is NOT
     supported by the version of C* running
     """
+    if SCYLLA_VERSION is not None:
+        return 2
     if CASSANDRA_VERSION >= Version('3.0'):
         return 2
     else:
@@ -298,6 +313,8 @@ def get_unsupported_upper_protocol():
     This is used to determine the highest protocol version that is NOT
     supported by the version of C* running
     """
+    if SCYLLA_VERSION is not None:
+        return 5
 
     if CASSANDRA_VERSION >= Version('4.0-a'):
         if DSE_VERSION:
@@ -338,8 +355,10 @@ def local_decorator_creator():
 local = local_decorator_creator()
 notprotocolv1 = unittest.skipUnless(PROTOCOL_VERSION > 1, 'Protocol v1 not supported')
 lessthenprotocolv4 = unittest.skipUnless(PROTOCOL_VERSION < 4, 'Protocol versions 4 or greater not supported')
+lessthanprotocolv3 = unittest.skipUnless(PROTOCOL_VERSION < 3, 'Protocol versions 3 or greater not supported')
 greaterthanprotocolv3 = unittest.skipUnless(PROTOCOL_VERSION >= 4, 'Protocol versions less than 4 are not supported')
 protocolv6 = unittest.skipUnless(6 in get_supported_protocol_versions(), 'Protocol versions less than 6 are not supported')
+
 greaterthancass20 = unittest.skipUnless(CASSANDRA_VERSION >= Version('2.1'), 'Cassandra version 2.1 or greater required')
 greaterthancass21 = unittest.skipUnless(CASSANDRA_VERSION >= Version('2.2'), 'Cassandra version 2.2 or greater required')
 greaterthanorequalcass30 = unittest.skipUnless(CASSANDRA_VERSION >= Version('3.0'), 'Cassandra version 3.0 or greater required')
@@ -347,10 +366,12 @@ greaterthanorequalcass31 = unittest.skipUnless(CASSANDRA_VERSION >= Version('3.1
 greaterthanorequalcass36 = unittest.skipUnless(CASSANDRA_VERSION >= Version('3.6'), 'Cassandra version 3.6 or greater required')
 greaterthanorequalcass3_10 = unittest.skipUnless(CASSANDRA_VERSION >= Version('3.10'), 'Cassandra version 3.10 or greater required')
 greaterthanorequalcass3_11 = unittest.skipUnless(CASSANDRA_VERSION >= Version('3.11'), 'Cassandra version 3.11 or greater required')
-greaterthanorequalcass40 = unittest.skipUnless(CASSANDRA_VERSION >= Version('4.0-a'), 'Cassandra version 4.0 or greater required')
-lessthanorequalcass40 = unittest.skipUnless(CASSANDRA_VERSION <= Version('4.0-a'), 'Cassandra version less or equal to 4.0 required')
-lessthancass40 = unittest.skipUnless(CASSANDRA_VERSION < Version('4.0-a'), 'Cassandra version less than 4.0 required')
+greaterthanorequalcass40 = unittest.skipUnless(CASSANDRA_VERSION >= Version('4.0'), 'Cassandra version 4.0 or greater required')
+greaterthanorequalcass50 = unittest.skipUnless(CASSANDRA_VERSION >= Version('5.0-beta'), 'Cassandra version 5.0 or greater required')
+lessthanorequalcass40 = unittest.skipUnless(CASSANDRA_VERSION <= Version('4.0'), 'Cassandra version less or equal to 4.0 required')
+lessthancass40 = unittest.skipUnless(CASSANDRA_VERSION < Version('4.0'), 'Cassandra version less than 4.0 required')
 lessthancass30 = unittest.skipUnless(CASSANDRA_VERSION < Version('3.0'), 'Cassandra version less then 3.0 required')
+
 greaterthanorequaldse68 = unittest.skipUnless(DSE_VERSION and DSE_VERSION >= Version('6.8'), "DSE 6.8 or greater required for this test")
 greaterthanorequaldse67 = unittest.skipUnless(DSE_VERSION and DSE_VERSION >= Version('6.7'), "DSE 6.7 or greater required for this test")
 greaterthanorequaldse60 = unittest.skipUnless(DSE_VERSION and DSE_VERSION >= Version('6.0'), "DSE 6.0 or greater required for this test")
@@ -359,8 +380,24 @@ greaterthanorequaldse50 = unittest.skipUnless(DSE_VERSION and DSE_VERSION >= Ver
 lessthandse51 = unittest.skipUnless(DSE_VERSION and DSE_VERSION < Version('5.1'), "DSE version less than 5.1 required")
 lessthandse60 = unittest.skipUnless(DSE_VERSION and DSE_VERSION < Version('6.0'), "DSE version less than 6.0 required")
 
+# pytest.mark.xfail instead of unittest.expectedFailure because
+# 1. unittest doesn't skip setUpClass when used on class and we need it sometimes
+# 2. unittest doesn't have conditional xfail, and I prefer to use pytest than custom decorator
+# 3. unittest doesn't have a reason argument, so you don't see the reason in pytest report
+requires_collection_indexes = pytest.mark.skipif(SCYLLA_VERSION is not None and Version(get_scylla_version(SCYLLA_VERSION)) < Version('5.2'),
+                                              reason='Scylla supports collection indexes from 5.2 onwards')
+requires_custom_indexes = pytest.mark.skipif(SCYLLA_VERSION is not None,
+                                          reason='Scylla does not support SASI or any other CUSTOM INDEX class')
+requires_java_udf = pytest.mark.skipif(SCYLLA_VERSION is not None,
+                                    reason='Scylla does not support UDFs written in Java')
+requires_composite_type = pytest.mark.skipif(SCYLLA_VERSION is not None,
+                                            reason='Scylla does not support composite types')
+requires_custom_payload = pytest.mark.skipif(SCYLLA_VERSION is not None or PROTOCOL_VERSION < 4,
+                                            reason='Scylla does not support custom payloads. Cassandra requires native protocol v4.0+')
+xfail_scylla = lambda reason, *args, **kwargs: pytest.mark.xfail(SCYLLA_VERSION is not None, reason=reason, *args, **kwargs)
+incorrect_test = lambda reason='This test seems to be incorrect and should be fixed', *args, **kwargs: pytest.mark.xfail(reason=reason, *args, **kwargs)
+
 pypy = unittest.skipUnless(platform.python_implementation() == "PyPy", "Test is skipped unless it's on PyPy")
-notpy3 = unittest.skipIf(sys.version_info >= (3, 0), "Test not applicable for Python 3.x runtime")
 requiresmallclockgranularity = unittest.skipIf("Windows" in platform.system() or "asyncore" in EVENT_LOOP_MANAGER,
                                                "This test is not suitible for environments with large clock granularity")
 requiressimulacron = unittest.skipIf(SIMULACRON_JAR is None or CASSANDRA_VERSION < Version("2.1"), "Simulacron jar hasn't been specified or C* version is 2.0")
@@ -405,15 +442,15 @@ def get_node(node_id):
     return CCM_CLUSTER.nodes['node%s' % node_id]
 
 
-def use_multidc(dc_list, workloads=[]):
+def use_multidc(dc_list, workloads=None):
     use_cluster(MULTIDC_CLUSTER_NAME, dc_list, start=True, workloads=workloads)
 
 
-def use_singledc(start=True, workloads=[], use_single_interface=USE_SINGLE_INTERFACE):
+def use_singledc(start=True, workloads=None, use_single_interface=USE_SINGLE_INTERFACE):
     use_cluster(CLUSTER_NAME, [3], start=start, workloads=workloads, use_single_interface=use_single_interface)
 
 
-def use_single_node(start=True, workloads=[], configuration_options={}, dse_options={}):
+def use_single_node(start=True, workloads=None, configuration_options=None, dse_options=None):
     use_cluster(SINGLE_NODE_CLUSTER_NAME, [1], start=start, workloads=workloads,
                 configuration_options=configuration_options, dse_options=dse_options)
 
@@ -466,7 +503,7 @@ def is_current_cluster(cluster_name, node_counts, workloads):
 
 
 def start_cluster_wait_for_up(cluster):
-    cluster.start(wait_for_binary_proto=True)
+    cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
     # Added to wait for slow nodes to start up
     log.debug("Cluster started waiting for binary ports")
     for node in CCM_CLUSTER.nodes.values():
@@ -475,10 +512,11 @@ def start_cluster_wait_for_up(cluster):
 
 
 def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, set_keyspace=True, ccm_options=None,
-                configuration_options={}, dse_options={}, use_single_interface=USE_SINGLE_INTERFACE):
+                configuration_options=None, dse_options=None, use_single_interface=USE_SINGLE_INTERFACE):
+    configuration_options = configuration_options or {}
+    dse_options = dse_options or {}
+    workloads = workloads or []
     dse_cluster = True if DSE_VERSION else False
-    if not workloads:
-        workloads = []
 
     if ccm_options is None and DSE_VERSION:
         ccm_options = {"version": CCM_VERSION}
@@ -585,19 +623,30 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
                     # Selecting only features we need for tests, i.e. anything but CDC.
                     CCM_CLUSTER = CCMScyllaCluster(path, cluster_name, **ccm_options)
                     CCM_CLUSTER.set_configuration_options({'experimental_features': ['lwt', 'udf'], 'start_native_transport': True})
+
+                    CCM_CLUSTER.set_configuration_options({'skip_wait_for_gossip_to_settle': 0})
+                    # Permit IS NOT NULL restriction on non-primary key columns of a materialized view
+                    # This allows `test_metadata_with_quoted_identifiers` to run
+                    CCM_CLUSTER.set_configuration_options({'strict_is_not_null_in_views': False})
                 else:
-                    CCM_CLUSTER = CCMCluster(path, cluster_name, **ccm_options)
+                    ccm_cluster_clz = CCMCluster if Version(cassandra_version) < Version(
+                        '4.1') else Cassandra41CCMCluster
+                    CCM_CLUSTER = ccm_cluster_clz(path, cluster_name, **ccm_options)
                     CCM_CLUSTER.set_configuration_options({'start_native_transport': True})
                 if Version(cassandra_version) >= Version('2.2'):
                     CCM_CLUSTER.set_configuration_options({'enable_user_defined_functions': True})
                     if Version(cassandra_version) >= Version('3.0'):
-                        CCM_CLUSTER.set_configuration_options({'enable_scripted_user_defined_functions': True})
-                        if Version(cassandra_version) >= Version('4.0-a'):
+                        # The config.yml option below is deprecated in C* 4.0 per CASSANDRA-17280
+                        if Version(cassandra_version) < Version('4.0'):
+                            CCM_CLUSTER.set_configuration_options({'enable_scripted_user_defined_functions': True})
+                        else:
+                            # Cassandra version >= 4.0
                             CCM_CLUSTER.set_configuration_options({
                                 'enable_materialized_views': True,
                                 'enable_sasi_indexes': True,
                                 'enable_transient_replication': True,
                             })
+
                 common.switch_cluster(path, cluster_name)
                 CCM_CLUSTER.set_configuration_options(configuration_options)
                 # Since scylla CCM doesn't yet support this options, we skip it
@@ -618,20 +667,23 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True, workloads=None, 
                 node.set_workloads(workloads)
         if start:
             log.debug("Starting CCM cluster: {0}".format(cluster_name))
-            CCM_CLUSTER.start(jvm_args=jvm_args, wait_for_binary_proto=True)
+            CCM_CLUSTER.start(jvm_args=jvm_args, wait_for_binary_proto=True, wait_other_notice=True)
             # Added to wait for slow nodes to start up
             log.debug("Cluster started waiting for binary ports")
             for node in CCM_CLUSTER.nodes.values():
                 wait_for_node_socket(node, 300)
             log.debug("Binary ports are open")
             if set_keyspace:
-                setup_keyspace(ipformat=ipformat)
+                args = {"ipformat": ipformat}
+                if use_single_interface:
+                    args["port"] = DEFAULT_SINGLE_INTERFACE_PORT
+                setup_keyspace(**args)
     except Exception:
         log.exception("Failed to start CCM cluster; removing cluster.")
 
         if os.name == "nt":
             if CCM_CLUSTER:
-                for node in six.itervalues(CCM_CLUSTER.nodes):
+                for node in CCM_CLUSTER.nodes.items():
                     os.system("taskkill /F /PID " + str(node.pid))
         else:
             call(["pkill", "-9", "-f", ".ccm"])
@@ -724,7 +776,7 @@ def drop_keyspace_shutdown_cluster(keyspace_name, session, cluster):
         cluster.shutdown()
 
 
-def setup_keyspace(ipformat=None, wait=True, protocol_version=None):
+def setup_keyspace(ipformat=None, wait=True, protocol_version=None, port=9042):
     # wait for nodes to startup
     if wait:
         time.sleep(10)
@@ -735,9 +787,9 @@ def setup_keyspace(ipformat=None, wait=True, protocol_version=None):
         _protocol_version = PROTOCOL_VERSION
 
     if not ipformat:
-        cluster = TestCluster(protocol_version=_protocol_version)
+        cluster = TestCluster(protocol_version=_protocol_version, port=port)
     else:
-        cluster = TestCluster(contact_points=["::1"], protocol_version=_protocol_version)
+        cluster = TestCluster(contact_points=["::1"], protocol_version=_protocol_version, port=port)
     session = cluster.connect()
 
     try:
@@ -777,6 +829,38 @@ def setup_keyspace(ipformat=None, wait=True, protocol_version=None):
         raise
     finally:
         cluster.shutdown()
+
+
+def is_scylla_enterprise(version: Version) -> bool:
+    return version > Version('2000.1.1')
+
+
+def xfail_scylla_version_lt(reason, oss_scylla_version, ent_scylla_version, *args, **kwargs):
+    """
+    It is used to mark tests that are going to fail on certain scylla versions.
+    :param reason: message to fail test with
+    :param oss_scylla_version: str, oss version from which test supposed to succeed
+    :param ent_scylla_version: str, enterprise version from which test supposed to succeed. It should end with `.1.1`
+    """
+    if not reason.startswith("scylladb/scylladb#"):
+        raise ValueError('reason should start with scylladb/scylladb#<issue-id> to reference issue in scylla repo')
+
+    if not isinstance(ent_scylla_version, str):
+        raise ValueError('ent_scylla_version should be a str')
+
+    if not ent_scylla_version.endswith("1.1"):
+        raise ValueError('ent_scylla_version should end with "1.1"')
+
+    if SCYLLA_VERSION is None:
+        return pytest.mark.skipif(False, reason="It is just a NoOP Decor, should not skip anything")
+
+    current_version = Version(get_scylla_version(SCYLLA_VERSION))
+
+    if is_scylla_enterprise(current_version):
+        return pytest.mark.xfail(current_version < Version(ent_scylla_version),
+                                 reason=reason, *args, **kwargs)
+
+    return pytest.mark.xfail(current_version < Version(oss_scylla_version), reason=reason, *args, **kwargs)
 
 
 class UpDownWaiter(object):
@@ -898,7 +982,7 @@ class MockLoggingHandler(logging.Handler):
         return self
 
     def __exit__(self, *args):
-        pass
+        self.logger.removeHandler(self)
 
 
 class BasicExistingKeyspaceUnitTestCase(BasicKeyspaceUnitTestCase):
@@ -1020,6 +1104,8 @@ def assert_startswith(s, prefix):
 
 
 class TestCluster(object):
+    __test__ = False
+
     DEFAULT_PROTOCOL_VERSION = default_protocol_version
     DEFAULT_CASSANDRA_IP = CASSANDRA_IP
     DEFAULT_ALLOW_BETA = ALLOW_BETA_PROTOCOL
@@ -1033,3 +1119,38 @@ class TestCluster(object):
             kwargs['allow_beta_protocol_version'] = cls.DEFAULT_ALLOW_BETA
         return Cluster(**kwargs)
 
+# Subclass of CCMCluster (i.e. ccmlib.cluster.Cluster) which transparently performs
+# conversion of cassandra.yml directives into something matching the new syntax
+# introduced by CASSANDRA-15234
+class Cassandra41CCMCluster(CCMCluster):
+    __test__ = False
+    IN_MS_REGEX = re.compile('^(\w+)_in_ms$')
+    IN_KB_REGEX = re.compile('^(\w+)_in_kb$')
+    ENABLE_REGEX = re.compile('^enable_(\w+)$')
+
+    def _get_config_key(self, k, v):
+        if "." in k:
+            return k
+        m = self.IN_MS_REGEX.match(k)
+        if m:
+            return m.group(1)
+        m = self.ENABLE_REGEX.search(k)
+        if m:
+            return "%s_enabled" % (m.group(1))
+        m = self.IN_KB_REGEX.match(k)
+        if m:
+            return m.group(1)
+        return k
+
+    def _get_config_val(self, k, v):
+        m = self.IN_MS_REGEX.match(k)
+        if m:
+            return "%sms" % (v)
+        m = self.IN_KB_REGEX.match(k)
+        if m:
+            return "%sKiB" % (v)
+        return v
+
+    def set_configuration_options(self, values=None, *args, **kwargs):
+        new_values = {self._get_config_key(k, str(v)):self._get_config_val(k, str(v)) for (k,v) in values.items()}
+        super(Cassandra41CCMCluster, self).set_configuration_options(values=new_values, *args, **kwargs)

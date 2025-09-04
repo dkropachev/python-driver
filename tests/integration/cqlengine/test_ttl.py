@@ -13,10 +13,7 @@
 # limitations under the License.
 
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from packaging.version import Version
 
@@ -26,12 +23,14 @@ from tests.integration.cqlengine.base import BaseCassEngTestCase
 from cassandra.cqlengine.models import Model
 from uuid import uuid4
 from cassandra.cqlengine import columns
-import mock
+from unittest import mock
 from cassandra.cqlengine.connection import get_session
 from tests.integration import CASSANDRA_VERSION, greaterthancass20
 
 
 class TestTTLModel(Model):
+    __test__ = False
+
     id = columns.UUID(primary_key=True, default=lambda: uuid4())
     count = columns.Integer()
     text = columns.Text(required=False)
@@ -51,6 +50,8 @@ class BaseTTLTest(BaseCassEngTestCase):
 
 
 class TestDefaultTTLModel(Model):
+    __test__ = False
+
     __options__ = {'default_time_to_live': 20}
     id = columns.UUID(primary_key=True, default=lambda:uuid4())
     count = columns.Integer()
@@ -168,7 +169,7 @@ class TTLDefaultTest(BaseDefaultTTLTest):
         except InvalidRequest:
             default_ttl = session.execute("SELECT default_time_to_live FROM system.schema_columnfamilies "
                                           "WHERE keyspace_name = 'cqlengine_test' AND columnfamily_name = '{0}'".format(table_name))
-        return default_ttl[0]['default_time_to_live']
+        return default_ttl.one()['default_time_to_live']
 
     def test_default_ttl_not_set(self):
         session = get_session()

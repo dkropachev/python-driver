@@ -14,19 +14,15 @@
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
+from cassandra.protocol_features import ProtocolFeatures
 
 from cassandra.shard_info import _ShardingInfo
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-    import unittest.mock as mock
-
-from mock import Mock, NonCallableMagicMock, MagicMock
+import unittest
 from threading import Thread, Event, Lock
+from unittest.mock import Mock, NonCallableMagicMock, MagicMock
 
-from cassandra.cluster import Session
+from cassandra.cluster import Session, ShardAwareOptions
 from cassandra.connection import Connection
 from cassandra.pool import HostConnection, HostConnectionPool
 from cassandra.pool import Host, NoConnectionsAvailable
@@ -54,7 +50,7 @@ class _PoolTests(unittest.TestCase):
         session.cluster.connection_factory.return_value = conn
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         c, request_id = pool.borrow_connection(timeout=0.01)
         self.assertIs(c, conn)
@@ -73,7 +69,7 @@ class _PoolTests(unittest.TestCase):
         session.cluster.connection_factory.return_value = conn
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         pool.borrow_connection(timeout=0.01)
         self.assertEqual(1, conn.in_flight)
@@ -92,7 +88,7 @@ class _PoolTests(unittest.TestCase):
         session.cluster.connection_factory.return_value = conn
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         pool.borrow_connection(timeout=0.01)
         self.assertEqual(1, conn.in_flight)
@@ -120,7 +116,7 @@ class _PoolTests(unittest.TestCase):
         session.cluster.get_max_connections_per_host.return_value = 2
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         pool.borrow_connection(timeout=0.01)
         self.assertEqual(1, conn.in_flight)
@@ -143,11 +139,12 @@ class _PoolTests(unittest.TestCase):
         session.cluster.connection_factory.return_value = conn
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         pool.borrow_connection(timeout=0.01)
         conn.is_defunct = True
         session.cluster.signal_connection_failure.return_value = False
+        host.signal_connection_failure.return_value = False
         pool.return_connection(conn)
 
         # the connection should be closed a new creation scheduled
@@ -158,40 +155,45 @@ class _PoolTests(unittest.TestCase):
         host = Mock(spec=Host, address='ip1')
         session = self.make_session()
         conn = NonCallableMagicMock(spec=Connection, in_flight=0, is_defunct=False, is_closed=False,
-                                    max_request_id=100, signaled_error=False)
+                                    max_request_id=100, signaled_error=False,
+                                    orphaned_threshold_reached=False)
         session.cluster.connection_factory.return_value = conn
+        session.cluster.shard_aware_options = ShardAwareOptions()
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         pool.borrow_connection(timeout=0.01)
         conn.is_defunct = True
         session.cluster.signal_connection_failure.return_value = True
+        host.signal_connection_failure.return_value = True
         pool.return_connection(conn)
 
         # the connection should be closed a new creation scheduled
-        self.assertTrue(session.cluster.signal_connection_failure.call_args)
         self.assertTrue(conn.close.call_args)
         if self.PoolImpl is HostConnection:
             # on shard aware implementation we use submit function regardless
+            self.assertTrue(host.signal_connection_failure.call_args)
             self.assertTrue(session.submit.called)
         else:
             self.assertFalse(session.submit.called)
+            self.assertTrue(session.cluster.signal_connection_failure.call_args)
         self.assertTrue(pool.is_shutdown)
 
     def test_return_closed_connection(self):
         host = Mock(spec=Host, address='ip1')
         session = self.make_session()
         conn = NonCallableMagicMock(spec=Connection, in_flight=0, is_defunct=False, is_closed=True, max_request_id=100,
-                                    signaled_error=False)
+                                    signaled_error=False, orphaned_threshold_reached=False)
         session.cluster.connection_factory.return_value = conn
 
         pool = self.PoolImpl(host, HostDistance.LOCAL, session)
-        session.cluster.connection_factory.assert_called_once_with(host.endpoint, owning_pool=pool)
+        session.cluster.connection_factory.assert_called_once_with(host.endpoint, on_orphaned_stream_released=pool.on_orphaned_stream_released)
 
         pool.borrow_connection(timeout=0.01)
         conn.is_closed = True
         session.cluster.signal_connection_failure.return_value = False
+        host.signal_connection_failure.return_value = False
         pool.return_connection(conn)
 
         # a new creation should be scheduled
@@ -281,7 +283,7 @@ class HostConnectionTests(_PoolTests):
             keyspace = "reprospace"
 
             def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
+                super(MockSession, self).__init__(*args, **kwargs)
                 self.cluster = MagicMock()
                 self.cluster.executor = ThreadPoolExecutor(max_workers=2, initializer=self.executor_init)
                 self.cluster.signal_connection_failure = lambda *args, **kwargs: False
@@ -298,10 +300,11 @@ class HostConnectionTests(_PoolTests):
                 connection.is_shutdown = False
                 connection.is_defunct = False
                 connection.is_closed = False
-                connection.shard_id = self.connection_counter
+                connection.features = ProtocolFeatures(shard_id=self.connection_counter, 
+                                                       sharding_info=_ShardingInfo(shard_id=1, shards_count=14,
+                                                                    partitioner="", sharding_algorithm="", sharding_ignore_msb=0,
+                                                                    shard_aware_port="", shard_aware_port_ssl=""))
                 self.connection_counter += 1
-                connection.sharding_info = _ShardingInfo(shard_id=1, shards_count=14,
-                                                         partitioner="", sharding_algorithm="", sharding_ignore_msb=0)
 
                 return connection
 

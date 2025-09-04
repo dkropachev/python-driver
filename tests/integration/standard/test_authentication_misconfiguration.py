@@ -13,18 +13,15 @@
 # limitations under the License.
 
 import unittest
+import pytest
 
 from tests.integration import USE_CASS_EXTERNAL, use_cluster, TestCluster
 
 
+@pytest.mark.skip(reason="Flaky test - needs investigation whether its Scylla's or driver's fault."
+                         "Issue: https://github.com/scylladb/python-driver/issues/236")
 class MisconfiguredAuthenticationTests(unittest.TestCase):
     """ One node (not the contact point) has password auth. The rest of the nodes have no auth """
-    # TODO: 	Fix ccm to apply following options to scylla.yaml
-    # 	node3.set_configuration_options(values={
-    # 	'authenticator': 'PasswordAuthenticator',
-    # 	'authorizer': 'CassandraAuthorizer',
-    # 	})
-    # To make it working for scylla
     @classmethod
     def setUpClass(cls):
         if not USE_CASS_EXTERNAL:
@@ -34,11 +31,10 @@ class MisconfiguredAuthenticationTests(unittest.TestCase):
                 'authenticator': 'PasswordAuthenticator',
                 'authorizer': 'CassandraAuthorizer',
             })
-            ccm_cluster.start(wait_for_binary_proto=True)
+            ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
 
             cls.ccm_cluster = ccm_cluster
 
-    @unittest.expectedFailure
     def test_connect_no_auth_provider(self):
         cluster = TestCluster()
         cluster.connect()

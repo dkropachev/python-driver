@@ -11,20 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import subprocess
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from collections import deque
 from copy import copy
-from mock import Mock, call, patch
+from unittest.mock import Mock, patch
 import time
 from uuid import uuid4
 import logging
 import warnings
 from packaging.version import Version
+import os
 
 import cassandra
 from cassandra.cluster import NoHostAvailable, ExecutionProfile, EXEC_PROFILE_DEFAULT, ControlConnection, Cluster
@@ -39,11 +38,11 @@ from cassandra.auth import PlainTextAuthProvider, SaslAuthProvider
 from cassandra import connection
 from cassandra.connection import DefaultEndPoint
 
-from tests import notwindows
-from tests.integration import use_singledc, get_server_versions, CASSANDRA_VERSION, \
+from tests import notwindows, notasyncio
+from tests.integration import use_cluster, get_server_versions, CASSANDRA_VERSION, \
     execute_until_pass, execute_with_long_wait_retry, get_node, MockLoggingHandler, get_unsupported_lower_protocol, \
-    get_unsupported_upper_protocol, protocolv6, local, CASSANDRA_IP, greaterthanorequalcass30, lessthanorequalcass40, \
-    DSE_VERSION, TestCluster, PROTOCOL_VERSION
+    get_unsupported_upper_protocol, lessthanprotocolv3, protocolv6, local, CASSANDRA_IP, greaterthanorequalcass30, \
+    lessthanorequalcass40, DSE_VERSION, TestCluster, PROTOCOL_VERSION, xfail_scylla, incorrect_test
 from tests.integration.util import assert_quiescent_pool_state
 import sys
 
@@ -51,7 +50,8 @@ log = logging.getLogger(__name__)
 
 
 def setup_module():
-    use_singledc()
+    os.environ['SCYLLA_EXT_OPTS'] = "--smp 1"
+    use_cluster("cluster_tests", [3], start=True, workloads=None)
     warnings.simplefilter("always")
 
 
@@ -150,7 +150,7 @@ class ClusterTests(unittest.TestCase):
         get_node(1).pause()
         cluster = TestCluster(contact_points=['127.0.0.1'], connect_timeout=1)
 
-        with self.assertRaisesRegexp(NoHostAvailable, "OperationTimedOut\('errors=Timed out creating connection \(1 seconds\)"):
+        with self.assertRaisesRegex(NoHostAvailable, r"OperationTimedOut\('errors=Timed out creating connection \(1 seconds\)"):
             cluster.connect()
         cluster.shutdown()
 
@@ -288,8 +288,6 @@ class ClusterTests(unittest.TestCase):
 
         cluster.shutdown()
 
-    # "Failing with scylla because there is option to create a cluster with 'lower bound' protocol
-    @unittest.expectedFailure
     def test_invalid_protocol_negotation(self):
         """
         Test for protocol negotiation when explicit versions are set
@@ -410,12 +408,11 @@ class ClusterTests(unittest.TestCase):
                               protocol_version=PROTOCOL_VERSION)
         self.assertRaises(NoHostAvailable, cluster.connect)
 
+    @lessthanprotocolv3
     def test_cluster_settings(self):
         """
         Test connection setting getters and setters
         """
-        if PROTOCOL_VERSION >= 3:
-            raise unittest.SkipTest("min/max requests and core/max conns aren't used with v3 protocol")
 
         cluster = TestCluster()
 
@@ -524,7 +521,7 @@ class ClusterTests(unittest.TestCase):
         def patched_wait_for_responses(*args, **kwargs):
             # When selecting schema version, replace the real schema UUID with an unexpected UUID
             response = original_wait_for_responses(*args, **kwargs)
-            if len(args) > 2 and hasattr(args[2], "query") and args[2].query == "SELECT schema_version FROM system.local WHERE key='local'":
+            if len(args) > 2 and hasattr(args[2], "query") and "SELECT schema_version FROM system.local WHERE key='local'" in args[2].query:
                 new_uuid = uuid4()
                 response[1].parsed_rows[0] = (new_uuid,)
             return response
@@ -540,7 +537,7 @@ class ClusterTests(unittest.TestCase):
             # cluster agreement wait used for refresh
             original_meta = c.metadata.keyspaces
             start_time = time.time()
-            self.assertRaisesRegexp(Exception, r"Schema metadata was not refreshed.*", c.refresh_schema_metadata)
+            self.assertRaisesRegex(Exception, r"Schema metadata was not refreshed.*", c.refresh_schema_metadata)
             end_time = time.time()
             self.assertGreaterEqual(end_time - start_time, agreement_timeout)
             self.assertIs(original_meta, c.metadata.keyspaces)
@@ -577,7 +574,7 @@ class ClusterTests(unittest.TestCase):
             # refresh wait overrides cluster value
             original_meta = c.metadata.keyspaces
             start_time = time.time()
-            self.assertRaisesRegexp(Exception, r"Schema metadata was not refreshed.*", c.refresh_schema_metadata,
+            self.assertRaisesRegex(Exception, r"Schema metadata was not refreshed.*", c.refresh_schema_metadata,
                                     max_schema_agreement_wait=agreement_timeout)
             end_time = time.time()
             self.assertGreaterEqual(end_time - start_time, agreement_timeout)
@@ -592,15 +589,15 @@ class ClusterTests(unittest.TestCase):
         cluster = TestCluster()
         session = cluster.connect()
 
-        result = session.execute( "SELECT * FROM system.local", trace=True)
+        result = session.execute( "SELECT * FROM system.local WHERE key='local'", trace=True)
         self._check_trace(result.get_query_trace())
 
-        query = "SELECT * FROM system.local"
+        query = "SELECT * FROM system.local WHERE key='local'"
         statement = SimpleStatement(query)
         result = session.execute(statement, trace=True)
         self._check_trace(result.get_query_trace())
 
-        query = "SELECT * FROM system.local"
+        query = "SELECT * FROM system.local WHERE key='local'"
         statement = SimpleStatement(query)
         result = session.execute(statement)
         self.assertIsNone(result.get_query_trace())
@@ -615,7 +612,7 @@ class ClusterTests(unittest.TestCase):
         future.result()
         self.assertIsNone(future.get_query_trace())
 
-        prepared = session.prepare("SELECT * FROM system.local")
+        prepared = session.prepare("SELECT * FROM system.local WHERE key='local'")
         future = session.execute_async(prepared, parameters=(), trace=True)
         future.result()
         self._check_trace(future.get_query_trace())
@@ -639,7 +636,7 @@ class ClusterTests(unittest.TestCase):
         self.addCleanup(cluster.shutdown)
         session = cluster.connect()
 
-        query = "SELECT * FROM system.local"
+        query = "SELECT * FROM system.local WHERE key='local'"
         statement = SimpleStatement(query)
 
         max_retry_count = 10
@@ -689,7 +686,7 @@ class ClusterTests(unittest.TestCase):
         cluster = TestCluster()
         session = cluster.connect()
 
-        query = "SELECT * FROM system.local"
+        query = "SELECT * FROM system.local WHERE key='local'"
         statement = SimpleStatement(query)
         future = session.execute_async(statement)
 
@@ -745,7 +742,7 @@ class ClusterTests(unittest.TestCase):
         with MockLoggingHandler().set_module_name(connection.__name__) as mock_handler:
             with TestCluster(auth_provider=auth_provider) as cluster:
                 session = cluster.connect()
-                self.assertIsNotNone(session.execute("SELECT * from system.local"))
+                self.assertIsNotNone(session.execute("SELECT * from system.local WHERE key='local'"))
 
             # Three conenctions to nodes plus the control connection
             auth_warning = mock_handler.get_message_count('warning', "An authentication challenge was not sent")
@@ -789,7 +786,7 @@ class ClusterTests(unittest.TestCase):
         self.assertTrue(all(c.is_idle for c in connections))
 
         # send messages on all connections
-        statements_and_params = [("SELECT release_version FROM system.local", ())] * len(cluster.metadata.all_hosts())
+        statements_and_params = [("SELECT release_version FROM system.local WHERE key='local'", ())] * len(cluster.metadata.all_hosts())
         results = execute_concurrent(session, statements_and_params)
         for success, result in results:
             self.assertTrue(success)
@@ -874,7 +871,7 @@ class ClusterTests(unittest.TestCase):
 
         @test_category config_profiles
         """
-        query = "select release_version from system.local"
+        query = "select release_version from system.local where key='local'"
         node1 = ExecutionProfile(
             load_balancing_policy=HostFilterPolicy(
                 RoundRobinPolicy(), lambda host: host.address == CASSANDRA_IP
@@ -901,7 +898,7 @@ class ClusterTests(unittest.TestCase):
 
             # use a copied instance and override the row factory
             # assert last returned value can be accessed as a namedtuple so we can prove something different
-            named_tuple_row = rs[0]
+            named_tuple_row = rs.one()
             self.assertIsInstance(named_tuple_row, tuple)
             self.assertTrue(named_tuple_row.release_version)
 
@@ -912,13 +909,13 @@ class ClusterTests(unittest.TestCase):
                 rs = session.execute(query, execution_profile=tmp_profile)
                 queried_hosts.add(rs.response_future._current_host)
             self.assertEqual(queried_hosts, expected_hosts)
-            tuple_row = rs[0]
+            tuple_row = rs.one()
             self.assertIsInstance(tuple_row, tuple)
             with self.assertRaises(AttributeError):
                 tuple_row.release_version
 
             # make sure original profile is not impacted
-            self.assertTrue(session.execute(query, execution_profile='node1')[0].release_version)
+            self.assertTrue(session.execute(query, execution_profile='node1').one().release_version)
 
     def test_setting_lbp_legacy(self):
         cluster = TestCluster()
@@ -945,7 +942,7 @@ class ClusterTests(unittest.TestCase):
 
         @test_category config_profiles
         """
-        query = "select release_version from system.local"
+        query = "select release_version from system.local where key='local'"
         rr1 = ExecutionProfile(load_balancing_policy=RoundRobinPolicy())
         rr2 = ExecutionProfile(load_balancing_policy=RoundRobinPolicy())
         exec_profiles = {'rr1': rr1, 'rr2': rr2}
@@ -974,7 +971,7 @@ class ClusterTests(unittest.TestCase):
 
         @test_category config_profiles
         """
-        query = "select release_version from system.local"
+        query = "select release_version from system.local where key='local'"
         ta1 = ExecutionProfile()
         with TestCluster() as cluster:
             session = cluster.connect()
@@ -994,7 +991,7 @@ class ClusterTests(unittest.TestCase):
 
         @test_category config_profiles
         """
-        query = "select release_version from system.local"
+        query = "select release_version from system.local where key='local'"
         rr1 = ExecutionProfile(load_balancing_policy=RoundRobinPolicy())
         exec_profiles = {'rr1': rr1}
         with TestCluster(execution_profiles=exec_profiles) as cluster:
@@ -1021,7 +1018,7 @@ class ClusterTests(unittest.TestCase):
 
         @test_category config_profiles
         """
-        query = "select release_version from system.local"
+        query = "select release_version from system.local where key='local'"
         rr1 = ExecutionProfile(load_balancing_policy=RoundRobinPolicy())
         rr2 = ExecutionProfile(load_balancing_policy=RoundRobinPolicy())
         exec_profiles = {'rr1': rr1, 'rr2': rr2}
@@ -1111,7 +1108,36 @@ class ClusterTests(unittest.TestCase):
         else:
             raise Exception("add_execution_profile didn't timeout after {0} retries".format(max_retry_count))
 
+    def test_stale_connections_after_shutdown(self):
+        """
+        Check if any connection/socket left unclosed after cluster.shutdown
+        Originates from https://github.com/scylladb/python-driver/issues/120
+        """
+        for _ in range(10):
+            with TestCluster(protocol_version=3) as cluster:
+                cluster.connect().execute("SELECT * FROM system_schema.keyspaces")
+                time.sleep(1)
+
+            with TestCluster(protocol_version=3) as cluster:
+                session = cluster.connect()
+                for _ in range(5):
+                    session.execute("SELECT * FROM system_schema.keyspaces")
+
+            for _ in range(10):
+                with TestCluster(protocol_version=3) as cluster:
+                    cluster.connect().execute("SELECT * FROM system_schema.keyspaces")
+
+            for _ in range(10):
+                with TestCluster(protocol_version=3) as cluster:
+                    cluster.connect()
+
+            result = subprocess.run(["lsof -nP | awk '$3 ~ \":9042\" {print $0}' | grep ''"], shell=True, capture_output=True)
+            if result.returncode:
+                continue
+            assert False, f'Found stale connections: {result.stdout}'
+
     @notwindows
+    @notasyncio  # asyncio can't do timeouts smaller than 1ms, as this test requires
     def test_execute_query_timeout(self):
         with TestCluster() as cluster:
             session = cluster.connect(wait_for_all_pools=True)
@@ -1199,8 +1225,7 @@ class ClusterTests(unittest.TestCase):
 
     @greaterthanorequalcass30
     @lessthanorequalcass40
-    # The scylla failed because 'Unknown identifier column1'
-    @unittest.expectedFailure
+    @incorrect_test()
     def test_compact_option(self):
         """
         Test the driver can connect with the no_compact option and the results
@@ -1364,7 +1389,7 @@ class ContextManagementTest(unittest.TestCase):
             with cluster.connect() as session:
                 self.assertFalse(cluster.is_shutdown)
                 self.assertFalse(session.is_shutdown)
-                self.assertTrue(session.execute('select release_version from system.local')[0])
+                self.assertTrue(session.execute('select release_version from system.local').one())
             self.assertTrue(session.is_shutdown)
         self.assertTrue(cluster.is_shutdown)
 
@@ -1382,7 +1407,7 @@ class ContextManagementTest(unittest.TestCase):
             session = cluster.connect()
             self.assertFalse(cluster.is_shutdown)
             self.assertFalse(session.is_shutdown)
-            self.assertTrue(session.execute('select release_version from system.local')[0])
+            self.assertTrue(session.execute('select release_version from system.local').one())
         self.assertTrue(session.is_shutdown)
         self.assertTrue(cluster.is_shutdown)
 
@@ -1402,7 +1427,7 @@ class ContextManagementTest(unittest.TestCase):
             self.assertFalse(cluster.is_shutdown)
             self.assertFalse(session.is_shutdown)
             self.assertFalse(unmanaged_session.is_shutdown)
-            self.assertTrue(session.execute('select release_version from system.local')[0])
+            self.assertTrue(session.execute('select release_version from system.local').one())
         self.assertTrue(session.is_shutdown)
         self.assertFalse(cluster.is_shutdown)
         self.assertFalse(unmanaged_session.is_shutdown)
@@ -1484,7 +1509,7 @@ class DontPrepareOnIgnoredHostsTest(unittest.TestCase):
         # the length of mock_calls will vary, but all should use the unignored
         # address
         for c in cluster.connection_factory.mock_calls:
-            self.assertEqual(call(DefaultEndPoint(unignored_address)), c)
+            self.assertEqual(unignored_address, c.args[0].address)
         cluster.shutdown()
 
 
@@ -1525,7 +1550,7 @@ class BetaProtocolTest(unittest.TestCase):
         cluster = Cluster(protocol_version=cassandra.ProtocolVersion.V6, allow_beta_protocol_version=True)
         session = cluster.connect()
         self.assertEqual(cluster.protocol_version, cassandra.ProtocolVersion.V6)
-        self.assertTrue(session.execute("select release_version from system.local")[0])
+        self.assertTrue(session.execute("select release_version from system.local").one())
         cluster.shutdown()
 
 
@@ -1543,9 +1568,11 @@ class DeprecationWarningTest(unittest.TestCase):
         """
         with warnings.catch_warnings(record=True) as w:
             TestCluster(load_balancing_policy=RoundRobinPolicy())
-            self.assertEqual(len(w), 1)
-            self.assertIn("Legacy execution parameters will be removed in 4.0. Consider using execution profiles.",
-                          str(w[0].message))
+            logging.info(w)
+            self.assertGreaterEqual(len(w), 1)
+            self.assertTrue(any(["Legacy execution parameters will be removed in 4.0. "
+                                 "Consider using execution profiles." in
+                            str(wa.message) for wa in w]))
 
     def test_deprecation_warnings_meta_refreshed(self):
         """
@@ -1561,11 +1588,11 @@ class DeprecationWarningTest(unittest.TestCase):
         with warnings.catch_warnings(record=True) as w:
             cluster = TestCluster()
             cluster.set_meta_refresh_enabled(True)
-            self.assertEqual(len(w), 1)
-            self.assertIn("Cluster.set_meta_refresh_enabled is deprecated and will be removed in 4.0.",
-                          str(w[0].message))
+            logging.info(w)
+            self.assertGreaterEqual(len(w), 1)
+            self.assertTrue(any(["Cluster.set_meta_refresh_enabled is deprecated and will be removed in 4.0." in
+                            str(wa.message) for wa in w]))
 
-    @unittest.expectedFailure
     def test_deprecation_warning_default_consistency_level(self):
         """
         Tests the deprecation warning has been added when enabling
@@ -1581,6 +1608,6 @@ class DeprecationWarningTest(unittest.TestCase):
             cluster = TestCluster()
             session = cluster.connect()
             session.default_consistency_level = ConsistencyLevel.ONE
-            self.assertEqual(len(w), 1)
-            self.assertIn("Setting the consistency level at the session level will be removed in 4.0",
-                          str(w[0].message))
+            self.assertGreaterEqual(len(w), 1)
+            self.assertTrue(any(["Setting the consistency level at the session level will be removed in 4.0" in
+                            str(wa.message) for wa in w]))

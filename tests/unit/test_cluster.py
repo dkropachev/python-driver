@@ -11,15 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import logging
-import six
+import socket
 
-from mock import patch, Mock
+from unittest.mock import patch, Mock
 
 from cassandra import ConsistencyLevel, DriverException, Timeout, Unavailable, RequestExecutionException, ReadTimeout, WriteTimeout, CoordinationFailure, ReadFailure, WriteFailure, FunctionFailure, AlreadyExists,\
     InvalidRequest, Unauthorized, AuthenticationFailed, OperationTimedOut, UnsupportedOperation, RequestValidationException, ConfigurationException, ProtocolVersion
@@ -92,8 +89,9 @@ class ClusterTest(unittest.TestCase):
 
     def test_tuple_for_contact_points(self):
         cluster = Cluster(contact_points=[('localhost', 9045), ('127.0.0.2', 9046), '127.0.0.3'], port=9999)
+        localhost_addr = set([addr[0] for addr in [t for (_,_,_,_,t) in socket.getaddrinfo("localhost",80)]])
         for cp in cluster.endpoints_resolved:
-            if cp.address in ('::1', '127.0.0.1'):
+            if cp.address in localhost_addr:
                 self.assertEqual(cp.port, 9045)
             elif cp.address == '127.0.0.2':
                 self.assertEqual(cp.port, 9046)
@@ -120,6 +118,22 @@ class ClusterTest(unittest.TestCase):
         # max underflow, under min, overflow
         for n in (0, mn, 128):
             self.assertRaises(ValueError, c.set_max_requests_per_connection, d, n)
+
+    def test_port_str(self):
+        """Check port passed as tring is converted and checked properly"""
+        cluster = Cluster(contact_points=['127.0.0.1'], port='1111')
+        for cp in cluster.endpoints_resolved:
+            if cp.address in ('::1', '127.0.0.1'):
+                self.assertEqual(cp.port, 1111)
+
+        with self.assertRaises(ValueError):
+            cluster = Cluster(contact_points=['127.0.0.1'], port='string')
+
+
+    def test_port_range(self):
+        for invalid_port in [0, 65536, -1]:
+            with self.assertRaises(ValueError):
+                cluster = Cluster(contact_points=['127.0.0.1'], port=invalid_port)
 
 
 class SchedulerTest(unittest.TestCase):
@@ -155,6 +169,7 @@ class SessionTest(unittest.TestCase):
         """
         c = Cluster(protocol_version=4)
         s = Session(c, [Host("127.0.0.1", SimpleConvictionPolicy)])
+        c.connection_class.initialize_reactor()
 
         # default is None
         default_profile = c.profile_manager.default
@@ -183,7 +198,7 @@ class SessionTest(unittest.TestCase):
         """
         c = Cluster(protocol_version=4)
         s = Session(c, [Host("127.0.0.1", SimpleConvictionPolicy)])
-
+        c.connection_class.initialize_reactor()
         # default is None
         self.assertIsNone(s.default_serial_consistency_level)
 
@@ -289,7 +304,7 @@ class ExecutionProfileTest(unittest.TestCase):
         rf = session.execute_async("query", execution_profile='non-default')
         self._verify_response_future_profile(rf, non_default_profile)
 
-        for name, ep in six.iteritems(cluster.profile_manager.profiles):
+        for name, ep in cluster.profile_manager.profiles.items():
             self.assertEqual(ep, session.get_execution_profile(name))
 
         # invalid ep

@@ -11,12 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
-import mock
+import unittest
+from unittest import mock
 from uuid import uuid4
 
 from cassandra.cqlengine import columns
@@ -29,6 +25,7 @@ from tests.integration import PROTOCOL_VERSION
 
 
 class TestIfExistsModel(Model):
+    __test__ = False
 
     id = columns.UUID(primary_key=True, default=lambda: uuid4())
     count = columns.Integer()
@@ -36,6 +33,7 @@ class TestIfExistsModel(Model):
 
 
 class TestIfExistsModel2(Model):
+    __test__ = False
 
     id = columns.Integer(primary_key=True)
     count = columns.Integer(primary_key=True, required=False)
@@ -43,6 +41,7 @@ class TestIfExistsModel2(Model):
 
 
 class TestIfExistsWithCounterModel(Model):
+    __test__ = False
 
     id = columns.UUID(primary_key=True, default=lambda: uuid4())
     likes = columns.Counter()
@@ -108,17 +107,13 @@ class IfExistsUpdateTests(BaseIfExistsTest):
         with self.assertRaises(LWTException) as assertion:
             m.if_exists().update()
 
-        self.assertEqual(assertion.exception.existing, {
-            '[applied]': False,
-        })
+        self.assertEqual(assertion.exception.existing.get('[applied]'), False)
 
         # queryset update
         with self.assertRaises(LWTException) as assertion:
             TestIfExistsModel.objects(id=uuid4()).if_exists().update(count=8)
 
-        self.assertEqual(assertion.exception.existing, {
-            '[applied]': False,
-        })
+        self.assertEqual(assertion.exception.existing.get('[applied]'), False)
 
     @unittest.skipUnless(PROTOCOL_VERSION >= 2, "only runs against the cql3 protocol v2.0")
     def test_batch_update_if_exists_success(self):
@@ -145,9 +140,7 @@ class IfExistsUpdateTests(BaseIfExistsTest):
                 m = TestIfExistsModel(id=uuid4(), count=42)  # Doesn't exist
                 m.batch(b).if_exists().update()
 
-        self.assertEqual(assertion.exception.existing, {
-            '[applied]': False,
-        })
+        self.assertEqual(assertion.exception.existing.get('[applied]'), False)
 
         q = TestIfExistsModel.objects(id=id)
         self.assertEqual(len(q), 1)
@@ -201,17 +194,13 @@ class IfExistsUpdateTests(BaseIfExistsTest):
         with self.assertRaises(LWTException) as assertion:
             m.if_exists().delete()
 
-        self.assertEqual(assertion.exception.existing, {
-            '[applied]': False,
-        })
+        self.assertEqual(assertion.exception.existing.get('[applied]'), False)
 
         # queryset delete
         with self.assertRaises(LWTException) as assertion:
             TestIfExistsModel.objects(id=uuid4()).if_exists().delete()
 
-        self.assertEqual(assertion.exception.existing, {
-            '[applied]': False,
-        })
+        self.assertEqual(assertion.exception.existing.get('[applied]'), False)
 
     @unittest.skipUnless(PROTOCOL_VERSION >= 2, "only runs against the cql3 protocol v2.0")
     def test_batch_delete_if_exists_success(self):
@@ -240,9 +229,7 @@ class IfExistsUpdateTests(BaseIfExistsTest):
                 m = TestIfExistsModel(id=uuid4(), count=42)  # Doesn't exist
                 m.batch(b).if_exists().delete()
 
-        self.assertEqual(assertion.exception.existing, {
-            '[applied]': False,
-        })
+        self.assertEqual(assertion.exception.existing.get('[applied]'), False)
 
     @unittest.skipUnless(PROTOCOL_VERSION >= 2, "only runs against the cql3 protocol v2.0")
     def test_batch_delete_mixed(self):

@@ -14,10 +14,7 @@
 
 
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from packaging.version import Version
 
@@ -31,6 +28,8 @@ from tests.integration import (DSE_VERSION, greaterthanorequaldse51,
 
 
 class TestMultiKeyModel(models.Model):
+    __test__ = False
+
     partition = columns.Integer(primary_key=True)
     cluster = columns.Integer(primary_key=True)
     count = columns.Integer(required=False)

@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest
-from mock import Mock, patch
+import unittest
+from unittest.mock import Mock, patch
 
 from cassandra.connection import DefaultEndPoint
 
@@ -69,7 +66,9 @@ class TestTwistedProtocol(unittest.TestCase):
         self.tr.protocol = self.obj_ut
 
     def tearDown(self):
-        pass
+        loop = twistedreactor.TwistedConnection._loop
+        if loop and not loop._reactor_stopped():
+            loop._cleanup()
 
     def test_makeConnection(self):
         """
@@ -94,6 +93,8 @@ class TestTwistedConnection(unittest.TestCase):
     def setUp(self):
         if twistedreactor is None:
             raise unittest.SkipTest("Twisted libraries not available")
+        if twistedreactor.TwistedConnection._loop:
+            twistedreactor.TwistedConnection._loop._cleanup()
         twistedreactor.TwistedConnection.initialize_reactor()
         self.reactor_cft_patcher = patch(
             'twisted.internet.reactor.callFromThread')
@@ -112,7 +113,6 @@ class TestTwistedConnection(unittest.TestCase):
         Verify that __init__() works correctly.
         """
         self.mock_reactor_cft.assert_called_with(self.obj_ut.add_connection)
-        self.obj_ut._loop._cleanup()
         self.mock_reactor_run.assert_called_with(installSignalHandlers=False)
 
     def test_client_connection_made(self):

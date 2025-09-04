@@ -13,14 +13,11 @@
 # limitations under the License.
 
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import logging
-from mock import sentinel
 import sys
+from unittest.mock import sentinel
 
 from cassandra import ConsistencyLevel
 from cassandra.cluster import (

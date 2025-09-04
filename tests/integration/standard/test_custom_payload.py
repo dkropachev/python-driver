@@ -13,16 +13,12 @@
 # limitations under the License.
 
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest
-
-import six
+import unittest
 
 from cassandra.query import (SimpleStatement, BatchStatement, BatchType)
 
-from tests.integration import use_singledc, PROTOCOL_VERSION, local, TestCluster
+from tests.integration import (use_singledc, PROTOCOL_VERSION, local, TestCluster,
+                              requires_custom_payload)
 
 
 def setup_module():
@@ -31,13 +27,10 @@ def setup_module():
 #These test rely on the custom payload being returned but by default C*
 #ignores all the payloads.
 @local
+@requires_custom_payload
 class CustomPayloadTests(unittest.TestCase):
 
     def setUp(self):
-        if PROTOCOL_VERSION < 4:
-            raise unittest.SkipTest(
-                "Native protocol 4,0+ is required for custom payloads, currently using %r"
-                % (PROTOCOL_VERSION,))
         self.cluster = TestCluster()
         self.session = self.cluster.connect()
 
@@ -46,7 +39,6 @@ class CustomPayloadTests(unittest.TestCase):
         self.cluster.shutdown()
 
     # Scylla error: 'truncated frame: expected 65540 bytes, length is 64'
-    @unittest.expectedFailure
     def test_custom_query_basic(self):
         """
         Test to validate that custom payloads work with simple queries
@@ -64,13 +56,12 @@ class CustomPayloadTests(unittest.TestCase):
         """
 
         # Create a simple query statement a
-        query = "SELECT * FROM system.local"
+        query = "SELECT * FROM system.local WHERE key='local'"
         statement = SimpleStatement(query)
         # Validate that various types of custom payloads are sent and received okay
         self.validate_various_custom_payloads(statement=statement)
 
     # Scylla error: 'Invalid query kind in BATCH messages. Must be 0 or 1 but got 4'"
-    @unittest.expectedFailure
     def test_custom_query_batching(self):
         """
         Test to validate that custom payloads work with batch queries
@@ -97,7 +88,6 @@ class CustomPayloadTests(unittest.TestCase):
 
     # Scylla error: 'Got different query ID in server response (b'\x00') than we had before
     # (b'\x84P\xd0K0\xe2=\x11\xba\x02\x16W\xfatN\xf1')'")
-    @unittest.expectedFailure
     def test_custom_query_prepared(self):
         """
         Test to validate that custom payloads work with prepared queries
@@ -148,16 +138,16 @@ class CustomPayloadTests(unittest.TestCase):
 
         # Long key value pair
         key_value = "x" * 10
-        custom_payload = {key_value: six.b(key_value)}
+        custom_payload = {key_value: key_value.encode()}
         self.execute_async_validate_custom_payload(statement=statement, custom_payload=custom_payload)
 
         # Max supported value key pairs according C* binary protocol v4 should be 65534 (unsigned short max value)
         for i in range(65534):
-            custom_payload[str(i)] = six.b('x')
+            custom_payload[str(i)] = b'x'
         self.execute_async_validate_custom_payload(statement=statement, custom_payload=custom_payload)
 
         # Add one custom payload to this is too many key value pairs and should fail
-        custom_payload[str(65535)] = six.b('x')
+        custom_payload[str(65535)] = b'x'
         with self.assertRaises(ValueError):
             self.execute_async_validate_custom_payload(statement=statement, custom_payload=custom_payload)
 

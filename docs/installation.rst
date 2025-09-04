@@ -3,7 +3,7 @@ Installation
 
 Supported Platforms
 -------------------
-Python 2.7, 3.5, 3.6, 3.7 and 3.8 are supported. Both CPython (the standard Python
+Python versions 3.6-3.12 are supported. Both CPython (the standard Python
 implementation) and `PyPy <http://pypy.org>`_ are supported and tested.
 
 Linux, OSX, and Windows are supported.
@@ -24,19 +24,9 @@ Verifying your Installation
 ---------------------------
 To check if the installation was successful, you can run::
 
-    python -c 'import cassandra; print cassandra.__version__'
+    python -c 'import cassandra; print(cassandra.__version__)'
 
-It should print something like "3.22.0".
-
-.. _installation-datastax-graph:
-
-(*Optional*) Graph
----------------------------
-The driver provides an optional fluent graph API that depends on Apache TinkerPop (gremlinpython). It is
-not installed by default. To be able to build Gremlin traversals, you need to install
-the `graph` requirements::
-
-    pip install scylla-driver[graph]
+It should print something like "3.29.3".
 
 (*Optional*) Compression Support
 --------------------------------
@@ -188,16 +178,19 @@ If your sudo configuration does not allow SETENV, you must push the option flag 
 applies these options to all dependencies (which break on the custom flag). Therefore, you must first install
 dependencies, then use install-option::
 
-    sudo pip install six futures
+    sudo pip install futures
     sudo pip install --install-option="--no-cython"
 
 
+Supported Event Loops
+^^^^^^^^^^^^^^^^^^^^^
+For Python versions before 3.12 the driver uses the ``asyncore`` module for its default
+event loop.  Other event loops such as ``libev``, ``gevent`` and ``eventlet`` are also
+available via Python modules or C extensions.  Python 3.12 has removed ``asyncore`` entirely
+so for this platform one of these other event loops must be used.
+
 libev support
 ^^^^^^^^^^^^^
-The driver currently uses Python's ``asyncore`` module for its default
-event loop.  For better performance, ``libev`` is also supported through
-a C extension.
-
 If you're on Linux, you should be able to install libev
 through a package manager.  For example, on Debian/Ubuntu::
 
@@ -212,8 +205,10 @@ through `Homebrew <http://brew.sh/>`_. For example, on Mac OS X::
 
     $ brew install libev
 
-The libev extension is not built for Windows (the build process is complex, and the Windows implementation uses
-select anyway).
+The libev extension can now be built for Windows as of Python driver version 3.29.3.  You can
+install libev using any Windows package manager.  For example, to install using `vcpkg <https://vcpkg.io>`_:
+
+    $ vcpkg install libev
 
 If successful, you should be able to build and install the extension
 (just using ``setup.py build`` or ``setup.py install``) and then use

@@ -21,20 +21,20 @@ import ssl
 from threading import Lock, Thread
 import time
 
-from six.moves import range
-
-from cassandra.connection import (Connection, ConnectionShutdown,
-                                  NONBLOCKING, Timer, TimerManager)
+from cassandra import DependencyException
 try:
     import cassandra.io.libevwrapper as libev
 except ImportError:
-    raise ImportError(
+    raise DependencyException(
         "The C extension needed to use libev was not found.  This "
         "probably means that you didn't have the required build dependencies "
         "when installing the driver.  See "
         "http://datastax.github.io/python-driver/installation.html#c-extensions "
         "for instructions on installing build dependencies and building "
         "the C extension.")
+
+from cassandra.connection import (Connection, ConnectionShutdown,
+                                  NONBLOCKING, Timer, TimerManager)
 
 
 log = logging.getLogger(__name__)
@@ -294,6 +294,7 @@ class LibevConnection(Connection):
         if not self.is_defunct:
             self.error_all_requests(
                 ConnectionShutdown("Connection to %s was closed" % self.endpoint))
+            self.connected_event.set()
 
     def handle_write(self, watcher, revents, errno=None):
         if revents & libev.EV_ERROR:

@@ -39,8 +39,6 @@ import logging
 import re
 import socket
 import time
-import six
-from six.moves import range
 import struct
 import sys
 from uuid import UUID
@@ -50,14 +48,11 @@ from cassandra.marshal import (int8_pack, int8_unpack, int16_pack, int16_unpack,
                                int32_pack, int32_unpack, int64_pack, int64_unpack,
                                float_pack, float_unpack, double_pack, double_unpack,
                                varint_pack, varint_unpack, point_be, point_le,
-                               vints_pack, vints_unpack)
+                               vints_pack, vints_unpack, uvint_unpack, uvint_pack)
 from cassandra import util
 
 _little_endian_flag = 1  # we always serialize LE
-if six.PY3:
-    import ipaddress
-
-_ord = ord if six.PY2 else lambda x: x
+import ipaddress
 
 apache_cassandra_type_prefix = 'org.apache.cassandra.db.marshal.'
 
@@ -66,16 +61,12 @@ cql_empty_type = 'empty'
 
 log = logging.getLogger(__name__)
 
-if six.PY3:
-    _number_types = frozenset((int, float))
-    long = int
+_number_types = frozenset((int, float))
 
-    def _name_from_hex_string(encoded_name):
-        bin_str = unhexlify(encoded_name)
-        return bin_str.decode('ascii')
-else:
-    _number_types = frozenset((int, long, float))
-    _name_from_hex_string = unhexlify
+
+def _name_from_hex_string(encoded_name):
+    bin_str = unhexlify(encoded_name)
+    return bin_str.decode('ascii')
 
 
 def trim_if_startswith(s, prefix):
@@ -235,12 +226,14 @@ def parse_casstype_args(typestring):
             else:
                 names.append(None)
 
-            ctype = lookup_casstype_simple(tok)
+            try:
+                ctype = int(tok)
+            except ValueError:
+                ctype = lookup_casstype_simple(tok)
             types.append(ctype)
 
     # return the first (outer) type, which will have all parameters applied
     return args[0][0][0]
-
 
 def lookup_casstype(casstype):
     """
@@ -276,8 +269,7 @@ class EmptyValue(object):
 EMPTY = EmptyValue()
 
 
-@six.add_metaclass(CassandraTypeType)
-class _CassandraType(object):
+class _CassandraType(object, metaclass=CassandraTypeType):
     subtypes = ()
     num_subtypes = 0
     empty_binary_ok = False
@@ -296,7 +288,7 @@ class _CassandraType(object):
     """
 
     def __repr__(self):
-        return '<%s( %r )>' % (self.cql_parameterized_type(), self.val)
+        return '<%s>' % (self.cql_parameterized_type())
 
     @classmethod
     def from_binary(cls, byts, protocol_version):
@@ -380,8 +372,6 @@ class _CassandraType(object):
             raise ValueError("%s types require %d subtypes (%d given)"
                              % (cls.typename, cls.num_subtypes, len(subtypes)))
         newname = cls.cass_parameterized_type_with(subtypes)
-        if six.PY2 and isinstance(newname, unicode):
-            newname = newname.encode('utf-8')
         return type(newname, (cls,), {'subtypes': subtypes, 'cassname': cls.cassname, 'fieldnames': names})
 
     @classmethod
@@ -402,6 +392,9 @@ class _CassandraType(object):
         """
         return cls.cass_parameterized_type_with(cls.subtypes, full=full)
 
+    @classmethod
+    def serial_size(cls):
+        return None
 
 # it's initially named with a _ to avoid registering it as a real type, but
 # client programs may want to use the name still for isinstance(), etc
@@ -412,16 +405,10 @@ class _UnrecognizedType(_CassandraType):
     num_subtypes = 'UNKNOWN'
 
 
-if six.PY3:
-    def mkUnrecognizedType(casstypename):
-        return CassandraTypeType(casstypename,
-                                 (_UnrecognizedType,),
-                                 {'typename': "'%s'" % casstypename})
-else:
-    def mkUnrecognizedType(casstypename):  # noqa
-        return CassandraTypeType(casstypename.encode('utf8'),
-                                 (_UnrecognizedType,),
-                                 {'typename': "'%s'" % casstypename})
+def mkUnrecognizedType(casstypename):
+    return CassandraTypeType(casstypename,
+                             (_UnrecognizedType,),
+                             {'typename': "'%s'" % casstypename})
 
 
 class BytesType(_CassandraType):
@@ -430,7 +417,7 @@ class BytesType(_CassandraType):
 
     @staticmethod
     def serialize(val, protocol_version):
-        return six.binary_type(val)
+        return bytes(val)
 
 
 class DecimalType(_CassandraType):
@@ -473,6 +460,9 @@ class UUIDType(_CassandraType):
         except AttributeError:
             raise TypeError("Got a non-UUID object for a UUID value")
 
+    @classmethod
+    def serial_size(cls):
+        return 16
 
 class BooleanType(_CassandraType):
     typename = 'boolean'
@@ -484,6 +474,10 @@ class BooleanType(_CassandraType):
     @staticmethod
     def serialize(truth, protocol_version):
         return int8_pack(truth)
+
+    @classmethod
+    def serial_size(cls):
+        return 1
 
 class ByteType(_CassandraType):
     typename = 'tinyint'
@@ -497,25 +491,20 @@ class ByteType(_CassandraType):
         return int8_pack(byts)
 
 
-if six.PY2:
-    class AsciiType(_CassandraType):
-        typename = 'ascii'
-        empty_binary_ok = True
-else:
-    class AsciiType(_CassandraType):
-        typename = 'ascii'
-        empty_binary_ok = True
+class AsciiType(_CassandraType):
+    typename = 'ascii'
+    empty_binary_ok = True
 
-        @staticmethod
-        def deserialize(byts, protocol_version):
-            return byts.decode('ascii')
+    @staticmethod
+    def deserialize(byts, protocol_version):
+        return byts.decode('ascii')
 
-        @staticmethod
-        def serialize(var, protocol_version):
-            try:
-                return var.encode('ascii')
-            except UnicodeDecodeError:
-                return var
+    @staticmethod
+    def serialize(var, protocol_version):
+        try:
+            return var.encode('ascii')
+        except UnicodeDecodeError:
+            return var
 
 
 class FloatType(_CassandraType):
@@ -529,6 +518,9 @@ class FloatType(_CassandraType):
     def serialize(byts, protocol_version):
         return float_pack(byts)
 
+    @classmethod
+    def serial_size(cls):
+        return 4
 
 class DoubleType(_CassandraType):
     typename = 'double'
@@ -541,6 +533,9 @@ class DoubleType(_CassandraType):
     def serialize(byts, protocol_version):
         return double_pack(byts)
 
+    @classmethod
+    def serial_size(cls):
+        return 8
 
 class LongType(_CassandraType):
     typename = 'bigint'
@@ -553,6 +548,9 @@ class LongType(_CassandraType):
     def serialize(byts, protocol_version):
         return int64_pack(byts)
 
+    @classmethod
+    def serial_size(cls):
+        return 8
 
 class Int32Type(_CassandraType):
     typename = 'int'
@@ -565,6 +563,9 @@ class Int32Type(_CassandraType):
     def serialize(byts, protocol_version):
         return int32_pack(byts)
 
+    @classmethod
+    def serial_size(cls):
+        return 4
 
 class IntegerType(_CassandraType):
     typename = 'varint'
@@ -600,7 +601,7 @@ class InetAddressType(_CassandraType):
                 # since we've already determined the AF
                 return socket.inet_aton(addr)
         except:
-            if six.PY3 and isinstance(addr, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            if isinstance(addr, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
                 return addr.packed
             raise ValueError("can't interpret %r as an inet address" % (addr,))
 
@@ -659,8 +660,11 @@ class DateType(_CassandraType):
                     raise TypeError('DateType arguments must be a datetime, date, or timestamp')
                 timestamp = v
 
-        return int64_pack(long(timestamp))
+        return int64_pack(int(timestamp))
 
+    @classmethod
+    def serial_size(cls):
+        return 8
 
 class TimestampType(DateType):
     pass
@@ -683,6 +687,9 @@ class TimeUUIDType(DateType):
         except AttributeError:
             raise TypeError("Got a non-UUID object for a UUID value")
 
+    @classmethod
+    def serial_size(cls):
+        return 16
 
 class SimpleDateType(_CassandraType):
     typename = 'date'
@@ -703,7 +710,7 @@ class SimpleDateType(_CassandraType):
         try:
             days = val.days_from_epoch
         except AttributeError:
-            if isinstance(val, six.integer_types):
+            if isinstance(val, int):
                 # the DB wants offset int values, but util.Date init takes days from epoch
                 # here we assume int values are offset, as they would appear in CQL
                 # short circuit to avoid subtracting just to add offset
@@ -723,9 +730,14 @@ class ShortType(_CassandraType):
     def serialize(byts, protocol_version):
         return int16_pack(byts)
 
-
 class TimeType(_CassandraType):
     typename = 'time'
+    # Time should be a fixed size 8 byte type but Cassandra 5.0 code marks it as
+    # variable size... and we have to match what the server expects since the server
+    # uses that specification to encode data of that type.
+    #@classmethod
+    #def serial_size(cls):
+    #    return 8
 
     @staticmethod
     def deserialize(byts, protocol_version):
@@ -823,7 +835,7 @@ class _SimpleParameterizedType(_ParameterizedType):
 
     @classmethod
     def serialize_safe(cls, items, protocol_version):
-        if isinstance(items, six.string_types):
+        if isinstance(items, str):
             raise TypeError("Received a string for a type that expects a sequence")
 
         subtype, = cls.subtypes
@@ -832,9 +844,12 @@ class _SimpleParameterizedType(_ParameterizedType):
         buf.write(pack(len(items)))
         inner_proto = max(3, protocol_version)
         for item in items:
-            itembytes = subtype.to_binary(item, inner_proto)
-            buf.write(pack(len(itembytes)))
-            buf.write(itembytes)
+            if item is None:
+                buf.write(pack(-1))
+            else:
+                itembytes = subtype.to_binary(item, inner_proto)
+                buf.write(pack(len(itembytes)))
+                buf.write(itembytes)
         return buf.getvalue()
 
 
@@ -897,17 +912,23 @@ class MapType(_ParameterizedType):
         buf = io.BytesIO()
         buf.write(pack(len(themap)))
         try:
-            items = six.iteritems(themap)
+            items = themap.items()
         except AttributeError:
             raise TypeError("Got a non-map object for a map value")
         inner_proto = max(3, protocol_version)
         for key, val in items:
-            keybytes = key_type.to_binary(key, inner_proto)
-            valbytes = value_type.to_binary(val, inner_proto)
-            buf.write(pack(len(keybytes)))
-            buf.write(keybytes)
-            buf.write(pack(len(valbytes)))
-            buf.write(valbytes)
+            if key is not None:
+                keybytes = key_type.to_binary(key, inner_proto)
+                buf.write(pack(len(keybytes)))
+                buf.write(keybytes)
+            else:
+                buf.write(pack(-1))
+            if val is not None:
+                valbytes = value_type.to_binary(val, inner_proto)
+                buf.write(pack(len(valbytes)))
+                buf.write(valbytes)
+            else:
+                buf.write(pack(-1))
         return buf.getvalue()
 
 
@@ -972,9 +993,6 @@ class UserType(TupleType):
     def make_udt_class(cls, keyspace, udt_name, field_names, field_types):
         assert len(field_names) == len(field_types)
 
-        if six.PY2 and isinstance(udt_name, unicode):
-            udt_name = udt_name.encode('utf-8')
-
         instance = cls._cache.get((keyspace, udt_name))
         if not instance or instance.fieldnames != field_names or instance.subtypes != field_types:
             instance = type(udt_name, (cls,), {'subtypes': field_types,
@@ -989,8 +1007,6 @@ class UserType(TupleType):
 
     @classmethod
     def evict_udt_class(cls, keyspace, udt_name):
-        if six.PY2 and isinstance(udt_name, unicode):
-            udt_name = udt_name.encode('utf-8')
         try:
             del cls._cache[(keyspace, udt_name)]
         except KeyError:
@@ -1026,7 +1042,9 @@ class UserType(TupleType):
             try:
                 item = val[i]
             except TypeError:
-                item = getattr(val, fieldname)
+                item = getattr(val, fieldname, None)
+                if item is None and not hasattr(val, fieldname):
+                    log.warning(f"field {fieldname} is part of the UDT {cls.typename} but is not present in the value {val}")
 
             if item is not None:
                 packed_item = subtype.to_binary(item, proto_version)
@@ -1145,7 +1163,7 @@ class FrozenType(_ParameterizedType):
 
 
 def is_counter_type(t):
-    if isinstance(t, six.string_types):
+    if isinstance(t, str):
         t = lookup_casstype(t)
     return issubclass(t, CounterColumnType)
 
@@ -1181,7 +1199,7 @@ class PointType(CassandraType):
 
     @staticmethod
     def deserialize(byts, protocol_version):
-        is_little_endian = bool(_ord(byts[0]))
+        is_little_endian = bool(byts[0])
         point = point_le if is_little_endian else point_be
         return util.Point(*point.unpack_from(byts, 5))  # ofs = endian byte + int type
 
@@ -1198,7 +1216,7 @@ class LineStringType(CassandraType):
 
     @staticmethod
     def deserialize(byts, protocol_version):
-        is_little_endian = bool(_ord(byts[0]))
+        is_little_endian = bool(byts[0])
         point = point_le if is_little_endian else point_be
         coords = ((point.unpack_from(byts, offset) for offset in range(1 + 4 + 4, len(byts), point.size)))  # start = endian + int type + int count
         return util.LineString(coords)
@@ -1227,7 +1245,7 @@ class PolygonType(CassandraType):
 
     @staticmethod
     def deserialize(byts, protocol_version):
-        is_little_endian = bool(_ord(byts[0]))
+        is_little_endian = bool(byts[0])
         if is_little_endian:
             int_fmt = '<i'
             point = point_le
@@ -1270,8 +1288,7 @@ class BoundKind(object):
         'BOTH_OPEN_RANGE': 4,
         'SINGLE_DATE_OPEN': 5,
     }
-    _bound_int_to_str_map = {i: s for i, s in
-                             six.iteritems(_bound_str_to_int_map)}
+    _bound_int_to_str_map = {i: s for i, s in _bound_str_to_int_map.items()}
 
     @classmethod
     def to_int(cls, bound_str):
@@ -1300,8 +1317,7 @@ class DateRangeType(CassandraType):
         'SECOND': 5,
         'MILLISECOND': 6
     }
-    _precision_int_to_str_map = {s: i for i, s in
-                                 six.iteritems(_precision_str_to_int_map)}
+    _precision_int_to_str_map = {s: i for i, s in _precision_str_to_int_map.items()}
 
     @classmethod
     def _encode_precision(cls, precision_str):
@@ -1421,3 +1437,70 @@ class DateRangeType(CassandraType):
             buf.write(int8_pack(cls._encode_precision(bound.precision)))
 
         return buf.getvalue()
+
+class VectorType(_CassandraType):
+    typename = 'org.apache.cassandra.db.marshal.VectorType'
+    vector_size = 0
+    subtype = None
+
+    @classmethod
+    def serial_size(cls):
+        serialized_size = cls.subtype.serial_size()
+        return cls.vector_size * serialized_size if serialized_size is not None else None
+
+    @classmethod
+    def apply_parameters(cls, params, names):
+        assert len(params) == 2
+        subtype = lookup_casstype(params[0])
+        vsize = params[1]
+        return type('%s(%s)' % (cls.cass_parameterized_type_with([]), vsize), (cls,), {'vector_size': vsize, 'subtype': subtype})
+
+    @classmethod
+    def deserialize(cls, byts, protocol_version):
+        serialized_size = cls.subtype.serial_size()
+        if serialized_size is not None:
+            expected_byte_size = serialized_size * cls.vector_size
+            if len(byts) != expected_byte_size:
+                raise ValueError(
+                    "Expected vector of type {0} and dimension {1} to have serialized size {2}; observed serialized size of {3} instead"\
+                    .format(cls.subtype.typename, cls.vector_size, expected_byte_size, len(byts)))
+            indexes = (serialized_size * x for x in range(0, cls.vector_size))
+            return [cls.subtype.deserialize(byts[idx:idx + serialized_size], protocol_version) for idx in indexes]
+
+        idx = 0
+        rv = []
+        while (len(rv) < cls.vector_size):
+            try:
+                size, bytes_read = uvint_unpack(byts[idx:])
+                idx += bytes_read
+                rv.append(cls.subtype.deserialize(byts[idx:idx + size], protocol_version))
+                idx += size
+            except:
+                raise ValueError("Error reading additional data during vector deserialization after successfully adding {} elements"\
+                .format(len(rv)))
+
+        # If we have any additional data in the serialized vector treat that as an error as well
+        if idx < len(byts):
+            raise ValueError("Additional bytes remaining after vector deserialization completed")
+        return rv
+
+    @classmethod
+    def serialize(cls, v, protocol_version):
+        v_length = len(v)
+        if cls.vector_size != v_length:
+            raise ValueError(
+                "Expected sequence of size {0} for vector of type {1} and dimension {0}, observed sequence of length {2}"\
+                .format(cls.vector_size, cls.subtype.typename, v_length))
+
+        serialized_size = cls.subtype.serial_size()
+        buf = io.BytesIO()
+        for item in v:
+            item_bytes = cls.subtype.serialize(item, protocol_version)
+            if serialized_size is None:
+                buf.write(uvint_pack(len(item_bytes)))
+            buf.write(item_bytes)
+        return buf.getvalue()
+
+    @classmethod
+    def cql_parameterized_type(cls):
+        return "%s<%s, %s>" % (cls.typename, cls.subtype.cql_parameterized_type(), cls.vector_size)

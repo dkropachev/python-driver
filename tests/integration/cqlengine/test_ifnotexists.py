@@ -11,12 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
-import mock
+import unittest
+from unittest import mock
 from uuid import uuid4
 
 from cassandra.cqlengine import columns
@@ -28,6 +24,7 @@ from tests.integration.cqlengine.base import BaseCassEngTestCase
 from tests.integration import PROTOCOL_VERSION
 
 class TestIfNotExistsModel(Model):
+    __test__ = False
 
     id      = columns.UUID(primary_key=True, default=lambda:uuid4())
     count   = columns.Integer()
@@ -35,6 +32,7 @@ class TestIfNotExistsModel(Model):
 
 
 class TestIfNotExistsWithCounterModel(Model):
+    __test__ = False
 
     id      = columns.UUID(primary_key=True, default=lambda:uuid4())
     likes   = columns.Counter()

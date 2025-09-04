@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from uuid import uuid4
 
@@ -31,6 +28,8 @@ from tests.integration import PROTOCOL_VERSION
 STATIC_SUPPORTED = PROTOCOL_VERSION >= 2
 
 class TestStaticModel(Model):
+    __test__ = False
+
     partition = columns.UUID(primary_key=True, default=uuid4)
     cluster = columns.UUID(primary_key=True, default=uuid4)
     static = columns.Text(static=True)

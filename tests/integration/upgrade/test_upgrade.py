@@ -20,10 +20,7 @@ from cassandra.cluster import ConsistencyLevel, Cluster, DriverException, Execut
 from cassandra.policies import ConstantSpeculativeExecutionPolicy
 from tests.integration.upgrade import UpgradeBase, UpgradeBaseAuth, UpgradePath, upgrade_paths
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 
 # Previous Cassandra upgrade
@@ -59,7 +56,7 @@ class UpgradeTests(UpgradeBase):
             self.session.execute("INSERT INTO test3rf.test(k, v) VALUES (%s, 0)", (next(c), ), execution_profile="one")
             time.sleep(0.0001)
 
-        total_number_of_inserted = self.session.execute("SELECT COUNT(*) from test3rf.test", execution_profile="all")[0][0]
+        total_number_of_inserted = self.session.execute("SELECT COUNT(*) from test3rf.test", execution_profile="all").one()[0]
         self.assertEqual(total_number_of_inserted, next(c))
 
         self.assertEqual(self.logger_handler.get_message_count("error", ""), 0)
@@ -81,7 +78,7 @@ class UpgradeTests(UpgradeBase):
             session = cluster.connect(wait_for_all_pools=True)
             queried_hosts = set()
             for _ in range(10):
-                results = session.execute("SELECT * from system.local")
+                results = session.execute("SELECT * from system.local WHERE key='local'")
                 self.assertGreater(len(results.current_rows), 0)
                 self.assertEqual(len(results.response_future.attempted_hosts), 1)
                 queried_hosts.add(results.response_future.attempted_hosts[0])
@@ -118,7 +115,7 @@ class UpgradeTestsMetadata(UpgradeBase):
             self.session.execute("INSERT INTO test3rf.test(k, v) VALUES (%s, 0)", (next(c),), execution_profile="one")
             time.sleep(0.0001)
 
-        total_number_of_inserted = self.session.execute("SELECT COUNT(*) from test3rf.test", execution_profile="all")[0][0]
+        total_number_of_inserted = self.session.execute("SELECT COUNT(*) from test3rf.test", execution_profile="all").one()[0]
         self.assertEqual(total_number_of_inserted, next(c))
 
         self.assertEqual(self.logger_handler.get_message_count("error", ""), 0)
@@ -245,7 +242,7 @@ class UpgradeTestsAuthentication(UpgradeBaseAuth):
         session = cluster.connect(wait_for_all_pools=True)
         queried_hosts = set()
         for _ in range(10):
-            results = session.execute("SELECT * from system.local")
+            results = session.execute("SELECT * from system.local WHERE key='local'")
             self.assertGreater(len(results.current_rows), 0)
             self.assertEqual(len(results.response_future.attempted_hosts), 1)
             queried_hosts.add(results.response_future.attempted_hosts[0])
@@ -282,7 +279,7 @@ class UpgradeTestsPolicies(UpgradeBase):
                                  execution_profile='spec_ep_rr')
             time.sleep(0.0001)
 
-        total_number_of_inserted = session.execute("SELECT COUNT(*) from test3rf.test", execution_profile="all")[0][0]
+        total_number_of_inserted = session.execute("SELECT COUNT(*) from test3rf.test", execution_profile="all").one()[0]
         self.assertEqual(total_number_of_inserted, next(c))
 
         self.assertEqual(self.logger_handler.get_message_count("error", ""), 0)

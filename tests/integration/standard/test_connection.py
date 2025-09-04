@@ -12,27 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from functools import partial
-from mock import patch
+from unittest.mock import patch
 import logging
-from six.moves import range
 import sys
 import threading
 from threading import Thread, Event
 import time
 from unittest import SkipTest
 
-from cassandra import ConsistencyLevel, OperationTimedOut
+from cassandra import ConsistencyLevel, OperationTimedOut, DependencyException
 from cassandra.cluster import NoHostAvailable, ConnectionShutdown, ExecutionProfile, EXEC_PROFILE_DEFAULT
-import cassandra.io.asyncorereactor
-from cassandra.io.asyncorereactor import AsyncoreConnection
 from cassandra.protocol import QueryMessage
-from cassandra.connection import Connection
 from cassandra.policies import HostFilterPolicy, RoundRobinPolicy, HostStateListener
 from cassandra.pool import HostConnectionPool
 
@@ -41,9 +34,15 @@ from tests.integration import use_singledc, get_node, CASSANDRA_IP, local, \
     requiresmallclockgranularity, greaterthancass20, TestCluster
 
 try:
+    import cassandra.io.asyncorereactor
+    from cassandra.io.asyncorereactor import AsyncoreConnection
+except DependencyException:
+    AsyncoreConnection = None
+
+try:
     from cassandra.io.libevreactor import LibevConnection
     import cassandra.io.libevreactor
-except ImportError:
+except DependencyException:
     LibevConnection = None
 
 
@@ -86,7 +85,7 @@ class ConnectionTimeoutTest(unittest.TestCase):
         @test_category connection timeout
         """
         futures = []
-        query = '''SELECT * FROM system.local'''
+        query = "SELECT * FROM system.local WHERE key='local'"
         for _ in range(100):
             futures.append(self.session.execute_async(query))
 
@@ -95,6 +94,8 @@ class ConnectionTimeoutTest(unittest.TestCase):
 
 
 class TestHostListener(HostStateListener):
+    __test__ = False
+
     host_down = None
 
     def on_down(self, host):
@@ -149,7 +150,7 @@ class HeartbeatTest(unittest.TestCase):
         current_host = ""
         count = 0
         while current_host != host and count < 100:
-            rs = self.session.execute_async("SELECT * FROM system.local", trace=False)
+            rs = self.session.execute_async("SELECT * FROM system.local WHERE key='local'", trace=False)
             rs.result()
             current_host = str(rs._current_host)
             count += 1
@@ -180,7 +181,7 @@ class HeartbeatTest(unittest.TestCase):
         while(retry < 300):
             retry += 1
             connections = self.fetch_connections(host, cluster)
-            if len(connections) is not 0:
+            if connections:
                 return connections
             time.sleep(.1)
         self.fail("No new connections found")
@@ -190,7 +191,7 @@ class HeartbeatTest(unittest.TestCase):
         while(retry < 100):
             retry += 1
             connections = self.fetch_connections(host, cluster)
-            if len(connections) is 0:
+            if not connections:
                 return
             time.sleep(.5)
         self.fail("Connections never cleared")
@@ -444,6 +445,8 @@ class AsyncoreConnectionTests(ConnectionTests, unittest.TestCase):
     def setUp(self):
         if is_monkey_patched():
             raise unittest.SkipTest("Can't test asyncore with monkey patching")
+        if AsyncoreConnection is None:
+            raise unittest.SkipTest('Unable to import asyncore module')
         ConnectionTests.setUp(self)
 
     def clean_global_loop(self):

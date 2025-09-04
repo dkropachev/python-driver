@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
+import unittest
+from unittest.mock import patch
 
 
 from tests.unit.io.utils import TimerTestMixin
@@ -25,8 +23,6 @@ try:
     import gevent.monkey
 except ImportError:
     GeventConnection = None  # noqa
-
-from mock import patch
 
 
 skip_condition = GeventConnection is None or EVENT_LOOP_MANAGER != "gevent"

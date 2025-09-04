@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
+import unittest
 
-from mock import Mock
+from unittest.mock import Mock
+
+import pytest
 
 from cassandra import ProtocolVersion, UnsupportedOperation
 from cassandra.protocol import (
@@ -26,6 +25,7 @@ from cassandra.protocol import (
     _PAGE_SIZE_FLAG, _WITH_PAGING_STATE_FLAG,
     BatchMessage
 )
+from cassandra.protocol_features import ProtocolFeatures
 from cassandra.query import BatchType
 from cassandra.marshal import uint32_unpack
 from cassandra.cluster import ContinuousPagingOptions
@@ -46,11 +46,11 @@ class MessageTest(unittest.TestCase):
         message = PrepareMessage("a")
         io = Mock()
 
-        message.send_body(io, 4)
+        message.send_body(io, 4, ProtocolFeatures())
         self._check_calls(io, [(b'\x00\x00\x00\x01',), (b'a',)])
 
         io.reset_mock()
-        message.send_body(io, 5)
+        message.send_body(io, 5, ProtocolFeatures())
 
         self._check_calls(io, [(b'\x00\x00\x00\x01',), (b'a',), (b'\x00\x00\x00\x00',)])
 
@@ -58,17 +58,37 @@ class MessageTest(unittest.TestCase):
         message = ExecuteMessage('1', [], 4)
         io = Mock()
 
-        message.send_body(io, 4)
+        message.send_body(io, 4, ProtocolFeatures())
         self._check_calls(io, [(b'\x00\x01',), (b'1',), (b'\x00\x04',), (b'\x01',), (b'\x00\x00',)])
 
         io.reset_mock()
         message.result_metadata_id = 'foo'
-        message.send_body(io, 5)
+        message.send_body(io, 5, ProtocolFeatures())
 
         self._check_calls(io, [(b'\x00\x01',), (b'1',),
                                (b'\x00\x03',), (b'foo',),
                                (b'\x00\x04',),
                                (b'\x00\x00\x00\x01',), (b'\x00\x00',)])
+
+    def test_execute_metadata_id(self):
+        for protocol, use_metadata_id, can_have_result_metadata in [
+            (4, True, True), (4, True, False), (4, False, True), (4, False, False), (5, True, True), (5, True, False),
+            (5, False, True), (5, False, False)]:
+            print(protocol, use_metadata_id, can_have_result_metadata)
+            message = ExecuteMessage('1', [], 4, can_have_result_metadata=can_have_result_metadata)
+            io = Mock()
+
+            message.send_body(io, protocol, ProtocolFeatures(use_metadata_id=use_metadata_id))
+            self._check_calls(io, [(b'\x00\x01',), (b'1',), (b'\x00\x04',), (b'\x01',), (b'\x00\x00',)])
+
+            io.reset_mock()
+            message.result_metadata_id = 'foo'
+            message.send_body(io, 5, ProtocolFeatures())
+
+            self._check_calls(io, [(b'\x00\x01',), (b'1',),
+                                   (b'\x00\x03',), (b'foo',),
+                                   (b'\x00\x04',),
+                                   (b'\x00\x00\x00\x01',), (b'\x00\x00',)])
 
     def test_query_message(self):
         """
@@ -83,11 +103,11 @@ class MessageTest(unittest.TestCase):
         message = QueryMessage("a", 3)
         io = Mock()
 
-        message.send_body(io, 4)
+        message.send_body(io, 4, ProtocolFeatures())
         self._check_calls(io, [(b'\x00\x00\x00\x01',), (b'a',), (b'\x00\x03',), (b'\x00',)])
 
         io.reset_mock()
-        message.send_body(io, 5)
+        message.send_body(io, 5, ProtocolFeatures())
         self._check_calls(io, [(b'\x00\x00\x00\x01',), (b'a',), (b'\x00\x03',), (b'\x00\x00\x00\x00',)])
 
     def _check_calls(self, io, expected):
@@ -115,10 +135,10 @@ class MessageTest(unittest.TestCase):
         io = Mock()
         for version in [version for version in ProtocolVersion.SUPPORTED_VERSIONS
                         if not ProtocolVersion.has_continuous_paging_support(version)]:
-            self.assertRaises(UnsupportedOperation, message.send_body, io, version)
+            self.assertRaises(UnsupportedOperation, message.send_body, io, version, ProtocolFeatures())
 
         io.reset_mock()
-        message.send_body(io, ProtocolVersion.DSE_V1)
+        message.send_body(io, ProtocolVersion.DSE_V1, ProtocolFeatures())
 
         # continuous paging adds two write calls to the buffer
         self.assertEqual(len(io.write.mock_calls), 6)
@@ -145,7 +165,7 @@ class MessageTest(unittest.TestCase):
         message = PrepareMessage("a")
         io = Mock()
         for version in ProtocolVersion.SUPPORTED_VERSIONS:
-            message.send_body(io, version)
+            message.send_body(io, version, ProtocolFeatures())
             if ProtocolVersion.uses_prepare_flags(version):
                 self.assertEqual(len(io.write.mock_calls), 3)
             else:
@@ -158,7 +178,7 @@ class MessageTest(unittest.TestCase):
 
         for version in ProtocolVersion.SUPPORTED_VERSIONS:
             if ProtocolVersion.uses_keyspace_flag(version):
-                message.send_body(io, version)
+                message.send_body(io, version, ProtocolFeatures())
                 self._check_calls(io, [
                     (b'\x00\x00\x00\x01',),
                     (b'a',),
@@ -168,15 +188,15 @@ class MessageTest(unittest.TestCase):
                 ])
             else:
                 with self.assertRaises(UnsupportedOperation):
-                    message.send_body(io, version)
+                    message.send_body(io, version, ProtocolFeatures())
             io.reset_mock()
 
     def test_keyspace_flag_raises_before_v5(self):
         keyspace_message = QueryMessage('a', consistency_level=3, keyspace='ks')
         io = Mock(name='io')
 
-        with self.assertRaisesRegexp(UnsupportedOperation, 'Keyspaces.*set'):
-            keyspace_message.send_body(io, protocol_version=4)
+        with self.assertRaisesRegex(UnsupportedOperation, 'Keyspaces.*set'):
+            keyspace_message.send_body(io, protocol_version=4, protocol_features=ProtocolFeatures())
         io.assert_not_called()
 
     def test_keyspace_written_with_length(self):
@@ -189,7 +209,7 @@ class MessageTest(unittest.TestCase):
         ]
 
         QueryMessage('a', consistency_level=3, keyspace='ks').send_body(
-            io, protocol_version=5
+            io, protocol_version=5, protocol_features=ProtocolFeatures()
         )
         self._check_calls(io, base_expected + [
             (b'\x00\x02',),  # length of keyspace string
@@ -199,7 +219,7 @@ class MessageTest(unittest.TestCase):
         io.reset_mock()
 
         QueryMessage('a', consistency_level=3, keyspace='keyspace').send_body(
-            io, protocol_version=5
+            io, protocol_version=5, protocol_features=ProtocolFeatures()
         )
         self._check_calls(io, base_expected + [
             (b'\x00\x08',),  # length of keyspace string
@@ -218,7 +238,7 @@ class MessageTest(unittest.TestCase):
             consistency_level=3,
             keyspace='ks'
         )
-        batch.send_body(io, protocol_version=5)
+        batch.send_body(io, protocol_version=5, protocol_features=ProtocolFeatures())
         self._check_calls(io,
             ((b'\x00',), (b'\x00\x03',), (b'\x00',),
              (b'\x00\x00\x00\x06',), (b'stmt a',),

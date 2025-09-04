@@ -14,7 +14,6 @@
 
 import sys
 import datetime
-import six
 import time
 from collections import namedtuple
 from packaging.version import Version
@@ -35,10 +34,7 @@ from tests.integration.advanced.graph import (
     VertexLabel)
 from tests.integration import requiredse
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 
 import ipaddress
@@ -460,10 +456,10 @@ class _AbstractTraversalTest(GraphUnitTestCase):
     def _write_and_read_data_types(self, schema, graphson, use_schema=True):
         g = self.fetch_traversal_source(graphson)
         ep = self.get_execution_profile(graphson)
-        for data in six.itervalues(schema.fixtures.datatypes()):
+        for data in schema.fixtures.datatypes().values():
             typ, value, deserializer = data
             vertex_label = VertexLabel([typ])
-            property_name = next(six.iterkeys(vertex_label.non_pk_properties))
+            property_name = next(iter(vertex_label.non_pk_properties.keys()))
             if use_schema or schema is CoreGraphSchema:
                 schema.create_vertex_label(self.session, vertex_label, execution_profile=ep)
 
@@ -539,9 +535,9 @@ class _AbstractTraversalTest(GraphUnitTestCase):
         }
 
         g = self.fetch_traversal_source(graphson)
-        for typ, value in six.itervalues(data):
+        for typ, value in data.values():
             vertex_label = VertexLabel([typ])
-            property_name = next(six.iterkeys(vertex_label.non_pk_properties))
+            property_name = next(iter(vertex_label.non_pk_properties.keys()))
             schema.create_vertex_label(self.session, vertex_label, execution_profile=ep)
 
             write_traversal = g.addV(str(vertex_label.label)).property('pkid', vertex_label.id). \
@@ -600,7 +596,7 @@ def _validate_prop(key, value, unittest):
     elif any(key.startswith(t) for t in ('Linestring',)):
         typ = LineString
     elif any(key.startswith(t) for t in ('neg',)):
-        typ = six.string_types
+        typ = str
     elif any(key.startswith(t) for t in ('date',)):
         typ = datetime.date
     elif any(key.startswith(t) for t in ('time',)):

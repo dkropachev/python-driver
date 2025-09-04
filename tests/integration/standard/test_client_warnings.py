@@ -13,23 +13,18 @@
 # limitations under the License.
 
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest
+import unittest
 
 from cassandra.query import BatchStatement
 
-from tests.integration import use_singledc, PROTOCOL_VERSION, local, TestCluster
+from tests.integration import (use_singledc, PROTOCOL_VERSION, local, TestCluster,
+                               requires_custom_payload, xfail_scylla)
 
 
 def setup_module():
     use_singledc()
 
-
-# Failing with scylla because there is no warning message when changing the value of 'batch_size_warn_threshold_in_kb'
-# config")
-@unittest.expectedFailure
+@xfail_scylla('scylladb/scylladb#10196 - scylla does not report warnings')
 class ClientWarningTests(unittest.TestCase):
 
     @classmethod
@@ -76,7 +71,7 @@ class ClientWarningTests(unittest.TestCase):
         future = self.session.execute_async(self.warn_batch)
         future.result()
         self.assertEqual(len(future.warnings), 1)
-        self.assertRegexpMatches(future.warnings[0], 'Batch.*exceeding.*')
+        self.assertRegex(future.warnings[0], 'Batch.*exceeding.*')
 
     def test_warning_with_trace(self):
         """
@@ -92,10 +87,11 @@ class ClientWarningTests(unittest.TestCase):
         future = self.session.execute_async(self.warn_batch, trace=True)
         future.result()
         self.assertEqual(len(future.warnings), 1)
-        self.assertRegexpMatches(future.warnings[0], 'Batch.*exceeding.*')
+        self.assertRegex(future.warnings[0], 'Batch.*exceeding.*')
         self.assertIsNotNone(future.get_query_trace())
 
     @local
+    @requires_custom_payload
     def test_warning_with_custom_payload(self):
         """
         Test to validate client warning with custom payload
@@ -111,10 +107,11 @@ class ClientWarningTests(unittest.TestCase):
         future = self.session.execute_async(self.warn_batch, custom_payload=payload)
         future.result()
         self.assertEqual(len(future.warnings), 1)
-        self.assertRegexpMatches(future.warnings[0], 'Batch.*exceeding.*')
+        self.assertRegex(future.warnings[0], 'Batch.*exceeding.*')
         self.assertDictEqual(future.custom_payload, payload)
 
     @local
+    @requires_custom_payload
     def test_warning_with_trace_and_custom_payload(self):
         """
         Test to validate client warning with tracing and client warning
@@ -130,6 +127,6 @@ class ClientWarningTests(unittest.TestCase):
         future = self.session.execute_async(self.warn_batch, trace=True, custom_payload=payload)
         future.result()
         self.assertEqual(len(future.warnings), 1)
-        self.assertRegexpMatches(future.warnings[0], 'Batch.*exceeding.*')
+        self.assertRegex(future.warnings[0], 'Batch.*exceeding.*')
         self.assertIsNotNone(future.get_query_trace())
         self.assertDictEqual(future.custom_payload, payload)

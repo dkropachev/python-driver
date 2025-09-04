@@ -12,12 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
-import mock
+import unittest
+from unittest import mock
 
 from cassandra import timestamps
 from threading import Thread, Lock
@@ -108,10 +104,7 @@ class TestTimestampGeneratorLogging(unittest.TestCase):
         last_warn_args, last_warn_kwargs = call
         self.assertEqual(len(last_warn_args), 1)
         self.assertEqual(len(last_warn_kwargs), 0)
-        self.assertRegexpMatches(
-            last_warn_args[0],
-            pattern,
-        )
+        self.assertRegex(last_warn_args[0], pattern)
 
     def test_basic_log_content(self):
         """

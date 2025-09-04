@@ -11,16 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from binascii import unhexlify
 import logging
-from mock import Mock
+from unittest.mock import Mock
 import os
-import six
 import timeit
 
 import cassandra
@@ -488,11 +484,11 @@ class Murmur3TokensTest(unittest.TestCase):
             raise unittest.SkipTest('The cmurmur3 extension is not available')
 
     def _verify_hash(self, fn):
-        self.assertEqual(fn(six.b('123')), -7468325962851647638)
+        self.assertEqual(fn(b'123'), -7468325962851647638)
         self.assertEqual(fn(b'\x00\xff\x10\xfa\x99' * 10), 5837342703291459765)
         self.assertEqual(fn(b'\xfe' * 8), -8927430733708461935)
         self.assertEqual(fn(b'\x10' * 8), 1446172840243228796)
-        self.assertEqual(fn(six.b(str(cassandra.metadata.MAX_LONG))), 7162290910810015547)
+        self.assertEqual(fn(str(cassandra.metadata.MAX_LONG).encode()), 7162290910810015547)
 
 
 class MD5TokensTest(unittest.TestCase):
@@ -507,28 +503,28 @@ class MD5TokensTest(unittest.TestCase):
 class BytesTokensTest(unittest.TestCase):
 
     def test_bytes_tokens(self):
-        bytes_token = BytesToken(unhexlify(six.b('01')))
-        self.assertEqual(bytes_token.value, six.b('\x01'))
+        bytes_token = BytesToken(unhexlify(b'01'))
+        self.assertEqual(bytes_token.value, b'\x01')
         self.assertEqual(str(bytes_token), "<BytesToken: %s>" % bytes_token.value)
         self.assertEqual(bytes_token.hash_fn('123'), '123')
         self.assertEqual(bytes_token.hash_fn(123), 123)
         self.assertEqual(bytes_token.hash_fn(str(cassandra.metadata.MAX_LONG)), str(cassandra.metadata.MAX_LONG))
 
     def test_from_string(self):
-        from_unicode = BytesToken.from_string(six.text_type('0123456789abcdef'))
-        from_bin = BytesToken.from_string(six.b('0123456789abcdef'))
+        from_unicode = BytesToken.from_string('0123456789abcdef')
+        from_bin = BytesToken.from_string(b'0123456789abcdef')
         self.assertEqual(from_unicode, from_bin)
-        self.assertIsInstance(from_unicode.value, six.binary_type)
-        self.assertIsInstance(from_bin.value, six.binary_type)
+        self.assertIsInstance(from_unicode.value, bytes)
+        self.assertIsInstance(from_bin.value, bytes)
 
     def test_comparison(self):
-        tok = BytesToken.from_string(six.text_type('0123456789abcdef'))
+        tok = BytesToken.from_string('0123456789abcdef')
         token_high_order = uint16_unpack(tok.value[0:2])
         self.assertLess(BytesToken(uint16_pack(token_high_order - 1)), tok)
         self.assertGreater(BytesToken(uint16_pack(token_high_order + 1)), tok)
 
     def test_comparison_unicode(self):
-        value = six.b('\'_-()"\xc2\xac')
+        value = b'\'_-()"\xc2\xac'
         t0 = BytesToken(value)
         t1 = BytesToken.from_string('00')
         self.assertGreater(t0, t1)
@@ -622,7 +618,7 @@ class IndexTest(unittest.TestCase):
         column_meta.table.name = 'table_name_here'
         column_meta.table.keyspace_name = 'keyspace_name_here'
         column_meta.table.columns = {column_meta.name: column_meta}
-        parser = get_schema_parser(Mock(), '2.1.0', None, 0.1)
+        parser = get_schema_parser(Mock(), '2.1.0', None, 0.1, None)
 
         row = {'index_name': 'index_name_here', 'index_type': 'index_type_here'}
         index_meta = parser._build_index_metadata(column_meta, row)
@@ -645,7 +641,7 @@ class UnicodeIdentifiersTests(unittest.TestCase):
     Looking for encoding errors like PYTHON-447
     """
 
-    name = six.text_type(b'\'_-()"\xc2\xac'.decode('utf-8'))
+    name = b'\'_-()"\xc2\xac'.decode('utf-8')
 
     def test_keyspace_name(self):
         km = KeyspaceMetadata(self.name, False, 'SimpleStrategy', {'replication_factor': 1})

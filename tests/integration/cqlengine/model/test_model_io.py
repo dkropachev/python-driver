@@ -11,14 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from uuid import uuid4, UUID
 import random
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timezone
 from decimal import Decimal
 from operator import itemgetter
 
@@ -39,6 +36,7 @@ from tests.integration.cqlengine import DEFAULT_KEYSPACE
 
 
 class TestModel(Model):
+    __test__ = False
 
     id = columns.UUID(primary_key=True, default=lambda: uuid4())
     count = columns.Integer()
@@ -47,6 +45,8 @@ class TestModel(Model):
 
 
 class TestModelSave(Model):
+    __test__ = False
+
     partition = columns.UUID(primary_key=True, default=uuid4)
     cluster = columns.Integer(primary_key=True)
     count = columns.Integer(required=False)
@@ -200,13 +200,13 @@ class TestModelIO(BaseCassEngTestCase):
 
         sync_table(AllDatatypesModel)
 
-        input = ['ascii', 2 ** 63 - 1, bytearray(b'hello world'), True, datetime.utcfromtimestamp(872835240),
+        input = ['ascii', 2 ** 63 - 1, bytearray(b'hello world'), True, datetime.fromtimestamp(872835240, tz=timezone.utc).replace(tzinfo=None),
                  Decimal('12.3E+7'), 2.39, 3.4028234663852886e+38, '123.123.123.123', 2147483647, 'text',
                  UUID('FE2B4360-28C6-11E2-81C1-0800200C9A66'), UUID('067e6162-3b6f-4ae2-a171-2470b63dff00'),
                  int(str(2147483647) + '000')]
 
         AllDatatypesModel.create(id=0, a='ascii', b=2 ** 63 - 1, c=bytearray(b'hello world'), d=True,
-                                 e=datetime.utcfromtimestamp(872835240), f=Decimal('12.3E+7'), g=2.39,
+                                 e=datetime.fromtimestamp(872835240, tz=timezone.utc), f=Decimal('12.3E+7'), g=2.39,
                                  h=3.4028234663852886e+38, i='123.123.123.123', j=2147483647, k='text',
                                  l=UUID('FE2B4360-28C6-11E2-81C1-0800200C9A66'),
                                  m=UUID('067e6162-3b6f-4ae2-a171-2470b63dff00'), n=int(str(2147483647) + '000'),
@@ -305,6 +305,7 @@ class TestModelIO(BaseCassEngTestCase):
 
 
 class TestMultiKeyModel(Model):
+    __test__ = False
 
     partition = columns.Integer(primary_key=True)
     cluster = columns.Integer(primary_key=True)
@@ -661,6 +662,7 @@ class TestQueryQuoting(BaseCassEngTestCase):
 
 
 class TestQueryModel(Model):
+    __test__ = False
 
     test_id = columns.UUID(primary_key=True, default=uuid4)
     date = columns.Date(primary_key=True)

@@ -20,10 +20,7 @@ from tests.integration import (BasicExistingKeyspaceUnitTestCase, BasicSharedKey
                                greaterthanorequaldse68, use_single_node,
                                DSE_VERSION, requiredse, TestCluster)
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import logging
 import time
@@ -49,7 +46,7 @@ class FunctionAndAggregateMetadataTests(BasicSharedKeyspaceUnitTestCaseRF1):
     @classmethod
     def tearDownClass(cls):
         if DSE_VERSION:
-            super(FunctionAndAggregateMetadataTests, cls).setUpClass()
+            super(FunctionAndAggregateMetadataTests, cls).tearDownClass()
 
     def setUp(self):
         self.func_name = self.function_table_name + '_func'

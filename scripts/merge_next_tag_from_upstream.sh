@@ -6,7 +6,7 @@
 
 # this script assumes remotes for scylladb/python-driver and for datastax/python-driver are configured
 
-upstream_repo_url=https://github.com/datastax/python-driver
+upstream_repo_url=datastax/python-driver
 
 upstream_repo=$(git remote -v | grep ${upstream_repo_url} | awk '{print $1}' | head -n1)
 scylla_repo=$(git remote -v | grep scylladb/python-driver | awk '{print $1}' | head -n1)
@@ -46,7 +46,7 @@ case "$choice" in
 
       git merge --continue
       git tag ${new_scyla_tag}
-      git push --tags ${scylla_repo} ${new_scyla_tag}
+      git push --tags ${scylla_repo} master
 
    re-triggering a build of a tag in Travis:
 

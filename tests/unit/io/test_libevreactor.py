@@ -11,24 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
+import unittest
 
-from mock import patch, Mock
-import weakref
+from unittest.mock import patch, Mock
 import socket
 
-from tests import is_monkey_patched
-from tests.unit.io.utils import ReactorTestMixin, TimerTestMixin, noop_if_monkey_patched
-
+from cassandra import DependencyException
 
 try:
     from cassandra.io.libevreactor import _cleanup as libev__cleanup
     from cassandra.io.libevreactor import LibevConnection
-except ImportError:
+except (ImportError, DependencyException):
     LibevConnection = None  # noqa
+
+from tests import is_monkey_patched
+from tests.unit.io.utils import ReactorTestMixin, TimerTestMixin, noop_if_monkey_patched
 
 
 class LibevConnectionTest(ReactorTestMixin, unittest.TestCase):

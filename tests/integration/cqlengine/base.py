@@ -11,10 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import sys
 
@@ -25,6 +22,7 @@ from cassandra.cqlengine import columns
 from uuid import uuid4
 
 class TestQueryUpdateModel(Model):
+    __test__ = False
 
     partition = columns.UUID(primary_key=True, default=uuid4)
     cluster = columns.Integer(primary_key=True)
@@ -33,6 +31,8 @@ class TestQueryUpdateModel(Model):
     text_set = columns.Set(columns.Text, required=False)
     text_list = columns.List(columns.Text, required=False)
     text_map = columns.Map(columns.Text, columns.Text, required=False)
+    bin_map = columns.Map(columns.BigInt, columns.Bytes, required=False, default={})
+
 
 class BaseCassEngTestCase(unittest.TestCase):
 

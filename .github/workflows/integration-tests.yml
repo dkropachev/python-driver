@@ -1,23 +1,63 @@
 name: Integration tests
 
 on:
-  pull_request:
+  push:
     branches:
-     - master
-
+      - master
+      - 'branch-**'
+  pull_request:
+    paths-ignore:
+     - docs/*
+     - examples/*
+     - scripts/*
+     - .gitignore
+     - '*.rst'
+     - '*.ini'
+     - LICENSE
+     - .github/dependabot.yml
+     - .github/pull_request_template.md
+  workflow_dispatch:
 
 jobs:
   tests:
-    runs-on: ubuntu-20.04
-    if: contains(github.event.pull_request.labels.*.name, 'integration-tests')
+    name: test ${{ matrix.event_loop_manager }} (${{ matrix.python-version }})
+    if: "!contains(github.event.pull_request.labels.*.name, 'disable-integration-tests')"
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        java-version: [8]
+        python-version: ["3.8", "3.11", "3.12", "3.13"]
+        event_loop_manager: ["libev", "asyncio", "asyncore"]
+        exclude:
+          - python-version: "3.12"
+            event_loop_manager: "asyncore"
+          - python-version: "3.13"
+            event_loop_manager: "asyncore"
+
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v2
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK ${{ matrix.java-version }}
+      uses: actions/setup-java@v4
       with:
-        python-version: 3.8
+        java-version: ${{ matrix.java-version }}
+        distribution: 'adopt'
+
+    - uses: actions/setup-python@v5
+      name: Install Python ${{ matrix.python-version }}
+      with:
+        python-version: ${{ matrix.python-version }}
+        allow-prereleases: true
 
     - name: Test with pytest
       run: |
-        ./ci/run_integration_test.sh tests/integration/standard/test_authentication.py tests/integration/standard/test_cluster.py tests/integration/standard/test_concurrent.py tests/integration/standard/test_connection.py tests/integration/standard/test_control_connection.py tests/integration/standard/test_custom_payload.py tests/integration/standard/test_custom_protocol_handler.py tests/integration/standard/test_cython_protocol_handlers.py
-        # can't run this, cause only 2 cpus on github actions: tests/integration/standard/test_shard_aware.py
+        export EVENT_LOOP_MANAGER=${{ matrix.event_loop_manager }}
+        export SCYLLA_VERSION='release:6.2'
+        ./scripts/run_integration_test.sh tests/integration/standard/ tests/integration/cqlengine/
+    
+    - name: Test tablets
+      run: |
+        export EVENT_LOOP_MANAGER=${{ matrix.event_loop_manager }}
+        export SCYLLA_VERSION='release:6.2'
+        ./scripts/run_integration_test.sh tests/integration/experiments/

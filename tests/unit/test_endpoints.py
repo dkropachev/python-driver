@@ -6,16 +6,13 @@
 # You may obtain a copy of the License at
 #
 # http://www.datastax.com/terms/datastax-dse-driver-license-terms
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import itertools
 
 from cassandra.connection import DefaultEndPoint, SniEndPoint, SniEndPointFactory
 
-from mock import patch
+from unittest.mock import patch
 
 
 def socket_getaddrinfo(*args):

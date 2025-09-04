@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
 from uuid import uuid4
 
-from mock import patch
 from cassandra.cqlengine import ValidationError
 
 from tests.integration import greaterthancass21
@@ -25,6 +25,7 @@ from cassandra.cqlengine.management import sync_table, drop_table
 from cassandra.cqlengine.usertype import UserType
 
 class TestUpdateModel(Model):
+    __test__ = False
 
     partition   = columns.UUID(primary_key=True, default=uuid4)
     cluster     = columns.UUID(primary_key=True, default=uuid4)

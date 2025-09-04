@@ -11,13 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from uuid import uuid4
-import six
 
 from cassandra.query import FETCH_SIZE_UNSET
 from cassandra.cqlengine.statements import BaseCQLStatement
@@ -29,7 +25,7 @@ from cassandra.cqlengine.columns import Column
 
 from tests.integration.cqlengine.base import BaseCassEngTestCase, TestQueryUpdateModel
 from tests.integration.cqlengine import DEFAULT_KEYSPACE
-from tests.integration import greaterthanorequalcass3_10, TestCluster
+from tests.integration import greaterthanorequalcass3_10, requires_custom_indexes, TestCluster
 
 from cassandra.cqlengine.connection import execute
 
@@ -65,11 +61,11 @@ class ExecuteStatementTest(BaseCassEngTestCase):
     def _verify_statement(self, original):
         st = SelectStatement(self.table_name)
         result = execute(st)
-        response = result[0]
+        response = result.one()
 
         for assignment in original.assignments:
             self.assertEqual(response[assignment.field], assignment.value)
-        self.assertEqual(len(response), 7)
+        self.assertEqual(len(response), 8)
 
     def test_insert_statement_execute(self):
         """
@@ -96,6 +92,7 @@ class ExecuteStatementTest(BaseCassEngTestCase):
         st.add_assignment(Column(db_field='text_set'), set(("foo_update", "bar_update")))
         st.add_assignment(Column(db_field='text_list'), ["foo_update", "bar_update"])
         st.add_assignment(Column(db_field='text_map'), {"foo": '3', "bar": '4'})
+        st.add_assignment(Column(db_field='bin_map'), {123: b'3', 456: b'4'})
 
         execute(st)
         self._verify_statement(st)
@@ -105,6 +102,7 @@ class ExecuteStatementTest(BaseCassEngTestCase):
         self.assertEqual(TestQueryUpdateModel.objects.count(), 0)
 
     @greaterthanorequalcass3_10
+    @requires_custom_indexes
     def test_like_operator(self):
         """
         Test to verify the like operator works appropriately
@@ -130,7 +128,7 @@ class ExecuteStatementTest(BaseCassEngTestCase):
         ss = SelectStatement(self.table_name)
         like_clause = "text_for_%"
         ss.add_where(Column(db_field='text'), LikeOperator(), like_clause)
-        self.assertEqual(six.text_type(ss),
+        self.assertEqual(str(ss),
                          'SELECT * FROM {} WHERE "text" LIKE %(0)s'.format(self.table_name))
 
         result = execute(ss)
@@ -153,6 +151,7 @@ class ExecuteStatementTest(BaseCassEngTestCase):
         st.add_assignment(Column(db_field='text_set'), set(("foo", "bar")))
         st.add_assignment(Column(db_field='text_list'), ["foo", "bar"])
         st.add_assignment(Column(db_field='text_map'), {"foo": '1', "bar": '2'})
+        st.add_assignment(Column(db_field='bin_map'), {123: b'1', 456: b'2'})
 
         execute(st)
         self._verify_statement(st)

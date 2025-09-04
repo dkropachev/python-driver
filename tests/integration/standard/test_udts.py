@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
+import unittest
 from collections import namedtuple
 from functools import partial
-import six
 
 from cassandra import InvalidRequest
 from cassandra.cluster import UserTypeDoesNotExist, ExecutionProfile, EXEC_PROFILE_DEFAULT
@@ -70,7 +65,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         self.session.execute("INSERT INTO {0} (a, b) VALUES (%s, %s)".format(self.function_table_name), (0, User("Nebraska", True)))
         self.session.execute("UPDATE {0} SET b.has_corn = False where a = 0".format(self.function_table_name))
         result = self.session.execute("SELECT * FROM {0}".format(self.function_table_name))
-        self.assertFalse(result[0].b.has_corn)
+        self.assertFalse(result.one().b.has_corn)
         table_sql = self.cluster.metadata.keyspaces[self.keyspace_name].tables[self.function_table_name].as_cql_query()
         self.assertNotIn("<frozen>", table_sql)
 
@@ -90,7 +85,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         s.execute("INSERT INTO mytable (a, b) VALUES (%s, %s)", (0, User(42, 'bob')))
         result = s.execute("SELECT b FROM mytable WHERE a=0")
-        row = result[0]
+        row = result.one()
         self.assertEqual(42, row.b.age)
         self.assertEqual('bob', row.b.name)
         self.assertTrue(type(row.b) is User)
@@ -109,7 +104,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         s.execute("INSERT INTO mytable (a, b) VALUES (%s, %s)", (0, User('Texas', True)))
         result = s.execute("SELECT b FROM mytable WHERE a=0")
-        row = result[0]
+        row = result.one()
         self.assertEqual('Texas', row.b.state)
         self.assertEqual(True, row.b.is_cool)
         self.assertTrue(type(row.b) is User)
@@ -130,17 +125,15 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
             CREATE KEYSPACE udt_test_register_before_connecting
             WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
             """)
-        s.set_keyspace("udt_test_register_before_connecting")
-        s.execute("CREATE TYPE user (age int, name text)")
-        s.execute("CREATE TABLE mytable (a int PRIMARY KEY, b frozen<user>)")
+        s.execute("CREATE TYPE udt_test_register_before_connecting.user (age int, name text)")
+        s.execute("CREATE TABLE udt_test_register_before_connecting.mytable (a int PRIMARY KEY, b frozen<user>)")
 
         s.execute("""
             CREATE KEYSPACE udt_test_register_before_connecting2
             WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor': '1' }
             """)
-        s.set_keyspace("udt_test_register_before_connecting2")
-        s.execute("CREATE TYPE user (state text, is_cool boolean)")
-        s.execute("CREATE TABLE mytable (a int PRIMARY KEY, b frozen<user>)")
+        s.execute("CREATE TYPE udt_test_register_before_connecting2.user (state text, is_cool boolean)")
+        s.execute("CREATE TABLE udt_test_register_before_connecting2.mytable (a int PRIMARY KEY, b frozen<user>)")
 
         # now that types are defined, shutdown and re-create Cluster
         c.shutdown()
@@ -153,20 +146,19 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         c.register_user_type("udt_test_register_before_connecting2", "user", User2)
 
         s = c.connect(wait_for_all_pools=True)
+        c.control_connection.wait_for_schema_agreement()
 
-        s.set_keyspace("udt_test_register_before_connecting")
-        s.execute("INSERT INTO mytable (a, b) VALUES (%s, %s)", (0, User1(42, 'bob')))
-        result = s.execute("SELECT b FROM mytable WHERE a=0")
-        row = result[0]
+        s.execute("INSERT INTO udt_test_register_before_connecting.mytable (a, b) VALUES (%s, %s)", (0, User1(42, 'bob')))
+        result = s.execute("SELECT b FROM udt_test_register_before_connecting.mytable WHERE a=0")
+        row = result.one()
         self.assertEqual(42, row.b.age)
         self.assertEqual('bob', row.b.name)
         self.assertTrue(type(row.b) is User1)
 
         # use the same UDT name in a different keyspace
-        s.set_keyspace("udt_test_register_before_connecting2")
-        s.execute("INSERT INTO mytable (a, b) VALUES (%s, %s)", (0, User2('Texas', True)))
-        result = s.execute("SELECT b FROM mytable WHERE a=0")
-        row = result[0]
+        s.execute("INSERT INTO udt_test_register_before_connecting2.mytable (a, b) VALUES (%s, %s)", (0, User2('Texas', True)))
+        result = s.execute("SELECT b FROM udt_test_register_before_connecting2.mytable WHERE a=0")
+        row = result.one()
         self.assertEqual('Texas', row.b.state)
         self.assertEqual(True, row.b.is_cool)
         self.assertTrue(type(row.b) is User2)
@@ -193,7 +185,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         select = s.prepare("SELECT b FROM mytable WHERE a=?")
         result = s.execute(select, (0,))
-        row = result[0]
+        row = result.one()
         self.assertEqual(42, row.b.age)
         self.assertEqual('bob', row.b.name)
 
@@ -212,7 +204,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         select = s.prepare("SELECT b FROM mytable WHERE a=?")
         result = s.execute(select, (0,))
-        row = result[0]
+        row = result.one()
         self.assertEqual('Texas', row.b.state)
         self.assertEqual(True, row.b.is_cool)
 
@@ -239,7 +231,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         select = s.prepare("SELECT b FROM mytable WHERE a=?")
         result = s.execute(select, (0,))
-        row = result[0]
+        row = result.one()
         self.assertEqual(42, row.b.age)
         self.assertEqual('bob', row.b.name)
         self.assertTrue(type(row.b) is User)
@@ -261,7 +253,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         select = s.prepare("SELECT b FROM mytable WHERE a=?")
         result = s.execute(select, (0,))
-        row = result[0]
+        row = result.one()
         self.assertEqual('Texas', row.b.state)
         self.assertEqual(True, row.b.is_cool)
         self.assertTrue(type(row.b) is User)
@@ -288,15 +280,15 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         s.execute(insert, [User(None, None, None, None)])
 
         results = s.execute("SELECT b FROM mytable WHERE a=0")
-        self.assertEqual((None, None, None, None), results[0].b)
+        self.assertEqual((None, None, None, None), results.one().b)
 
         select = s.prepare("SELECT b FROM mytable WHERE a=0")
-        self.assertEqual((None, None, None, None), s.execute(select)[0].b)
+        self.assertEqual((None, None, None, None), s.execute(select).one().b)
 
         # also test empty strings
-        s.execute(insert, [User('', None, None, six.binary_type())])
+        s.execute(insert, [User('', None, None, bytes())])
         results = s.execute("SELECT b FROM mytable WHERE a=0")
-        self.assertEqual(('', None, None, six.binary_type()), results[0].b)
+        self.assertEqual(('', None, None, bytes()), results.one().b)
 
         c.shutdown()
 
@@ -335,7 +327,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
             s.execute("INSERT INTO mytable (k, v) VALUES (0, %s)", (created_udt,))
 
             # verify udt was written and read correctly, increase timeout to avoid the query failure on slow systems
-            result = s.execute("SELECT v FROM mytable WHERE k=0")[0]
+            result = s.execute("SELECT v FROM mytable WHERE k=0").one()
             self.assertEqual(created_udt, result.v)
 
         c.shutdown()
@@ -373,7 +365,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
             session.execute("INSERT INTO mytable (k, v_%s) VALUES (0, %s)", [i, udt])
 
             # verify udt was written and read correctly
-            result = session.execute("SELECT v_{0} FROM mytable WHERE k=0".format(i))[0]
+            result = session.execute("SELECT v_{0} FROM mytable WHERE k=0".format(i)).one()
             self.assertEqual(udt, result["v_{0}".format(i)])
 
             # write udt via prepared statement
@@ -381,7 +373,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
             session.execute(insert, [udt])
 
             # verify udt was written and read correctly
-            result = session.execute("SELECT v_{0} FROM mytable WHERE k=1".format(i))[0]
+            result = session.execute("SELECT v_{0} FROM mytable WHERE k=1".format(i)).one()
             self.assertEqual(udt, result["v_{0}".format(i)])
 
     def _cluster_default_dict_factory(self):
@@ -449,7 +441,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
                 s.execute(insert, [udt])
 
                 # verify udt was written and read correctly
-                result = s.execute("SELECT v_{0} FROM mytable WHERE k=0".format(i))[0]
+                result = s.execute("SELECT v_{0} FROM mytable WHERE k=0".format(i)).one()
                 self.assertEqual(udt, result["v_{0}".format(i)])
 
     def test_can_insert_nested_registered_udts_with_different_namedtuples(self):
@@ -540,7 +532,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         # retrieve and verify data
         results = s.execute("SELECT * FROM mytable")
 
-        row = results[0].b
+        row = results.one().b
         for expected, actual in zip(params, row):
             self.assertEqual(expected, actual)
 
@@ -598,7 +590,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         # retrieve and verify data
         results = s.execute("SELECT * FROM mytable")
 
-        row = results[0].b
+        row = results.one().b
         for expected, actual in zip(params, row):
             self.assertEqual(expected, actual)
 
@@ -607,7 +599,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
     def insert_select_column(self, session, table_name, column_name, value):
         insert = session.prepare("INSERT INTO %s (k, %s) VALUES (?, ?)" % (table_name, column_name))
         session.execute(insert, (0, value))
-        result = session.execute("SELECT %s FROM %s WHERE k=%%s" % (column_name, table_name), (0,))[0][0]
+        result = session.execute("SELECT %s FROM %s WHERE k=%%s" % (column_name, table_name), (0,)).one()[0]
         self.assertEqual(result, value)
 
     def test_can_insert_nested_collections(self):
@@ -674,7 +666,7 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
         # table with types as map keys to make sure the tuple lookup works
         s.execute('CREATE TABLE %s (k int PRIMARY KEY, non_alphanum_type_map map<frozen<"%s">, int>, alphanum_type_map map<frozen<%s>, int>)' % (self.table_name, non_alphanum_name, type_name))
         s.execute('INSERT INTO %s (k, non_alphanum_type_map, alphanum_type_map) VALUES (%s, {{"%s": \'nonalphanum\'}: 0}, {{"%s": \'alphanum\'}: 1})' % (self.table_name, 0, non_alphanum_name, non_alphanum_name))
-        row = s.execute('SELECT * FROM %s' % (self.table_name,))[0]
+        row = s.execute('SELECT * FROM %s' % (self.table_name,)).one()
 
         k, v = row.non_alphanum_type_map.popitem()
         self.assertEqual(v, 0)
@@ -703,25 +695,25 @@ class UDTTests(BasicSegregatedKeyspaceUnitTestCase):
 
         s.cluster.register_user_type('udttests', type_name, dict)
 
-        val = s.execute('SELECT v FROM %s' % self.table_name)[0][0]
+        val = s.execute('SELECT v FROM %s' % self.table_name).one()[0]
         self.assertEqual(val['v0'], 1)
 
         # add field
         s.execute('ALTER TYPE %s ADD v1 text' % (type_name,))
-        val = s.execute('SELECT v FROM %s' % self.table_name)[0][0]
+        val = s.execute('SELECT v FROM %s' % self.table_name).one()[0]
         self.assertEqual(val['v0'], 1)
         self.assertIsNone(val['v1'])
         s.execute("INSERT INTO %s (k, v) VALUES (0, {v0 : 2, v1 : 'sometext'})" % (self.table_name,))
-        val = s.execute('SELECT v FROM %s' % self.table_name)[0][0]
+        val = s.execute('SELECT v FROM %s' % self.table_name).one()[0]
         self.assertEqual(val['v0'], 2)
         self.assertEqual(val['v1'], 'sometext')
 
         # alter field type
         s.execute('ALTER TYPE %s ALTER v1 TYPE blob' % (type_name,))
         s.execute("INSERT INTO %s (k, v) VALUES (0, {v0 : 3, v1 : 0xdeadbeef})" % (self.table_name,))
-        val = s.execute('SELECT v FROM %s' % self.table_name)[0][0]
+        val = s.execute('SELECT v FROM %s' % self.table_name).one()[0]
         self.assertEqual(val['v0'], 3)
-        self.assertEqual(val['v1'], six.b('\xde\xad\xbe\xef'))
+        self.assertEqual(val['v1'], b'\xde\xad\xbe\xef')
 
     @lessthancass30
     def test_alter_udt(self):

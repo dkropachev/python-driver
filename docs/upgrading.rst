@@ -4,14 +4,6 @@ Upgrading
 .. toctree::
    :maxdepth: 1
 
-Upgrading from dse-driver
--------------------------
-
-Since 3.21.0, scylla-driver fully supports DataStax products. dse-driver and
-dse-graph users should now migrate to scylla-driver to benefit from latest bug fixes
-and new features. The upgrade to this new unified driver version is straightforward
-with no major API changes.
-
 Installation
 ^^^^^^^^^^^^
 
@@ -19,10 +11,6 @@ Only the `scylla-driver` package should be installed. `dse-driver` and `dse-grap
 are not required anymore::
 
     pip install scylla-driver
-
-If you need the Graph *Fluent* API (features provided by dse-graph)::
-
-    pip install scylla-driver[graph]
 
 See :doc:`installation` for more details.
 
@@ -47,24 +35,6 @@ need to change only the first module of your import statements, not the submodul
 Also note that the cassandra.hosts module doesn't exist in scylla-driver. This
 module is named cassandra.pool.
 
-dse-graph
-^^^^^^^^^
-
-dse-graph features are now built into scylla-driver. The only change you need
-to do is your import statements:
-
-.. code-block:: python
-
-    from dse_graph import ..
-    from dse_graph.query import ..
-
-    # becomes
-
-    from cassandra.datastax.graph.fluent import ..
-    from cassandra.datastax.graph.fluent.query import ..
-
-See :mod:`~.datastax.graph.fluent`.
-
 Session.execute and Session.execute_async API
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -80,7 +50,6 @@ Deprecations
 
 These changes are optional, but recommended:
 
-* Importing from `cassandra.graph` is deprecated. Consider importing from `cassandra.datastax.graph`.
 * Use :class:`~.policies.DefaultLoadBalancingPolicy` instead of DSELoadBalancingPolicy.
 
 Upgrading to 3.0
@@ -99,7 +68,7 @@ DC-aware load balancing policy and to match other drivers.
 Execution API Updates
 ^^^^^^^^^^^^^^^^^^^^^
 Result return normalization
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+---------------------------
 `PYTHON-368 <https://datastax-oss.atlassian.net/browse/PYTHON-368>`_
 
 Previously results would be returned as a ``list`` of rows for result rows
@@ -137,7 +106,7 @@ This can send requests and load (possibly large) results into memory, so
 `~.ResultSet` will log a warning on implicit materialization.
 
 Trace information is not attached to executed Statements
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--------------------------------------------------------
 `PYTHON-318 <https://datastax-oss.atlassian.net/browse/PYTHON-318>`_
 
 Previously trace data was attached to Statements if tracing was enabled. This
@@ -155,7 +124,7 @@ returned for each query:
 :meth:`.ResultSet.get_all_query_traces()`
 
 Binding named parameters now ignores extra names
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+------------------------------------------------
 `PYTHON-178 <https://datastax-oss.atlassian.net/browse/PYTHON-178Cassadfasdf>`_
 
 Previously, :meth:`.BoundStatement.bind()` would raise if a mapping
@@ -382,7 +351,3 @@ The following dependencies have officially been made optional:
 
 * ``scales``
 * ``blist``
-
-And one new dependency has been added (to enable Python 3 support):
-
-* ``six``

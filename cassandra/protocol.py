@@ -16,22 +16,18 @@ from __future__ import absolute_import  # to enable import io from stdlib
 from collections import namedtuple
 import logging
 import socket
+from typing import Optional
 from uuid import UUID
 
-import six
-from six.moves import range
 import io
 
-from cassandra import ProtocolVersion
+from cassandra import OperationType, ProtocolVersion
 from cassandra import type_codes, DriverException
-from cassandra import (Unavailable, WriteTimeout, ReadTimeout,
+from cassandra import (Unavailable, WriteTimeout, RateLimitReached, ReadTimeout,
                        WriteFailure, ReadFailure, FunctionFailure,
                        AlreadyExists, InvalidRequest, Unauthorized,
                        UnsupportedOperation, UserFunctionDescriptor,
                        UserAggregateDescriptor, SchemaTargetType)
-from cassandra.marshal import (int32_pack, int32_unpack, uint16_pack, uint16_unpack,
-                               uint8_pack, int8_unpack, uint64_pack, header_pack,
-                               v3_header_pack, uint32_pack, uint32_le_unpack, uint32_le_pack)
 from cassandra.cqltypes import (AsciiType, BytesType, BooleanType,
                                 CounterColumnType, DateType, DecimalType,
                                 DoubleType, FloatType, Int32Type,
@@ -40,9 +36,14 @@ from cassandra.cqltypes import (AsciiType, BytesType, BooleanType,
                                 UTF8Type, VarcharType, UUIDType, UserType,
                                 TupleType, lookup_casstype, SimpleDateType,
                                 TimeType, ByteType, ShortType, DurationType)
+from cassandra.marshal import (int32_pack, int32_unpack, uint16_pack, uint16_unpack,
+                               uint8_pack, int8_unpack, uint64_pack, header_pack,
+                               v3_header_pack, uint32_pack, uint32_le_unpack, uint32_le_pack)
+from cassandra.policies import ColDesc
 from cassandra import WriteType
 from cassandra.cython_deps import HAVE_CYTHON, HAVE_NUMPY
 from cassandra import util
+from cassandra.protocol_features import ProtocolFeatures
 
 log = logging.getLogger(__name__)
 
@@ -85,8 +86,7 @@ class _RegisterMessageType(type):
             register_class(cls)
 
 
-@six.add_metaclass(_RegisterMessageType)
-class _MessageType(object):
+class _MessageType(object, metaclass=_RegisterMessageType):
 
     tracing = False
     custom_payload = None
@@ -126,18 +126,19 @@ class ErrorMessage(_MessageType, Exception):
         self.info = info
 
     @classmethod
-    def recv_body(cls, f, protocol_version, *args):
+    def recv_body(cls, f, protocol_version, protocol_features, *args):
         code = read_int(f)
         msg = read_string(f)
-        subcls = error_classes.get(code, cls)
+        if code == protocol_features.rate_limit_error:
+            subcls = RateLimitReachedException
+        else:
+            subcls = error_classes.get(code, cls)
         extra_info = subcls.recv_error_info(f, protocol_version)
         return subcls(code=code, message=msg, info=extra_info)
 
     def summary_msg(self):
         msg = 'Error from server: code=%04x [%s] message="%s"' \
               % (self.code, self.summary, self.message)
-        if six.PY2 and isinstance(msg, six.text_type):
-            msg = msg.encode('utf-8')
         return msg
 
     def __str__(self):
@@ -158,8 +159,7 @@ class ErrorMessageSubclass(_RegisterMessageType):
             error_classes[cls.error_code] = cls
 
 
-@six.add_metaclass(ErrorMessageSubclass)
-class ErrorMessageSub(ErrorMessage):
+class ErrorMessageSub(ErrorMessage, metaclass=ErrorMessageSubclass):
     error_code = None
 
 
@@ -390,6 +390,19 @@ class AlreadyExistsException(ConfigurationException):
     def to_exception(self):
         return AlreadyExists(**self.info)
 
+class RateLimitReachedException(ConfigurationException):
+    summary= 'Rate limit was exceeded for a partition affected by the request'
+    error_code = 0x4321
+
+    @staticmethod
+    def recv_error_info(f, protocol_version):
+        return {
+            'op_type': OperationType(read_byte(f)),
+            'rejected_by_coordinator': read_byte(f) != 0
+        }
+
+    def to_exception(self):
+        return RateLimitReached(**self.info)
 
 class ClientWriteError(RequestExecutionException):
     summary = 'Client write failure.'
@@ -410,7 +423,7 @@ class StartupMessage(_MessageType):
         self.cqlversion = cqlversion
         self.options = options
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         optmap = self.options.copy()
         optmap['CQL_VERSION'] = self.cqlversion
         write_stringmap(f, optmap)
@@ -445,7 +458,7 @@ class CredentialsMessage(_MessageType):
     def __init__(self, creds):
         self.creds = creds
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         if protocol_version > 1:
             raise UnsupportedOperation(
                 "Credentials-based authentication is not supported with "
@@ -476,7 +489,7 @@ class AuthResponseMessage(_MessageType):
     def __init__(self, response):
         self.response = response
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         write_longstring(f, self.response)
 
 
@@ -496,7 +509,7 @@ class OptionsMessage(_MessageType):
     opcode = 0x05
     name = 'OPTIONS'
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         pass
 
 
@@ -530,11 +543,35 @@ _PAGING_OPTIONS_FLAG = 0x80000000
 
 
 class _QueryMessage(_MessageType):
+    """
+    Represents a query frame sent to the database.
 
+    This message encapsulates all parameters required for executing a query,
+    including consistency settings, paging controls, and metadata options.
+
+    Attributes:
+        query_params: Encoded query parameters or a prepared statement ID with bound values.
+        consistency_level: The desired consistency level for the query.
+        serial_consistency_level: Optional serial consistency level for conditional updates (e.g., LOCAL_SERIAL).
+        fetch_size: Optional number of rows to fetch per page.
+        paging_state: Optional opaque paging state token for continuing from a previous query.
+        timestamp: Optional client-supplied timestamp for the query.
+        skip_meta: Optional flag indicating if result metadata should be skipped in the response.
+        continuous_paging_options: Optional configuration for continuous paging behavior.
+        keyspace: Optional keyspace to associate with the query.
+        can_have_result_metadata: Optional flag indicating if the query is expected to have result metadata.
+
+    When skip_meta is not set to True or False it resolves it the safest way possible.
+    Every protocol before 5 has result metadata invalidation loopholes, when metadata on server
+     and client stays different without client noticing it.
+    To solve this problem for protocol 4 scylla introduced SCYLLA_USE_METADATA_ID feature
+     that allows client spot when result metadata on client divert from server.
+    Read https://github.com/scylladb/scylla-drivers/issues/81 for more details
+    """
     def __init__(self, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
-                 paging_state=None, timestamp=None, skip_meta=False,
-                 continuous_paging_options=None, keyspace=None):
+                 paging_state=None, timestamp=None, skip_meta=None,
+                 continuous_paging_options=None, keyspace=None, can_have_result_metadata: bool = False):
         self.query_params = query_params
         self.consistency_level = consistency_level
         self.serial_consistency_level = serial_consistency_level
@@ -544,8 +581,9 @@ class _QueryMessage(_MessageType):
         self.skip_meta = skip_meta
         self.continuous_paging_options = continuous_paging_options
         self.keyspace = keyspace
+        self.can_have_result_metadata = can_have_result_metadata
 
-    def _write_query_params(self, f, protocol_version):
+    def _write_query_params(self, f, protocol_version, protocol_features: ProtocolFeatures):
         write_consistency_level(f, self.consistency_level)
         flags = 0x00
         if self.query_params is not None:
@@ -595,6 +633,14 @@ class _QueryMessage(_MessageType):
                     "Keyspaces may only be set on queries with protocol version "
                     "5 or DSE_V2 or higher. Consider setting Cluster.protocol_version.")
 
+        if self.skip_meta:
+            flags |= _SKIP_METADATA_FLAG
+        elif self.skip_meta is None and self.can_have_result_metadata and (protocol_version >= 5 or protocol_features.use_metadata_id):
+            # Skip metadata only when protocol allows to invalidate result metadata properly
+            # i.e. protocol version >= 5 or SCYLLA_USE_METADATA_ID present
+            # Read https://github.com/scylladb/scylla-drivers/issues/81 for more details
+            flags |= _SKIP_METADATA_FLAG
+
         if ProtocolVersion.uses_int_query_flags(protocol_version):
             write_uint(f, flags)
         else:
@@ -634,9 +680,9 @@ class QueryMessage(_QueryMessage):
         super(QueryMessage, self).__init__(None, consistency_level, serial_consistency_level, fetch_size,
                                            paging_state, timestamp, False, continuous_paging_options, keyspace)
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features: ProtocolFeatures):
         write_longstring(f, self.query)
-        self._write_query_params(f, protocol_version)
+        self._write_query_params(f, protocol_version, protocol_features)
 
 
 class ExecuteMessage(_QueryMessage):
@@ -645,14 +691,14 @@ class ExecuteMessage(_QueryMessage):
 
     def __init__(self, query_id, query_params, consistency_level,
                  serial_consistency_level=None, fetch_size=None,
-                 paging_state=None, timestamp=None, skip_meta=False,
-                 continuous_paging_options=None, result_metadata_id=None):
+                 paging_state=None, timestamp=None, skip_meta=None,
+                 continuous_paging_options=None, result_metadata_id=None, can_have_result_metadata: bool = False):
         self.query_id = query_id
         self.result_metadata_id = result_metadata_id
         super(ExecuteMessage, self).__init__(query_params, consistency_level, serial_consistency_level, fetch_size,
-                                             paging_state, timestamp, skip_meta, continuous_paging_options)
+                                             paging_state, timestamp, skip_meta, continuous_paging_options, can_have_result_metadata=can_have_result_metadata)
 
-    def _write_query_params(self, f, protocol_version):
+    def _write_query_params(self, f, protocol_version, protocol_features: ProtocolFeatures):
         if protocol_version == 1:
             if self.serial_consistency_level:
                 raise UnsupportedOperation(
@@ -668,13 +714,13 @@ class ExecuteMessage(_QueryMessage):
                 write_value(f, param)
             write_consistency_level(f, self.consistency_level)
         else:
-            super(ExecuteMessage, self)._write_query_params(f, protocol_version)
+            super(ExecuteMessage, self)._write_query_params(f, protocol_version, protocol_features)
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         write_string(f, self.query_id)
-        if ProtocolVersion.uses_prepared_metadata(protocol_version):
-            write_string(f, self.result_metadata_id)
-        self._write_query_params(f, protocol_version)
+        if ProtocolVersion.uses_prepared_metadata(protocol_version) or protocol_features.use_metadata_id:
+            write_string(f, self.result_metadata_id or "")
+        self._write_query_params(f, protocol_version, protocol_features)
 
 
 CUSTOM_TYPE = object()
@@ -719,56 +765,65 @@ class ResultMessage(_MessageType):
     bind_metadata = None
     pk_indexes = None
     schema_change_event = None
+    result_metadata_id = None
 
     def __init__(self, kind):
         self.kind = kind
 
-    def recv(self, f, protocol_version, user_type_map, result_metadata):
+    def recv(self, f, protocol_version, protocol_features, user_type_map, result_metadata, column_encryption_policy):
         if self.kind == RESULT_KIND_VOID:
             return
         elif self.kind == RESULT_KIND_ROWS:
-            self.recv_results_rows(f, protocol_version, user_type_map, result_metadata)
+            self.recv_results_rows(f, protocol_version, user_type_map, result_metadata, column_encryption_policy)
         elif self.kind == RESULT_KIND_SET_KEYSPACE:
             self.new_keyspace = read_string(f)
         elif self.kind == RESULT_KIND_PREPARED:
-            self.recv_results_prepared(f, protocol_version, user_type_map)
+            self.recv_results_prepared(f, protocol_version, protocol_features, user_type_map)
         elif self.kind == RESULT_KIND_SCHEMA_CHANGE:
             self.recv_results_schema_change(f, protocol_version)
         else:
             raise DriverException("Unknown RESULT kind: %d" % self.kind)
 
     @classmethod
-    def recv_body(cls, f, protocol_version, user_type_map, result_metadata):
+    def recv_body(cls, f, protocol_version, protocol_features, user_type_map, result_metadata, column_encryption_policy):
         kind = read_int(f)
         msg = cls(kind)
-        msg.recv(f, protocol_version, user_type_map, result_metadata)
+        msg.recv(f, protocol_version, protocol_features, user_type_map, result_metadata, column_encryption_policy)
         return msg
 
-    def recv_results_rows(self, f, protocol_version, user_type_map, result_metadata):
+    def recv_results_rows(self, f, protocol_version, user_type_map, result_metadata, column_encryption_policy):
         self.recv_results_metadata(f, user_type_map)
         column_metadata = self.column_metadata or result_metadata
         rowcount = read_int(f)
         rows = [self.recv_row(f, len(column_metadata)) for _ in range(rowcount)]
         self.column_names = [c[2] for c in column_metadata]
         self.column_types = [c[3] for c in column_metadata]
+        col_descs = [ColDesc(md[0], md[1], md[2]) for md in column_metadata]
+
+        def decode_val(val, col_md, col_desc):
+            uses_ce = column_encryption_policy and column_encryption_policy.contains_column(col_desc)
+            col_type = column_encryption_policy.column_type(col_desc) if uses_ce else col_md[3]
+            raw_bytes = column_encryption_policy.decrypt(col_desc, val) if uses_ce else val
+            return col_type.from_binary(raw_bytes, protocol_version)
+
+        def decode_row(row):
+            return tuple(decode_val(val, col_md, col_desc) for val, col_md, col_desc in zip(row, column_metadata, col_descs))
+
         try:
-            self.parsed_rows = [
-                tuple(ctype.from_binary(val, protocol_version)
-                      for ctype, val in zip(self.column_types, row))
-                for row in rows]
+            self.parsed_rows = [decode_row(row) for row in rows]
         except Exception:
             for row in rows:
-                for i in range(len(row)):
+                for val, col_md, col_desc in zip(row, column_metadata, col_descs):
                     try:
-                        self.column_types[i].from_binary(row[i], protocol_version)
+                        decode_val(val, col_md, col_desc)
                     except Exception as e:
-                        raise DriverException('Failed decoding result column "%s" of type %s: %s' % (self.column_names[i],
-                                                                                                     self.column_types[i].cql_parameterized_type(),
+                        raise DriverException('Failed decoding result column "%s" of type %s: %s' % (col_md[2],
+                                                                                                     col_md[3].cql_parameterized_type(),
                                                                                                      str(e)))
 
-    def recv_results_prepared(self, f, protocol_version, user_type_map):
+    def recv_results_prepared(self, f, protocol_version, protocol_features, user_type_map):
         self.query_id = read_binary_string(f)
-        if ProtocolVersion.uses_prepared_metadata(protocol_version):
+        if ProtocolVersion.uses_prepared_metadata(protocol_version) or protocol_features.use_metadata_id:
             self.result_metadata_id = read_binary_string(f)
         else:
             self.result_metadata_id = None
@@ -890,7 +945,7 @@ class PrepareMessage(_MessageType):
         self.query = query
         self.keyspace = keyspace
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         write_longstring(f, self.query)
 
         flags = 0x00
@@ -934,7 +989,7 @@ class BatchMessage(_MessageType):
         self.timestamp = timestamp
         self.keyspace = keyspace
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         write_byte(f, self.batch_type.value)
         write_short(f, len(self.queries))
         for prepared, string_or_query_id, params in self.queries:
@@ -993,7 +1048,7 @@ class RegisterMessage(_MessageType):
     def __init__(self, event_list):
         self.event_list = event_list
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         write_stringlist(f, self.event_list)
 
 
@@ -1067,7 +1122,7 @@ class ReviseRequestMessage(_MessageType):
         self.op_id = op_id
         self.next_pages = next_pages
 
-    def send_body(self, f, protocol_version):
+    def send_body(self, f, protocol_version, protocol_features):
         write_int(f, self.op_type)
         write_int(f, self.op_id)
         if self.op_type == ReviseRequestMessage.RevisionType.PAGING_BACKPRESSURE:
@@ -1099,8 +1154,11 @@ class _ProtocolHandler(object):
     result decoding implementations.
     """
 
+    column_encryption_policy = None
+    """Instance of :class:`cassandra.policies.ColumnEncryptionPolicy` in use by this handler"""
+
     @classmethod
-    def encode_message(cls, msg, stream_id, protocol_version, compressor, allow_beta_protocol_version):
+    def encode_message(cls, msg, stream_id, protocol_version, protocol_features, compressor, allow_beta_protocol_version):
         """
         Encodes a message using the specified frame parameters, and compressor
 
@@ -1116,7 +1174,7 @@ class _ProtocolHandler(object):
                 raise UnsupportedOperation("Custom key/value payloads can only be used with protocol version 4 or higher")
             flags |= CUSTOM_PAYLOAD_FLAG
             write_bytesmap(body, msg.custom_payload)
-        msg.send_body(body, protocol_version)
+        msg.send_body(body, protocol_version, protocol_features)
         body = body.getvalue()
 
         # With checksumming, the compression is done at the segment frame encoding
@@ -1147,7 +1205,7 @@ class _ProtocolHandler(object):
         write_int(f, length)
 
     @classmethod
-    def decode_message(cls, protocol_version, user_type_map, stream_id, flags, opcode, body,
+    def decode_message(cls, protocol_version, protocol_features, user_type_map, stream_id, flags, opcode, body,
                        decompressor, result_metadata):
         """
         Decodes a native protocol message body
@@ -1193,7 +1251,7 @@ class _ProtocolHandler(object):
             log.warning("Unknown protocol flags set: %02x. May cause problems.", flags)
 
         msg_class = cls.message_types_by_opcode[opcode]
-        msg = msg_class.recv_body(body, protocol_version, user_type_map, result_metadata)
+        msg = msg_class.recv_body(body, protocol_version, protocol_features, user_type_map, result_metadata, cls.column_encryption_policy)
         msg.stream_id = stream_id
         msg.trace_id = trace_id
         msg.custom_payload = custom_payload
@@ -1346,7 +1404,7 @@ def read_binary_string(f):
 
 
 def write_string(f, s):
-    if isinstance(s, six.text_type):
+    if isinstance(s, str):
         s = s.encode('utf8')
     write_short(f, len(s))
     f.write(s)
@@ -1363,7 +1421,7 @@ def read_longstring(f):
 
 
 def write_longstring(f, s):
-    if isinstance(s, six.text_type):
+    if isinstance(s, str):
         s = s.encode('utf8')
     write_int(f, len(s))
     f.write(s)

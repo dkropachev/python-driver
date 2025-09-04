@@ -15,25 +15,29 @@
 import os, socket, errno
 from ccmlib import common
 
+from cassandra import DependencyException
 from cassandra.cluster import NoHostAvailable
-from cassandra.io.asyncorereactor import AsyncoreConnection
+
+try:
+    from cassandra.io.asyncorereactor import AsyncoreConnection
+except DependencyException:
+    AsyncoreConnection = None
 
 from tests import is_monkey_patched
 from tests.integration import use_cluster, remove_cluster, TestCluster
 
-if is_monkey_patched():
-    LibevConnection = -1
-    AsyncoreConnection = -1
-else:
-    try:
-        from cassandra.io.libevreactor import LibevConnection
-    except ImportError:
-        LibevConnection = None
-
 try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+    from cassandra.io.libevreactor import LibevConnection
+except DependencyException:
+    LibevConnection = None
+
+
+if is_monkey_patched():
+    LibevConnection = None
+    AsyncoreConnection = None
+
+
+import unittest
 
 
 # If more modules do IPV6 testing, this can be moved down to integration.__init__.
@@ -77,7 +81,7 @@ class IPV6ConnectionTest(object):
     def test_connect(self):
         cluster = TestCluster(connection_class=self.connection_class, contact_points=['::1'], connect_timeout=10)
         session = cluster.connect()
-        future = session.execute_async("SELECT * FROM system.local")
+        future = session.execute_async("SELECT * FROM system.local WHERE key='local'")
         future.result()
         self.assertEqual(future._current_host.address, '::1')
         cluster.shutdown()
@@ -85,7 +89,7 @@ class IPV6ConnectionTest(object):
     def test_error(self):
         cluster = TestCluster(connection_class=self.connection_class, contact_points=['::1'], port=9043,
                               connect_timeout=10)
-        self.assertRaisesRegexp(NoHostAvailable, '\(\'Unable to connect.*%s.*::1\', 9043.*Connection refused.*'
+        self.assertRaisesRegex(NoHostAvailable, '\(\'Unable to connect.*%s.*::1\', 9043.*Connection refused.*'
                                 % errno.ECONNREFUSED, cluster.connect)
 
     def test_error_multiple(self):
@@ -93,7 +97,7 @@ class IPV6ConnectionTest(object):
             raise unittest.SkipTest('localhost only resolves one address')
         cluster = TestCluster(connection_class=self.connection_class, contact_points=['localhost'], port=9043,
                               connect_timeout=10)
-        self.assertRaisesRegexp(NoHostAvailable, '\(\'Unable to connect.*Tried connecting to \[\(.*\(.*\].*Last error',
+        self.assertRaisesRegex(NoHostAvailable, '\(\'Unable to connect.*Tried connecting to \[\(.*\(.*\].*Last error',
                                 cluster.connect)
 
 
@@ -105,7 +109,7 @@ class LibevConnectionTests(IPV6ConnectionTest, unittest.TestCase):
         if os.name == "nt":
             raise unittest.SkipTest("IPv6 is currently not supported under Windows")
 
-        if LibevConnection == -1:
+        if LibevConnection is None:
             raise unittest.SkipTest("Can't test libev with monkey patching")
         elif LibevConnection is None:
             raise unittest.SkipTest("Libev does not appear to be installed properly")
@@ -119,5 +123,5 @@ class AsyncoreConnectionTests(IPV6ConnectionTest, unittest.TestCase):
         if os.name == "nt":
             raise unittest.SkipTest("IPv6 is currently not supported under Windows")
 
-        if AsyncoreConnection == -1:
+        if AsyncoreConnection is None:
             raise unittest.SkipTest("Can't test asyncore with monkey patching")

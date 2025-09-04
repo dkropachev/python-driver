@@ -4,7 +4,7 @@ A Python client driver for `Scylla <https://docs.scylladb.com>`_.
 This driver works exclusively with the Cassandra Query Language v3 (CQL3)
 and Cassandra's native protocol.
 
-The driver supports Python 2.7, 3.5, 3.6, 3.7 and 3.8.
+The driver supports Python 3.6-3.12.
 
 This driver is open source under the
 `Apache v2 License <http://www.apache.org/licenses/LICENSE-2.0.html>`_.
@@ -17,25 +17,25 @@ Contents
 :doc:`installation`
     How to install the driver.
 
-:doc:`getting_started`
+:doc:`getting-started`
     A guide through the first steps of connecting to Scylla and executing queries
 
-:doc:`scylla_specific`
+:doc:`scylla-specific`
     A list of feature available only on ``scylla-driver``
 
-:doc:`execution_profiles`
+:doc:`execution-profiles`
     An introduction to a more flexible way of configuring request execution
 
 :doc:`lwt`
     Working with results of conditional requests
 
-:doc:`object_mapper`
+:doc:`object-mapper`
     Introduction to the integrated object mapper, cqlengine
 
 :doc:`performance`
     Tips for getting good performance.
 
-:doc:`query_paging`
+:doc:`query-paging`
     Notes on paging large query results
 
 :doc:`security`
@@ -44,17 +44,17 @@ Contents
 :doc:`upgrading`
     A guide to upgrading versions of the driver
 
-:doc:`user_defined_types`
+:doc:`user-defined-types`
     Working with Scylla's user-defined types (UDT)
 
-:doc:`dates_and_times`
+:doc:`dates-and-times`
     Some discussion on the driver's approach to working with timestamp, date, time types
 
-:doc:`scylla_cloud`
-    Connect to Scylla Cloud
+:doc:`scylla-cloud`
+    Connect to ScyllaDB Cloud
 
-:doc:`CHANGELOG`
-    Log of changes to the driver, organized by version.
+:doc:`scylla-cloud-serverless`
+    Connect to ScyllaDB Cloud Serverless
 
 :doc:`faq`
     A collection of Frequently Asked Questions
@@ -67,26 +67,27 @@ Contents
 
    api/index
    installation
-   getting_started
-   scylla_specific
+   getting-started
+   scylla-specific
    upgrading
-   execution_profiles
+   execution-profiles
    performance
-   query_paging
+   query-paging
    lwt
    security
-   user_defined_types
-   object_mapper
-   dates_and_times
-   scylla_cloud
+   user-defined-types
+   object-mapper
+   dates-and-times
+   scylla-cloud
+   scylla-cloud-serverless
    faq
 
 Getting Help
 ------------
 Visit the :doc:`FAQ section <faq>` in this documentation.
 
-Please send questions to the Scylla `user list <https://groups.google.com/forum/#!forum/scylladb-users>`_.
-
+Please send questions to `ScyllaDB Community Forum <https://forum.scylladb.com/>`_
+and the Scylla Users `Slack channel <https://scylladb-users.slack.com>`_.
 
 Reporting Issues
 ----------------
@@ -101,5 +102,3 @@ Copyright
 
 © 2016, The Apache Software Foundation.
 Apache®, Apache Cassandra®, Cassandra®, the Apache feather logo and the Apache Cassandra® Eye logo are either registered trademarks or trademarks of the Apache Software Foundation in the United States and/or other countries. No endorsement by The Apache Software Foundation is implied by the use of these marks.
-
-

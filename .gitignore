@@ -3,6 +3,7 @@
 *.swo
 *.so
 *.egg
+*.eggs
 *.egg-info
 *.attr
 .tox
@@ -11,13 +12,12 @@ build
 MANIFEST
 dist
 .coverage
-nosetests.xml
 cover/
 docs/_build/
-docs/poetry.lock
 tests/integration/ccm
 setuptools*.tar.gz
 setuptools*.egg
+venv/
 
 cassandra/*.c
 !cassandra/cmurmur3.c
@@ -43,3 +43,24 @@ tests/unit/cython/bytesio_testhelper.c
 #iPython
 *.ipynb
 
+# Files from upstream that we don't need
+Jenkinsfile
+Jenkinsfile.bak
+appveyor.yml
+appveyor/appveyor.ps1
+appveyor/run_test.ps1
+build.yaml.bak
+docs.yaml
+doxyfile
+tox.ini
+test-datastax-requirements.txt
+docs/api/cassandra/datastax/graph/fluent/index.rst
+docs/api/cassandra/datastax/graph/fluent/predicates.rst
+docs/api/cassandra/datastax/graph/fluent/query.rst
+docs/api/cassandra/datastax/graph/index.rst
+docs/api/cassandra/graph.rst
+docs/classic_graph.rst
+docs/core_graph.rst
+docs/geo_types.rst
+docs/graph.rst
+docs/graph_fluent.rst

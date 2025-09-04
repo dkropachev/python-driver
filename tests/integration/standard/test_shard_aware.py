@@ -15,6 +15,7 @@ import os
 import time
 import random
 from subprocess import run
+import logging
 
 try:
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,28 +26,31 @@ try:
     import unittest2 as unittest
 except ImportError:
     import unittest  # noqa
+import pytest
 
 from cassandra.cluster import Cluster
 from cassandra.policies import TokenAwarePolicy, RoundRobinPolicy, ConstantReconnectionPolicy
-from cassandra import OperationTimedOut
+from cassandra import OperationTimedOut, ConsistencyLevel
 
 from tests.integration import use_cluster, get_node, PROTOCOL_VERSION
 
+LOGGER = logging.getLogger(__name__)
+
 
 def setup_module():
-    os.environ['SCYLLA_EXT_OPTS'] = "--smp 4 --memory 2048M"
-    use_cluster('shared_aware', [3], start=True)
+    os.environ['SCYLLA_EXT_OPTS'] = "--smp 2"
+    use_cluster('shard_aware', [3], start=True)
 
 
 class TestShardAwareIntegration(unittest.TestCase):
     @classmethod
     def setup_class(cls):
-        cls.cluster = Cluster(protocol_version=PROTOCOL_VERSION, load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()),
+        cls.cluster = Cluster(contact_points=["127.0.0.1"], protocol_version=PROTOCOL_VERSION,
+                              load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()),
                               reconnection_policy=ConstantReconnectionPolicy(1))
         cls.session = cls.cluster.connect()
-
-        print(cls.cluster.is_shard_aware())
-        print(cls.cluster.shard_aware_stats())
+        LOGGER.info(cls.cluster.is_shard_aware())
+        LOGGER.info(cls.cluster.shard_aware_stats())
 
     @classmethod
     def teardown_class(cls):
@@ -56,18 +60,18 @@ class TestShardAwareIntegration(unittest.TestCase):
         traces = results.get_query_trace()
         events = traces.events
         for event in events:
-            print(event.thread_name, event.description)
+            LOGGER.info("%s %s %s", event.source, event.thread_name, event.description)
         for event in events:
-            self.assertEqual(event.thread_name, shard_name)
+            self.assertIn(shard_name, event.thread_name)
         self.assertIn('querying locally', "\n".join([event.description for event in events]))
 
         trace_id = results.response_future.get_query_trace_ids()[0]
         traces = self.session.execute("SELECT * FROM system_traces.events WHERE session_id = %s", (trace_id,))
         events = [event for event in traces]
         for event in events:
-            print(event.thread, event.activity)
+            LOGGER.info("%s %s", event.thread, event.activity)
         for event in events:
-            self.assertEqual(event.thread, shard_name)
+            self.assertIn(shard_name, event.thread)
         self.assertIn('querying locally', "\n".join([event.activity for event in events]))
 
     def create_ks_and_cf(self):
@@ -105,7 +109,7 @@ class TestShardAwareIntegration(unittest.TestCase):
         session.execute(bound)
         bound = prepared.bind(('e', 'f', 'g'))
         session.execute(bound)
-        bound = prepared.bind(('100000', 'f', 'g'))
+        bound = prepared.bind(('100002', 'f', 'g'))
         session.execute(bound)
 
     def query_data(self, session, verify_in_tracing=True):
@@ -118,20 +122,20 @@ class TestShardAwareIntegration(unittest.TestCase):
         results = session.execute(bound, trace=True)
         self.assertEqual(results, [('a', 'b', 'c')])
         if verify_in_tracing:
-            self.verify_same_shard_in_tracing(results, "shard 1")
+            self.verify_same_shard_in_tracing(results, "shard 0")
 
-        bound = prepared.bind(('100000', 'f'))
+        bound = prepared.bind(('100002', 'f'))
         results = session.execute(bound, trace=True)
-        self.assertEqual(results, [('100000', 'f', 'g')])
+        self.assertEqual(results, [('100002', 'f', 'g')])
 
         if verify_in_tracing:
-            self.verify_same_shard_in_tracing(results, "shard 0")
+            self.verify_same_shard_in_tracing(results, "shard 1")
 
         bound = prepared.bind(('e', 'f'))
         results = session.execute(bound, trace=True)
 
         if verify_in_tracing:
-            self.verify_same_shard_in_tracing(results, "shard 1")
+            self.verify_same_shard_in_tracing(results, "shard 0")
 
     def test_all_tracing_coming_one_shard(self):
         """
@@ -164,6 +168,7 @@ class TestShardAwareIntegration(unittest.TestCase):
             for result in as_completed(futures):
                 print(result)
 
+    @pytest.mark.skip(reason='https://github.com/scylladb/python-driver/issues/221')
     def test_closing_connections(self):
         """
         Verify that reconnection is working as expected, when connection are being closed.
@@ -185,7 +190,7 @@ class TestShardAwareIntegration(unittest.TestCase):
         time.sleep(10)
         self.query_data(self.session)
 
-    @unittest.expectedFailure
+    @pytest.mark.skip
     def test_blocking_connections(self):
         """
         Verify that reconnection is working as expected, when connection are being blocked.

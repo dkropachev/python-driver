@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from datetime import timedelta, datetime
-import mock
+from unittest import mock
 import sure
 from uuid import uuid4
 
@@ -25,6 +25,8 @@ from tests.integration.cqlengine.base import BaseCassEngTestCase
 
 
 class TestTimestampModel(Model):
+    __test__ = False
+
     id      = columns.UUID(primary_key=True, default=lambda:uuid4())
     count   = columns.Integer()
 

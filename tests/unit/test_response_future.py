@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
+import unittest
 
 from collections import deque
 from threading import RLock
-from mock import Mock, MagicMock, ANY
+from unittest.mock import Mock, MagicMock, ANY
 
 from cassandra import ConsistencyLevel, Unavailable, SchemaTargetType, SchemaChangeType, OperationTimedOut
 from cassandra.cluster import Session, ResponseFuture, NoHostAvailable, ProtocolVersion
@@ -31,7 +28,7 @@ from cassandra.protocol import (ReadTimeoutErrorMessage, WriteTimeoutErrorMessag
                                 RESULT_KIND_ROWS, RESULT_KIND_SET_KEYSPACE,
                                 RESULT_KIND_SCHEMA_CHANGE, RESULT_KIND_PREPARED,
                                 ProtocolHandler)
-from cassandra.policies import RetryPolicy
+from cassandra.policies import RetryPolicy, ExponentialBackoffRetryPolicy
 from cassandra.pool import NoConnectionsAvailable
 from cassandra.query import SimpleStatement
 
@@ -41,6 +38,7 @@ class ResponseFutureTests(unittest.TestCase):
     def make_basic_session(self):
         s = Mock(spec=Session)
         s.row_factory = lambda col_names, rows: [(col_names, rows)]
+        s.cluster.control_connection._tablets_routing_v1 = False
         return s
 
     def make_pool(self):
@@ -76,7 +74,7 @@ class ResponseFutureTests(unittest.TestCase):
         rf.send_request()
 
         rf.session._pools.get.assert_called_once_with('ip1')
-        pool.borrow_connection.assert_called_once_with(timeout=ANY, routing_key=ANY)
+        pool.borrow_connection.assert_called_once_with(timeout=ANY, routing_key=ANY, keyspace=ANY, table=ANY)
 
         connection.send_msg.assert_called_once_with(rf.message, 1, cb=ANY, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=[])
 
@@ -161,7 +159,7 @@ class ResponseFutureTests(unittest.TestCase):
 
         # Simulate ResponseFuture timing out
         rf._on_timeout()
-        self.assertRaisesRegexp(OperationTimedOut, "Connection defunct by heartbeat", rf.result)
+        self.assertRaisesRegex(OperationTimedOut, "Connection defunct by heartbeat", rf.result)
 
     def test_read_timeout_error_message(self):
         session = self.make_session()
@@ -258,14 +256,14 @@ class ResponseFutureTests(unittest.TestCase):
         rf.send_request()
 
         rf.session._pools.get.assert_called_once_with('ip1')
-        pool.borrow_connection.assert_called_once_with(timeout=ANY, routing_key=ANY)
+        pool.borrow_connection.assert_called_once_with(timeout=ANY, routing_key=ANY, keyspace=ANY, table=ANY)
         connection.send_msg.assert_called_once_with(rf.message, 1, cb=ANY, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=[])
 
         result = Mock(spec=UnavailableErrorMessage, info={})
         host = Mock()
         rf._set_result(host, None, None, result)
 
-        session.submit.assert_called_once_with(rf._retry_task, True, host)
+        rf.session.cluster.scheduler.schedule.assert_called_once_with(ANY, rf._retry_task, True, host)
         self.assertEqual(1, rf._query_retries)
 
         connection = Mock(spec=Connection)
@@ -277,7 +275,7 @@ class ResponseFutureTests(unittest.TestCase):
         # it should try again with the same host since this was
         # an UnavailableException
         rf.session._pools.get.assert_called_with(host)
-        pool.borrow_connection.assert_called_with(timeout=ANY, routing_key=ANY)
+        pool.borrow_connection.assert_called_with(timeout=ANY, routing_key=ANY, keyspace=ANY, table=ANY)
         connection.send_msg.assert_called_with(rf.message, 2, cb=ANY, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=[])
 
     def test_retry_with_different_host(self):
@@ -292,7 +290,7 @@ class ResponseFutureTests(unittest.TestCase):
         rf.send_request()
 
         rf.session._pools.get.assert_called_once_with('ip1')
-        pool.borrow_connection.assert_called_once_with(timeout=ANY, routing_key=ANY)
+        pool.borrow_connection.assert_called_once_with(timeout=ANY, routing_key=ANY, keyspace=ANY, table=ANY)
         connection.send_msg.assert_called_once_with(rf.message, 1, cb=ANY, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=[])
         self.assertEqual(ConsistencyLevel.QUORUM, rf.message.consistency_level)
 
@@ -300,7 +298,7 @@ class ResponseFutureTests(unittest.TestCase):
         host = Mock()
         rf._set_result(host, None, None, result)
 
-        session.submit.assert_called_once_with(rf._retry_task, False, host)
+        rf.session.cluster.scheduler.schedule.assert_called_once_with(ANY, rf._retry_task, False, host)
         # query_retries does get incremented for Overloaded/Bootstrapping errors (since 3.18)
         self.assertEqual(1, rf._query_retries)
 
@@ -311,7 +309,7 @@ class ResponseFutureTests(unittest.TestCase):
 
         # it should try with a different host
         rf.session._pools.get.assert_called_with('ip2')
-        pool.borrow_connection.assert_called_with(timeout=ANY, routing_key=ANY)
+        pool.borrow_connection.assert_called_with(timeout=ANY, routing_key=ANY, keyspace=ANY, table=ANY)
         connection.send_msg.assert_called_with(rf.message, 2, cb=ANY, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message, result_metadata=[])
 
         # the consistency level should be the same
@@ -332,7 +330,8 @@ class ResponseFutureTests(unittest.TestCase):
         rf._set_result(host, None, None, result)
 
         # simulate the executor running this
-        session.submit.assert_called_once_with(rf._retry_task, False, host)
+        rf.session.cluster.scheduler.schedule.assert_called_once_with(ANY, rf._retry_task, False, host)
+
         rf._retry_task(False, host)
 
         # it should try with a different host
@@ -342,10 +341,33 @@ class ResponseFutureTests(unittest.TestCase):
         rf._set_result(host, None, None, result)
 
         # simulate the executor running this
-        session.submit.assert_called_with(rf._retry_task, False, host)
+        rf.session.cluster.scheduler.schedule.assert_called_with(ANY, rf._retry_task, False, host)
         rf._retry_task(False, host)
 
         self.assertRaises(NoHostAvailable, rf.result)
+
+    def test_exponential_retry_policy_fail(self):
+        session = self.make_session()
+        pool = session._pools.get.return_value
+        connection = Mock(spec=Connection)
+        pool.borrow_connection.return_value = (connection, 1)
+
+        query = SimpleStatement("SELECT * FROM foo")
+        message = QueryMessage(query=query, consistency_level=ConsistencyLevel.ONE)
+        rf = ResponseFuture(session, message, query, 1, retry_policy=ExponentialBackoffRetryPolicy(2))
+        rf.send_request()
+        rf.session._pools.get.assert_called_once_with('ip1')
+
+        result = Mock(spec=IsBootstrappingErrorMessage, info={})
+        host = Mock()
+        rf._set_result(host, None, None, result)
+
+        # simulate the executor running this
+        rf.session.cluster.scheduler.schedule.assert_called_once_with(ANY, rf._retry_task, False, host)
+
+        delay = rf.session.cluster.scheduler.schedule.mock_calls[-1][1][0]
+        assert delay > 0.05
+        rf._retry_task(False, host)
 
     def test_all_pools_shutdown(self):
         session = self.make_basic_session()
@@ -628,7 +650,7 @@ class ResponseFutureTests(unittest.TestCase):
 
         rf._on_timeout()
         pool.return_connection.assert_called_once_with(connection, stream_was_orphaned=True)
-        self.assertRaisesRegexp(OperationTimedOut, "Client request timeout", rf.result)
+        self.assertRaisesRegex(OperationTimedOut, "Client request timeout", rf.result)
 
         assert len(connection.request_ids) == 0, \
             "Request IDs should be empty but it's not: {}".format(connection.request_ids)

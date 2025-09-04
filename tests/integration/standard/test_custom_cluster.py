@@ -16,10 +16,7 @@ from cassandra.cluster import NoHostAvailable
 from tests.integration import use_singledc, get_cluster, remove_cluster, local, TestCluster
 from tests.util import wait_until, wait_until_not_raised
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest
+import unittest
 
 
 def setup_module():
@@ -29,11 +26,7 @@ def setup_module():
     config_options = {'native_transport_port': 9046}
     ccm_cluster.set_configuration_options(config_options)
     # can't use wait_for_binary_proto cause ccm tries on port 9042
-    ccm_cluster.start(wait_for_binary_proto=False)
-    # wait until all nodes are up
-    wait_until_not_raised(lambda: TestCluster(contact_points=['127.0.0.1'], port=9046).connect().shutdown(), 1, 20)
-    wait_until_not_raised(lambda: TestCluster(contact_points=['127.0.0.2'], port=9046).connect().shutdown(), 1, 20)
-    wait_until_not_raised(lambda: TestCluster(contact_points=['127.0.0.3'], port=9046).connect().shutdown(), 1, 20)
+    ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
 
 
 def teardown_module():
@@ -60,4 +53,4 @@ class CustomClusterTests(unittest.TestCase):
         wait_until(lambda: len(cluster.metadata.all_hosts()) == 3, 1, 5)
         for host in cluster.metadata.all_hosts():
             self.assertTrue(host.is_up)
-            session.execute("select * from system.local", host=host)
+            session.execute("select * from system.local where key='local'", host=host)

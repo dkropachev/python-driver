@@ -11,10 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from uuid import uuid1
 
@@ -51,7 +48,7 @@ class RoutingTests(unittest.TestCase):
 
         my_token = s.cluster.metadata.token_map.token_class.from_key(bound.routing_key)
 
-        cass_token = s.execute(select, key_values)[0][0]
+        cass_token = s.execute(select, key_values).one()[0]
         token = s.cluster.metadata.token_map.token_class(cass_token)
         self.assertEqual(my_token, token)
 

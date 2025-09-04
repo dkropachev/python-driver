@@ -1,16 +1,26 @@
+.. |license| image:: https://img.shields.io/badge/License-Apache%202.0-blue.svg
+    :target: https://opensource.org/licenses/Apache-2.0
+.. |version| image:: https://badge.fury.io/py/scylla-driver.svg
+    :target: https://badge.fury.io/py/scylla-driver
+
+|license| |version|
+
 Scylla Python Driver
 ====================
 
 A modern, feature-rich and highly-tunable Python client library for Scylla Open Source (2.1+) and Apache Cassandra (2.1+) and
 Scylla Enterprise (2018.1.x+) using exclusively Cassandra's binary protocol and Cassandra Query Language v3.
 
-.. image:: https://github.com/scylladb/python-driver/workflows/Build%20and%20upload%20to%20PyPi/badge.svg?tag=*-scylla
-   :target: https://github.com/scylladb/python-driver/actions?query=workflow%3A%22Build+and+upload+to+PyPi%22+event%3Apush+branch%3A*-scylla
+.. image:: https://github.com/scylladb/python-driver/actions/workflows/build-push.yml/badge.svg?branch=master
+   :target: https://github.com/scylladb/python-driver/actions/workflows/build-push.yml?query=event%3Apush+branch%3Amaster
 
-.. image:: https://github.com/scylladb/python-driver/workflows/CI%20Docs/badge.svg?tag=*-scylla
-   :target: https://github.com/scylladb/python-driver/actions?query=workflow%3A%22CI+Docs%22+event%3Apush+branch%3A*-scylla
+.. image:: https://github.com/scylladb/python-driver/actions/workflows/docs-pages.yaml/badge.svg?branch=master
+   :target: https://github.com/scylladb/python-driver/actions/workflows/docs-pages.yaml?query=event%3Apush+branch%3Amaster
 
-The driver supports Python versions 2.7, 3.4, 3.5, 3.6, 3.7 and 3.8.
+.. image:: https://github.com/scylladb/python-driver/actions/workflows/integration-tests.yml/badge.svg?branch=master
+   :target: https://github.com/scylladb/python-driver/actions/workflows/integration-tests.yml?query=event%3Apush+branch%3Amaster
+
+The driver supports Python versions 3.7-3.13.
 
 .. **Note:** This driver does not support big-endian systems.
 
@@ -24,8 +34,9 @@ Features
 * `Automatic reconnection <http://python-driver.docs.scylladb.com/stable/api/cassandra/policies.html#reconnecting-to-dead-hosts>`_
 * Configurable `load balancing <http://python-driver.docs.scylladb.com/stable/api/cassandra/policies.html#load-balancing>`_ and `retry policies <http://python-driver.docs.scylladb.com/stable/api/cassandra/policies.html#retrying-failed-operations>`_
 * `Concurrent execution utilities <http://python-driver.docs.scylladb.com/stable/api/cassandra/concurrent.html>`_
-* `Object mapper <http://python-driver.docs.scylladb.com/stable/object_mapper.html>`_
-* `Shard awareness <http://python-driver.docs.scylladb.com/stable/scylla_specific.html#shard-awareness>`_
+* `Object mapper <http://python-driver.docs.scylladb.com/stable/object-mapper.html>`_
+* `Shard awareness <http://python-driver.docs.scylladb.com/stable/scylla-specific.html#shard-awareness>`_
+* `Tablet awareness <http://python-driver.docs.scylladb.com/stable/scylla-specific.html#tablet-awareness>`_
 
 Installation
 ------------
@@ -43,7 +54,7 @@ The documentation can be found online `here <http://python-driver.docs.scylladb.
 Information includes: 
 
 * `Installation <http://python-driver.docs.scylladb.com/stable/installation.html>`_
-* `Getting started guide <http://python-driver.docs.scylladb.com/stable/getting_started.html>`_
+* `Getting started guide <http://python-driver.docs.scylladb.com/stable/getting-started.html>`_
 * `API docs <http://python-driver.docs.scylladb.com/stable/api/index.html>`_
 * `Performance tips <http://python-driver.docs.scylladb.com/stable/performance.html>`_
 
@@ -59,11 +70,15 @@ Object Mapper
 -------------
 cqlengine (originally developed by Blake Eggleston and Jon Haddad, with contributions from the
 community) is now maintained as an integral part of this package. Refer to
-`documentation here <http://python-driver.docs.scylladb.com/stable/object_mapper.html>`_.
+`documentation here <http://python-driver.docs.scylladb.com/stable/object-mapper.html>`_.
 
 Contributing
 ------------
 See `CONTRIBUTING <https://github.com/scylladb/python-driver/blob/master/CONTRIBUTING.rst>`_.
+
+Error Handling
+--------------
+While originally written for the Java driver, users may reference the `Cassandra error handling done right blog <https://www.datastax.com/blog/cassandra-error-handling-done-right>`_ for resolving error handling scenarios with Apache Cassandra.
 
 Reporting Problems
 ------------------
@@ -74,8 +89,7 @@ If you would like to contribute, please feel free to send a pull request.
 
 Getting Help
 ------------
-Your best options for getting help with the driver are the
-`mailing list <https://groups.google.com/forum/#!forum/scylladb-users>`_
+You can ask questions on `ScyllaDB Community Forum <https://forum.scylladb.com/>`_
 and the Scylla Users `Slack channel <https://scylladb-users.slack.com>`_.
 
 License

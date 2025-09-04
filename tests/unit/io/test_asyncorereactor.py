@@ -11,19 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
+import platform
+import unittest
 
-from mock import patch
+from unittest.mock import patch
 import socket
-import cassandra.io.asyncorereactor as asyncorereactor
-from cassandra.io.asyncorereactor import AsyncoreConnection
+
+from cassandra import DependencyException
+
+try:
+    import cassandra.io.asyncorereactor as asyncorereactor
+    from cassandra.io.asyncorereactor import AsyncoreConnection
+    ASYNCCORE_AVAILABLE = True
+except (ImportError, DependencyException):
+    ASYNCCORE_AVAILABLE = False
+    AsyncoreConnection = None
+
 from tests import is_monkey_patched
 from tests.unit.io.utils import ReactorTestMixin, TimerTestMixin, noop_if_monkey_patched
 
 
+@unittest.skipIf(not ASYNCCORE_AVAILABLE, 'asyncore is deprecated')
 class AsyncorePatcher(unittest.TestCase):
 
     @classmethod
@@ -57,7 +65,7 @@ class AsyncorePatcher(unittest.TestCase):
             except:
                 pass
 
-
+@unittest.skipIf(not ASYNCCORE_AVAILABLE, 'asyncore is deprecated')
 class AsyncoreConnectionTest(ReactorTestMixin, AsyncorePatcher):
 
     connection_class = AsyncoreConnection
@@ -68,6 +76,7 @@ class AsyncoreConnectionTest(ReactorTestMixin, AsyncorePatcher):
             raise unittest.SkipTest("Can't test asyncore with monkey patching")
 
 
+@unittest.skipIf(not ASYNCCORE_AVAILABLE, 'asyncore is deprecated')
 class TestAsyncoreTimer(TimerTestMixin, AsyncorePatcher):
     connection_class = AsyncoreConnection
 

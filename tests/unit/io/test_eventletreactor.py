@@ -13,20 +13,18 @@
 # limitations under the License.
 
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest # noqa
+import unittest
+from mock import patch
 
 from tests.unit.io.utils import TimerTestMixin
 from tests import notpypy, EVENT_LOOP_MANAGER
 
-from eventlet import monkey_patch
-from mock import patch
+from unittest.mock import patch
 
 try:
+    from eventlet import monkey_patch
     from cassandra.io.eventletreactor import EventletConnection
-except ImportError:
+except (ImportError, AttributeError):
     EventletConnection = None  # noqa
 
 skip_condition = EventletConnection is None or EVENT_LOOP_MANAGER != "eventlet"

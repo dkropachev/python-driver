@@ -11,10 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 import logging
 import os
 import subprocess
@@ -160,7 +157,7 @@ class BasicDseAuthTest(unittest.TestCase):
         os.environ['KRB5_CONFIG'] = self.krb_conf
         self.cluster = TestCluster(auth_provider=auth_provider)
         self.session = self.cluster.connect()
-        query = query if query else "SELECT * FROM system.local"
+        query = query if query else "SELECT * FROM system.local WHERE key='local'"
         statement = SimpleStatement(query)
         rs = self.session.execute(statement)
         return rs
@@ -532,4 +529,4 @@ class DseProxyAuthTest(BaseDseProxyAuthTest):
         @expected_result connect and query should be allowed
         """
         auth_provider = TransitionalModePlainTextAuthProvider()
-        self.assertIsNotNone(self.connect_and_query(auth_provider, query="SELECT * from system.local"))
+        self.assertIsNotNone(self.connect_and_query(auth_provider, query="SELECT * from system.local WHERE key='local'"))

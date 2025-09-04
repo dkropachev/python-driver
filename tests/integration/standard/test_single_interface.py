@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
-import six
+import unittest
 
 from cassandra import ConsistencyLevel
 from cassandra.query import SimpleStatement
@@ -25,7 +20,7 @@ from cassandra.query import SimpleStatement
 from packaging.version import Version
 from tests.integration import use_singledc, PROTOCOL_VERSION, \
     remove_cluster, greaterthanorequalcass40, notdse, \
-    CASSANDRA_VERSION, DSE_VERSION, TestCluster
+    CASSANDRA_VERSION, DSE_VERSION, TestCluster, DEFAULT_SINGLE_INTERFACE_PORT
 
 
 def setup_module():
@@ -42,7 +37,7 @@ def teardown_module():
 class SingleInterfaceTest(unittest.TestCase):
 
     def setUp(self):
-        self.cluster = TestCluster()
+        self.cluster = TestCluster(port=DEFAULT_SINGLE_INTERFACE_PORT)
         self.session = self.cluster.connect()
 
     def tearDown(self):
@@ -59,7 +54,7 @@ class SingleInterfaceTest(unittest.TestCase):
         broadcast_rpc_ports = []
         broadcast_ports = []
         self.assertEqual(len(hosts), 3)
-        for endpoint, host in six.iteritems(hosts):
+        for endpoint, host in hosts.items():
 
             self.assertEqual(endpoint.address, host.broadcast_rpc_address)
             self.assertEqual(endpoint.port, host.broadcast_rpc_port)
@@ -76,4 +71,4 @@ class SingleInterfaceTest(unittest.TestCase):
                                                  consistency_level=ConsistencyLevel.ALL))
 
         for pool in self.session.get_pools():
-            self.assertEquals(1, pool.get_state()['open_count'])
+            self.assertEqual(1, pool.get_state()['open_count'])

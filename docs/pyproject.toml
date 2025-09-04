@@ -3,24 +3,27 @@ name = "python-driver-docs"
 version = "0.1.0"
 description = "ScyllaDB Python Driver Docs"
 authors = ["Python Driver Contributors"]
+package-mode = false
 
 [tool.poetry.dependencies]
-python = "^3.7"
-geomet = "0.1.2"
-six = "1.15.0"
+eventlet = "^0.33.3"
 futures = "2.2.0"
-eventlet = "0.25.2"
-gevent = "20.12.1"
-scales = "1.0.9"
-[tool.poetry.dev-dependencies]
-sphinx-autobuild = "0.7.1"
-Sphinx = "2.4.4"
-jinja2 = "2.8.1"
+geomet = ">=0.1,<0.3"
+gevent = "^23.9.1"
 gremlinpython = "3.4.7"
-recommonmark = "0.5.0"
-sphinx-scylladb-theme = "~1.0.0"
-sphinx-multiversion-scylla = "~0.2.6"
+python = "^3.10"
+pygments = "^2.18.0"
+recommonmark = "0.7.1"
+redirects_cli ="~0.1.2"
+sphinx-autobuild = "^2024.4.19"
+sphinx-sitemap = "^2.6.0"
+sphinx-scylladb-theme = "^1.8.1"
+sphinx-multiversion-scylla = "^0.3.1"
+Sphinx = "^7.3.7"
+scales = "^1.0.9"
+six = ">=1.9"
+tornado = ">=4.0,<5.0"
 
 [build-system]
-requires = ["poetry>=0.12"]
+requires = ["poetry>=1.8.0"]
 build-backend = "poetry.masonry.api"

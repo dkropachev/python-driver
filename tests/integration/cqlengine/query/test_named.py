@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from cassandra import ConsistencyLevel
 from cassandra.cqlengine import operators
@@ -30,7 +27,7 @@ from tests.integration.cqlengine.base import BaseCassEngTestCase
 from tests.integration.cqlengine.query.test_queryset import BaseQuerySetUsage
 
 
-from tests.integration import BasicSharedKeyspaceUnitTestCase, greaterthanorequalcass30
+from tests.integration import BasicSharedKeyspaceUnitTestCase, greaterthanorequalcass30, requires_collection_indexes
 
 
 class TestQuerySetOperation(BaseCassEngTestCase):
@@ -121,7 +118,7 @@ class TestQuerySetOperation(BaseCassEngTestCase):
         self.assertIsInstance(where.operator, GreaterThanOrEqualOperator)
         self.assertEqual(where.value, 1)
 
-
+@requires_collection_indexes
 class TestQuerySetCountSelectionAndIteration(BaseQuerySetUsage):
 
     @classmethod

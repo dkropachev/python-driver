@@ -17,24 +17,16 @@ from cassandra.cqlengine import connection
 from cassandra.cqlengine.management import sync_table, create_keyspace_simple
 from cassandra.cqlengine.models import Model
 from cassandra.cqlengine import columns
-
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
-
-import six
-from ssl import SSLContext, PROTOCOL_TLS
-
 from cassandra import DriverException, ConsistencyLevel, InvalidRequest
 from cassandra.cluster import NoHostAvailable, ExecutionProfile, Cluster, _execution_profile_to_string
 from cassandra.connection import SniEndPoint
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.policies import TokenAwarePolicy, DCAwareRoundRobinPolicy, ConstantReconnectionPolicy
 
-from mock import patch
+from ssl import SSLContext, PROTOCOL_TLS
+from unittest.mock import patch
 
-from tests.integration import requirescloudproxy, TestCluster
+from tests.integration import requirescloudproxy
 from tests.util import wait_until_not_raised
 from tests.integration.cloud import CloudProxyCluster, CLOUD_PROXY_SERVER
 
@@ -66,7 +58,7 @@ class CloudTests(CloudProxyCluster):
 
         self.assertEqual(len(self.hosts_up()), 3)
         for host in self.cluster.metadata.all_hosts():
-            row = self.session.execute('SELECT * FROM system.local', host=host).one()
+            row = self.session.execute("SELECT * FROM system.local WHERE key='local'", host=host).one()
             self.assertEqual(row.host_id, host.host_id)
             self.assertEqual(row.rpc_address, host.broadcast_rpc_address)
 
@@ -117,10 +109,7 @@ class CloudTests(CloudProxyCluster):
         try:
             self.connect('/invalid/path/file.zip')
         except Exception as e:
-            if six.PY2:
-                self.assertIsInstance(e, IOError)
-            else:
-                self.assertIsInstance(e, FileNotFoundError)
+            self.assertIsInstance(e, FileNotFoundError)
 
     def test_load_balancing_policy_is_dcawaretokenlbp(self):
         self.connect(self.creds)
@@ -166,7 +155,7 @@ class CloudTests(CloudProxyCluster):
         self.assertEqual(self.session.default_consistency_level, ConsistencyLevel.LOCAL_QUORUM)
         # Verify EXEC_PROFILE_DEFAULT, EXEC_PROFILE_GRAPH_DEFAULT,
         # EXEC_PROFILE_GRAPH_SYSTEM_DEFAULT, EXEC_PROFILE_GRAPH_ANALYTICS_DEFAULT
-        for ep_key in six.iterkeys(self.cluster.profile_manager.profiles):
+        for ep_key in self.cluster.profile_manager.profiles.keys():
             ep = self.cluster.profile_manager.profiles[ep_key]
             self.assertEqual(
                 ep.consistency_level,

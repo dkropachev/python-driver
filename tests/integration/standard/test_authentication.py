@@ -12,20 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from packaging.version import Version
 import logging
 import time
 
 from cassandra.cluster import NoHostAvailable
 from cassandra.auth import PlainTextAuthProvider, SASLClient, SaslAuthProvider
 
-from tests.integration import use_singledc, get_cluster, remove_cluster, PROTOCOL_VERSION, CASSANDRA_IP, \
-    USE_CASS_EXTERNAL, start_cluster_wait_for_up, TestCluster
+from tests.integration import use_singledc, get_cluster, remove_cluster, PROTOCOL_VERSION, \
+    CASSANDRA_IP, CASSANDRA_VERSION, USE_CASS_EXTERNAL, start_cluster_wait_for_up, TestCluster
 from tests.integration.util import assert_quiescent_pool_state
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest
+import unittest
 
 log = logging.getLogger(__name__)
 
@@ -45,12 +43,19 @@ def setup_module():
         log.debug("Starting ccm test cluster with %s", config_options)
         start_cluster_wait_for_up(ccm_cluster)
 
+    # PYTHON-1328
+    #
+    # Give the cluster enough time to startup (and perform necessary initialization)
+    # before executing the test.
+    if CASSANDRA_VERSION > Version('4.0-a'):
+        time.sleep(10)
 
 def teardown_module():
     remove_cluster()  # this test messes with config
 
 
 class AuthenticationTests(unittest.TestCase):
+
     """
     Tests to cover basic authentication functionality
     """
@@ -89,6 +94,7 @@ class AuthenticationTests(unittest.TestCase):
         raise Exception('Unable to connect with creds: {}/{}'.format(usr, pwd))
 
     def test_auth_connect(self):
+
         user = 'u'
         passwd = 'password'
 
@@ -99,7 +105,7 @@ class AuthenticationTests(unittest.TestCase):
             cluster = self.cluster_as(user, passwd)
             session = cluster.connect(wait_for_all_pools=True)
             try:
-                self.assertTrue(session.execute('SELECT release_version FROM system.local'))
+                self.assertTrue(session.execute("SELECT release_version FROM system.local WHERE key='local'"))
                 assert_quiescent_pool_state(self, cluster, wait=1)
                 for pool in session.get_pools():
                     connection, _ = pool.borrow_connection(timeout=0)
@@ -115,7 +121,7 @@ class AuthenticationTests(unittest.TestCase):
     def test_connect_wrong_pwd(self):
         cluster = self.cluster_as('cassandra', 'wrong_pass')
         try:
-            self.assertRaisesRegexp(NoHostAvailable,
+            self.assertRaisesRegex(NoHostAvailable,
                                     '.*AuthenticationFailed.',
                                     cluster.connect)
             assert_quiescent_pool_state(self, cluster)
@@ -125,7 +131,7 @@ class AuthenticationTests(unittest.TestCase):
     def test_connect_wrong_username(self):
         cluster = self.cluster_as('wrong_user', 'cassandra')
         try:
-            self.assertRaisesRegexp(NoHostAvailable,
+            self.assertRaisesRegex(NoHostAvailable,
                                     '.*AuthenticationFailed.*',
                                     cluster.connect)
             assert_quiescent_pool_state(self, cluster)
@@ -135,7 +141,7 @@ class AuthenticationTests(unittest.TestCase):
     def test_connect_empty_pwd(self):
         cluster = self.cluster_as('Cassandra', '')
         try:
-            self.assertRaisesRegexp(NoHostAvailable,
+            self.assertRaisesRegex(NoHostAvailable,
                                     '.*AuthenticationFailed.*',
                                     cluster.connect)
             assert_quiescent_pool_state(self, cluster)
@@ -145,7 +151,7 @@ class AuthenticationTests(unittest.TestCase):
     def test_connect_no_auth_provider(self):
         cluster = TestCluster()
         try:
-            self.assertRaisesRegexp(NoHostAvailable,
+            self.assertRaisesRegex(NoHostAvailable,
                                     '.*AuthenticationFailed.*',
                                     cluster.connect)
             assert_quiescent_pool_state(self, cluster)

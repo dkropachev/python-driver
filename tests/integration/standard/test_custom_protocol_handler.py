@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from cassandra.protocol import ProtocolHandler, ResultMessage, QueryMessage, UUIDType, read_int
 from cassandra.query import tuple_factory, SimpleStatement
@@ -28,10 +25,9 @@ from tests.integration import use_singledc, drop_keyspace_shutdown_cluster, \
     TestCluster, greaterthanorequalcass40, requirecassandra
 from tests.integration.datatype_utils import update_datatypes, PRIMITIVE_DATATYPES
 from tests.integration.standard.utils import create_table_with_all_types, get_all_primitive_params
-from six import binary_type
 
 import uuid
-import mock
+from unittest import mock
 
 
 def setup_module():
@@ -73,21 +69,21 @@ class CustomProtocolHandlerTest(unittest.TestCase):
         )
         session = cluster.connect(keyspace="custserdes")
 
-        result = session.execute("SELECT schema_version FROM system.local")
-        uuid_type = result[0][0]
+        result = session.execute("SELECT schema_version FROM system.local WHERE key='local'")
+        uuid_type = result.one()[0]
         self.assertEqual(type(uuid_type), uuid.UUID)
 
         # use our custom protocol handlder
         session.client_protocol_handler = CustomTestRawRowType
-        result_set = session.execute("SELECT schema_version FROM system.local")
-        raw_value = result_set[0][0]
-        self.assertTrue(isinstance(raw_value, binary_type))
+        result_set = session.execute("SELECT schema_version FROM system.local WHERE key='local'")
+        raw_value = result_set.one()[0]
+        self.assertTrue(isinstance(raw_value, bytes))
         self.assertEqual(len(raw_value), 16)
 
         # Ensure that we get normal uuid back when we re-connect
         session.client_protocol_handler = ProtocolHandler
-        result_set = session.execute("SELECT schema_version FROM system.local")
-        uuid_type = result_set[0][0]
+        result_set = session.execute("SELECT schema_version FROM system.local WHERE key='local'")
+        uuid_type = result_set.one()[0]
         self.assertEqual(type(uuid_type), uuid.UUID)
         cluster.shutdown()
 
@@ -117,7 +113,7 @@ class CustomProtocolHandlerTest(unittest.TestCase):
 
         # verify data
         params = get_all_primitive_params(0)
-        results = session.execute("SELECT {0} FROM alltypes WHERE primkey=0".format(columns_string))[0]
+        results = session.execute("SELECT {0} FROM alltypes WHERE primkey=0".format(columns_string)).one()
         for expected, actual in zip(params, results):
             self.assertEqual(actual, expected)
         # Ensure we have covered the various primitive types
@@ -267,7 +263,7 @@ class CustomResultMessageRaw(ResultMessage):
     my_type_codes[0xc] = UUIDType
     type_codes = my_type_codes
 
-    def recv_results_rows(self, f, protocol_version, user_type_map, result_metadata):
+    def recv_results_rows(self, f, protocol_version, user_type_map, result_metadata, column_encryption_policy):
             self.recv_results_metadata(f, user_type_map)
             column_metadata = self.column_metadata or result_metadata
             rowcount = read_int(f)
@@ -296,7 +292,7 @@ class CustomResultMessageTracked(ResultMessage):
     type_codes = my_type_codes
     checked_rev_row_set = set()
 
-    def recv_results_rows(self, f, protocol_version, user_type_map, result_metadata):
+    def recv_results_rows(self, f, protocol_version, user_type_map, result_metadata, column_encryption_policy):
         self.recv_results_metadata(f, user_type_map)
         column_metadata = self.column_metadata or result_metadata
         rowcount = read_int(f)

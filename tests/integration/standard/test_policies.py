@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 from cassandra.cluster import ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import HostFilterPolicy, RoundRobinPolicy,  SimpleConvictionPolicy, \
-    WhiteListRoundRobinPolicy
+    WhiteListRoundRobinPolicy, ExponentialBackoffRetryPolicy, ColDesc
 from cassandra.pool import Host
 from cassandra.connection import DefaultEndPoint
 
@@ -62,7 +59,7 @@ class HostFilterPolicyTests(unittest.TestCase):
 
         queried_hosts = set()
         for _ in range(10):
-            response = session.execute("SELECT * from system.local")
+            response = session.execute("SELECT * from system.local WHERE key='local'")
             queried_hosts.update(response.response_future.attempted_hosts)
 
         self.assertEqual(queried_hosts, single_host)
@@ -73,7 +70,7 @@ class HostFilterPolicyTests(unittest.TestCase):
 
         queried_hosts = set()
         for _ in range(10):
-            response = session.execute("SELECT * from system.local")
+            response = session.execute("SELECT * from system.local WHERE key='local'")
             queried_hosts.update(response.response_future.attempted_hosts)
         self.assertEqual(queried_hosts, all_hosts)
 
@@ -89,7 +86,24 @@ class WhiteListRoundRobinPolicyTests(unittest.TestCase):
         session = cluster.connect(wait_for_all_pools=True)
         queried_hosts = set()
         for _ in range(10):
-            response = session.execute('SELECT * from system.local', execution_profile="white_list")
+            response = session.execute("SELECT * from system.local WHERE key='local'", execution_profile="white_list")
             queried_hosts.update(response.response_future.attempted_hosts)
         queried_hosts = set(host.address for host in queried_hosts)
         self.assertEqual(queried_hosts, only_connect_hosts)
+
+
+class ExponentialRetryPolicyTests(unittest.TestCase):
+
+    def setUp(self):
+        self.cluster = TestCluster(default_retry_policy=ExponentialBackoffRetryPolicy(max_num_retries=3))
+        self.session = self.cluster.connect()
+
+    def tearDown(self):
+        self.cluster.shutdown()
+
+    def test_exponential_retries(self):
+        self.session.execute(
+            """
+            CREATE KEYSPACE preparedtests
+            WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
+            """)

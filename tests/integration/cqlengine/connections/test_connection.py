@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 
 from cassandra import ConsistencyLevel
@@ -32,6 +29,7 @@ from tests.integration.cqlengine import DEFAULT_KEYSPACE, setup_connection
 
 
 class TestConnectModel(Model):
+    __test__ = False
 
     id = columns.Integer(primary_key=True)
     keyspace = columns.Text()

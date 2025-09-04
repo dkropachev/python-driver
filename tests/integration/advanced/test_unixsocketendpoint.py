@@ -11,10 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License
-try:
-    import unittest2 as unittest
-except ImportError:
-    import unittest  # noqa
+import unittest
 
 import time
 import subprocess
@@ -74,4 +71,4 @@ class UnixSocketTest(unittest.TestCase):
 
     def test_unix_socket_connection(self):
         s = self.cluster.connect()
-        s.execute('select * from system.local')
+        s.execute("select * from system.local where key='local'")
