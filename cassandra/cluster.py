@@ -838,8 +838,8 @@ class Cluster(object):
     Using ssl_options without ssl_context is deprecated and will be removed in the
     next major release.
 
-    An optional dict which will be used as kwargs for ``ssl.SSLContext.wrap_socket`` 
-    when new sockets are created. This should be used when client encryption is enabled 
+    An optional dict which will be used as kwargs for ``ssl.SSLContext.wrap_socket``
+    when new sockets are created. This should be used when client encryption is enabled
     in Cassandra.
 
     The following documentation only applies when ssl_options is used without ssl_context.
@@ -1086,10 +1086,10 @@ class Cluster(object):
     """
     Specifies a server-side timeout (in seconds) for all internal driver queries,
     such as schema metadata lookups and cluster topology requests.
-    
+
     The timeout is enforced by appending `USING TIMEOUT <timeout>` to queries
     executed by the driver.
-    
+
     - A value of `0` disables explicit timeout enforcement. In this case,
       the driver does not add `USING TIMEOUT`, and the timeout is determined
       by the server's defaults.
@@ -1683,14 +1683,7 @@ class Cluster(object):
                     "http://datastax.github.io/python-driver/api/cassandra/cluster.html#cassandra.cluster.Cluster.protocol_version", self.protocol_version, new_version, host_endpoint)
         self.protocol_version = new_version
 
-    def _add_resolved_hosts(self):
-        for endpoint in self.endpoints_resolved:
-            host, new = self.add_host(endpoint, signal=False)
-            if new:
-                host.set_up()
-                for listener in self.listeners:
-                    listener.on_add(host)
-
+    def _populate_hosts(self):
         self.profile_manager.populate(
             weakref.proxy(self), self.metadata.all_hosts())
         self.load_balancing_policy.populate(
@@ -1717,17 +1710,10 @@ class Cluster(object):
                           self.contact_points, self.protocol_version)
                 self.connection_class.initialize_reactor()
                 _register_cluster_shutdown(self)
-                
-                self._add_resolved_hosts()
 
                 try:
                     self.control_connection.connect()
-
-                    # we set all contact points up for connecting, but we won't infer state after this
-                    for endpoint in self.endpoints_resolved:
-                        h = self.metadata.get_host(endpoint)
-                        if h and self.profile_manager.distance(h) == HostDistance.IGNORED:
-                            h.is_up = None
+                    self._populate_hosts()
 
                     log.debug("Control connection created")
                 except Exception:
@@ -2016,13 +2002,13 @@ class Cluster(object):
 
         log.debug("Handling new host %r and notifying listeners", host)
 
+        self.profile_manager.on_add(host)
+        self.control_connection.on_add(host, refresh_nodes)
+
         distance = self.profile_manager.distance(host)
         if distance != HostDistance.IGNORED:
             self._prepare_all_queries(host)
             log.debug("Done preparing queries for new host %r", host)
-
-        self.profile_manager.on_add(host)
-        self.control_connection.on_add(host, refresh_nodes)
 
         if distance == HostDistance.IGNORED:
             log.debug("Not adding connection pool for new host %r because the "
@@ -3534,24 +3520,22 @@ class ControlConnection(object):
         if old:
             log.debug("[control connection] Closing old connection %r, replacing with %r", old, conn)
             old.close()
-    
-    def _connect_host_in_lbp(self):
-        errors = {}
-        lbp = (
-            self._cluster.load_balancing_policy
-            if self._cluster._config_mode == _ConfigMode.LEGACY else
-            self._cluster._default_load_balancing_policy
-        )
 
-        for host in lbp.make_query_plan():
+    def _try_connect_to_hosts(self):
+        errors = {}
+
+        lbp = self._cluster.load_balancing_policy \
+            if self._cluster._config_mode == _ConfigMode.LEGACY else self._cluster._default_load_balancing_policy
+
+        for endpoint in chain((host.endpoint for host in lbp.make_query_plan()), self._cluster.endpoints_resolved):
             try:
-                return (self._try_connect(host), None)
+                return (self._try_connect(endpoint), None)
             except Exception as exc:
-                errors[str(host.endpoint)] = exc
-                log.warning("[control connection] Error connecting to %s:", host, exc_info=True)
+                errors[str(endpoint)] = exc
+                log.warning("[control connection] Error connecting to %s:", endpoint, exc_info=True)
             if self._is_shutdown:
                 raise DriverException("[control connection] Reconnection in progress during shutdown")
-        
+
         return (None, errors)
 
     def _reconnect_internal(self):
@@ -3563,43 +3547,43 @@ class ControlConnection(object):
         to the exception that was raised when an attempt was made to open
         a connection to that host.
         """
-        (conn, _) = self._connect_host_in_lbp()
+        (conn, _) = self._try_connect_to_hosts()
         if conn is not None:
             return conn
 
         # Try to re-resolve hostnames as a fallback when all hosts are unreachable
         self._cluster._resolve_hostnames()
 
-        self._cluster._add_resolved_hosts()
+        self._cluster._populate_hosts()
 
-        (conn, errors) = self._connect_host_in_lbp()
+        (conn, errors) = self._try_connect_to_hosts()
         if conn is not None:
             return conn
-        
+
         raise NoHostAvailable("Unable to connect to any servers", errors)
 
-    def _try_connect(self, host):
+    def _try_connect(self, endpoint):
         """
         Creates a new Connection, registers for pushed events, and refreshes
         node/token and schema metadata.
         """
-        log.debug("[control connection] Opening new connection to %s", host)
+        log.debug("[control connection] Opening new connection to %s", endpoint)
 
         while True:
             try:
-                connection = self._cluster.connection_factory(host.endpoint, is_control_connection=True)
+                connection = self._cluster.connection_factory(endpoint, is_control_connection=True)
                 if self._is_shutdown:
                     connection.close()
                     raise DriverException("Reconnecting during shutdown")
                 break
             except ProtocolVersionUnsupported as e:
-                self._cluster.protocol_downgrade(host.endpoint, e.startup_version)
+                self._cluster.protocol_downgrade(endpoint, e.startup_version)
             except ProtocolException as e:
                 # protocol v5 is out of beta in C* >=4.0-beta5 and is now the default driver
                 # protocol version. If the protocol version was not explicitly specified,
                 # and that the server raises a beta protocol error, we should downgrade.
                 if not self._cluster._protocol_version_explicit and e.is_beta_protocol_error:
-                    self._cluster.protocol_downgrade(host.endpoint, self._cluster.protocol_version)
+                    self._cluster.protocol_downgrade(endpoint, self._cluster.protocol_version)
                 else:
                     raise
 
@@ -3812,69 +3796,8 @@ class ControlConnection(object):
             local_row = local_rows[0]
             cluster_name = local_row["cluster_name"]
             self._cluster.metadata.cluster_name = cluster_name
-
             partitioner = local_row.get("partitioner")
-            tokens = local_row.get("tokens")
-
-            host = self._cluster.metadata.get_host(connection.original_endpoint)
-            if host:
-                datacenter = local_row.get("data_center")
-                rack = local_row.get("rack")
-                self._update_location_info(host, datacenter, rack)
-
-                # support the use case of connecting only with public address
-                if isinstance(self._cluster.endpoint_factory, SniEndPointFactory):
-                    new_endpoint = self._cluster.endpoint_factory.create(local_row)
-
-                    if new_endpoint.address:
-                        host.endpoint = new_endpoint
-
-                host.host_id = local_row.get("host_id")
-
-                found_host_ids.add(host.host_id)
-                found_endpoints.add(host.endpoint)
-
-                host.listen_address = local_row.get("listen_address")
-                host.listen_port = local_row.get("listen_port")
-                host.broadcast_address = _NodeInfo.get_broadcast_address(local_row)
-                host.broadcast_port = _NodeInfo.get_broadcast_port(local_row)
-
-                host.broadcast_rpc_address = _NodeInfo.get_broadcast_rpc_address(local_row)
-                host.broadcast_rpc_port = _NodeInfo.get_broadcast_rpc_port(local_row)
-                if host.broadcast_rpc_address is None:
-                    if self._token_meta_enabled:
-                        # local rpc_address is not available, use the connection endpoint
-                        host.broadcast_rpc_address = connection.endpoint.address
-                        host.broadcast_rpc_port = connection.endpoint.port
-                    else:
-                        # local rpc_address has not been queried yet, try to fetch it
-                        # separately, which might fail because C* < 2.1.6 doesn't have rpc_address
-                        # in system.local. See CASSANDRA-9436.
-                        local_rpc_address_query = QueryMessage(
-                            query=maybe_add_timeout_to_query(self._SELECT_LOCAL_NO_TOKENS_RPC_ADDRESS, self._metadata_request_timeout),
-                            consistency_level=ConsistencyLevel.ONE)
-                        success, local_rpc_address_result = connection.wait_for_response(
-                            local_rpc_address_query, timeout=self._timeout, fail_on_error=False)
-                        if success:
-                            row = dict_factory(
-                                local_rpc_address_result.column_names,
-                                local_rpc_address_result.parsed_rows)
-                            host.broadcast_rpc_address = _NodeInfo.get_broadcast_rpc_address(row[0])
-                            host.broadcast_rpc_port = _NodeInfo.get_broadcast_rpc_port(row[0])
-                        else:
-                            host.broadcast_rpc_address = connection.endpoint.address
-                            host.broadcast_rpc_port = connection.endpoint.port
-
-                host.release_version = local_row.get("release_version")
-                host.dse_version = local_row.get("dse_version")
-                host.dse_workload = local_row.get("workload")
-                host.dse_workloads = local_row.get("workloads")
-
-                if partitioner and tokens:
-                    token_map[host] = tokens
-
-                self._cluster.metadata.update_host(host, old_endpoint=connection.endpoint)
-                connection.original_endpoint = connection.endpoint = host.endpoint
+            peers_result.insert(0, local_row)
         # Check metadata.partitioner to see if we haven't built anything yet. If
         # every node in the cluster was in the contact points, we won't discover
         # any new nodes, so we need this additional check.  (See PYTHON-90)
@@ -4173,8 +4096,9 @@ class ControlConnection(object):
                 query_template = (self._SELECT_SCHEMA_PEERS_TEMPLATE
                                   if peers_query_type == self.PeersQueryType.PEERS_SCHEMA
                                   else self._SELECT_PEERS_NO_TOKENS_TEMPLATE)
-                host_release_version = self._cluster.metadata.get_host(connection.original_endpoint).release_version
-                host_dse_version = self._cluster.metadata.get_host(connection.original_endpoint).dse_version
+                original_endpoint_host = self._cluster.metadata.get_host(connection.original_endpoint)
+                host_release_version = None if original_endpoint_host is None else original_endpoint_host.release_version
+                host_dse_version = None if original_endpoint_host is None else original_endpoint_host.dse_version
                 uses_native_address_query = (
                     host_dse_version and Version(host_dse_version) >= self._MINIMUM_NATIVE_ADDRESS_DSE_VERSION)
 
