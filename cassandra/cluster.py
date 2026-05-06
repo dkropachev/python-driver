@@ -2076,7 +2076,9 @@ class Cluster(object):
 
         have_future = False
         add_aborted = False
-        futures = set()
+        futures = {}
+        futures_lock = Lock()
+        futures_results = []
         finalize_add = None
         try:
             self.profile_manager.on_add(host)
@@ -2092,12 +2094,9 @@ class Cluster(object):
                           "load balancing policy has marked it as IGNORED", host)
                 finalize_add = False
             else:
-                futures_lock = Lock()
-                futures_results = []
-
                 def future_completed(future):
                     with futures_lock:
-                        futures.discard(future)
+                        futures.pop(future, None)
 
                         if add_aborted:
                             return
@@ -2128,7 +2127,7 @@ class Cluster(object):
                     future = session.add_or_renew_pool(host, is_host_addition=True)
                     if future is not None:
                         have_future = True
-                        futures.add(future)
+                        futures[future] = session
 
                 for future in tuple(futures):
                     future.add_done_callback(future_completed)
@@ -2137,8 +2136,9 @@ class Cluster(object):
                     finalize_add = True
         except Exception:
             add_aborted = True
-            for future in tuple(futures):
-                future.cancel()
+            for future, session in tuple(futures.items()):
+                if not future.cancel():
+                    future.add_done_callback(lambda f, session=session: session.remove_pool(host))
             self._cleanup_failed_on_add_handling(host)
             raise
 

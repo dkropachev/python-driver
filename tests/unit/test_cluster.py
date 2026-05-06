@@ -126,6 +126,49 @@ class ClusterTest(unittest.TestCase):
         finally:
             cluster.shutdown()
 
+    def test_on_add_removes_pool_created_by_running_future_after_add_aborts(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        running_future = Future()
+        running_future.set_running_or_notify_cancel()
+
+        class RunningPoolSession(object):
+
+            def __init__(self):
+                self.pool_created = False
+                self.remove_pool_calls = 0
+                self.update_created_pools = Mock(return_value=set())
+
+            def add_or_renew_pool(self, add_host, is_host_addition):
+                return running_future
+
+            def remove_pool(self, remove_host):
+                self.remove_pool_calls += 1
+                if remove_host is host and self.pool_created:
+                    self.pool_created = False
+
+            def shutdown(self):
+                pass
+
+        running_session = RunningPoolSession()
+        failing_session = Mock()
+        failing_session.add_or_renew_pool.side_effect = RuntimeError("pool add failed")
+        failing_session.update_created_pools.return_value = set()
+        cluster.sessions = [running_session, failing_session]
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            assert running_session.remove_pool_calls == 1
+
+            running_session.pool_created = True
+            running_future.set_result(True)
+
+            assert running_session.pool_created is False
+        finally:
+            cluster.shutdown()
+
     def test_on_add_excludes_host_from_query_plan_when_pool_future_fails(self):
         cluster = Cluster(protocol_version=4)
         host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
