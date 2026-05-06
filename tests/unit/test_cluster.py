@@ -137,10 +137,18 @@ class ClusterTest(unittest.TestCase):
             def __init__(self):
                 self.pool_created = False
                 self.remove_pool_calls = 0
+                self.generation = None
                 self.update_created_pools = Mock(return_value=set())
 
             def add_or_renew_pool(self, add_host, is_host_addition):
+                self.generation = getattr(add_host, "_node_addition_generation", None)
                 return running_future
+
+            def complete_running_pool_creation(self, add_host):
+                current_generation = getattr(add_host, "_node_addition_generation", None)
+                if self.generation is None or current_generation is self.generation:
+                    self.pool_created = True
+                running_future.set_result(True)
 
             def remove_pool(self, remove_host):
                 self.remove_pool_calls += 1
@@ -162,12 +170,102 @@ class ClusterTest(unittest.TestCase):
 
             assert running_session.remove_pool_calls == 1
 
-            running_session.pool_created = True
-            running_future.set_result(True)
+            running_session.complete_running_pool_creation(host)
 
             assert running_session.pool_created is False
         finally:
             cluster.shutdown()
+
+    def test_on_add_aborted_future_does_not_remove_newer_successful_pool(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+
+        class FencedPoolSession(object):
+
+            def __init__(self):
+                self.pool = None
+                self.add_calls = 0
+                self.stale_future = Future()
+                self.stale_future.set_running_or_notify_cancel()
+                self.stale_generation = None
+                self.update_created_pools = Mock(return_value=set())
+
+            def add_or_renew_pool(self, add_host, is_host_addition):
+                self.add_calls += 1
+                if self.add_calls == 1:
+                    self.stale_generation = getattr(add_host, "_node_addition_generation", None)
+                    return self.stale_future
+
+                self.pool = "fresh-pool"
+                completed_future = Future()
+                completed_future.set_result(True)
+                return completed_future
+
+            def complete_stale_pool_creation(self, add_host):
+                current_generation = getattr(add_host, "_node_addition_generation", None)
+                if self.stale_generation is None or current_generation is self.stale_generation:
+                    self.pool = "stale-pool"
+                self.stale_future.set_result(True)
+
+            def remove_pool(self, remove_host):
+                if remove_host is host:
+                    self.pool = None
+
+            def shutdown(self):
+                pass
+
+        pool_session = FencedPoolSession()
+        recovered_future = Future()
+        recovered_future.set_result(True)
+        failing_session = Mock()
+        failing_session.add_or_renew_pool.side_effect = [RuntimeError("pool add failed"), recovered_future]
+        failing_session.update_created_pools.return_value = set()
+        cluster.sessions = [pool_session, failing_session]
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            cluster.on_add(host, refresh_nodes=False)
+            assert pool_session.pool == "fresh-pool"
+
+            pool_session.complete_stale_pool_creation(host)
+
+            assert pool_session.pool == "fresh-pool"
+        finally:
+            cluster.shutdown()
+
+    def test_add_or_renew_pool_does_not_signal_stale_addition_failure(self):
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        host._node_addition_generation = object()
+
+        session = object.__new__(Session)
+        session.cluster = Mock(connect_timeout=1)
+        session.cluster.signal_connection_failure = Mock()
+        session._profile_manager = Mock()
+        session._profile_manager.distance.return_value = HostDistance.LOCAL
+        session.keyspace = None
+        session._pools = {}
+
+        def submit(fn, *args, **kwargs):
+            future = Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+            return future
+
+        session.submit = submit
+
+        def raise_after_add_aborts(*args, **kwargs):
+            host._node_addition_generation = None
+            raise RuntimeError("stale connect failure")
+
+        with patch("cassandra.cluster.HostConnection", side_effect=raise_after_add_aborts):
+            future = session.add_or_renew_pool(host, is_host_addition=True)
+
+        assert future.result() is False
+        session.cluster.signal_connection_failure.assert_not_called()
 
     def test_on_add_excludes_host_from_query_plan_when_pool_future_fails(self):
         cluster = Cluster(protocol_version=4)

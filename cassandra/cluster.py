@@ -1870,8 +1870,11 @@ class Cluster(object):
 
         self._start_reconnector(host, is_host_addition=False)
 
-    def _cleanup_failed_on_add_handling(self, host):
+    def _cleanup_failed_on_add_handling(self, host, addition_generation=None):
         with host.lock:
+            if (addition_generation is not None and
+                    getattr(host, "_node_addition_generation", None) is not addition_generation):
+                return
             host.set_down()
 
         self.profile_manager.on_down(host)
@@ -1880,7 +1883,10 @@ class Cluster(object):
             session.remove_pool(host)
 
         with host.lock:
-            host._currently_handling_node_addition = False
+            if (addition_generation is None or
+                    getattr(host, "_node_addition_generation", None) is addition_generation):
+                host._currently_handling_node_addition = False
+                host._node_addition_generation = None
 
         self._start_reconnector(host, is_host_addition=True)
 
@@ -2068,11 +2074,13 @@ class Cluster(object):
         log.debug("Handling new host %r and notifying listeners", host)
 
         # Keep refresh-time pool rebuilds from racing this host's pool creation.
+        addition_generation = object()
         with host.lock:
             if getattr(host, "_currently_handling_node_addition", False):
                 log.debug("Another thread is already handling add status of node %s", host)
                 return
             host._currently_handling_node_addition = True
+            host._node_addition_generation = addition_generation
 
         have_future = False
         add_aborted = False
@@ -2113,15 +2121,15 @@ class Cluster(object):
 
                     for exc in [f for f in futures_results if isinstance(f, Exception)]:
                         log.error("Unexpected failure while adding node %s, will not mark up:", host, exc_info=exc)
-                        self._cleanup_failed_on_add_handling(host)
+                        self._cleanup_failed_on_add_handling(host, addition_generation)
                         return
 
                     if not all(futures_results):
                         log.warning("Connection pool could not be created, not marking node %s up", host)
-                        self._cleanup_failed_on_add_handling(host)
+                        self._cleanup_failed_on_add_handling(host, addition_generation)
                         return
 
-                    self._finalize_add(host)
+                    self._finalize_add(host, addition_generation=addition_generation)
 
                 for session in tuple(self.sessions):
                     future = session.add_or_renew_pool(host, is_host_addition=True)
@@ -2137,15 +2145,14 @@ class Cluster(object):
         except Exception:
             add_aborted = True
             for future, session in tuple(futures.items()):
-                if not future.cancel():
-                    future.add_done_callback(lambda f, session=session: session.remove_pool(host))
-            self._cleanup_failed_on_add_handling(host)
+                future.cancel()
+            self._cleanup_failed_on_add_handling(host, addition_generation)
             raise
 
         if finalize_add is not None:
-            self._finalize_add(host, set_up=finalize_add)
+            self._finalize_add(host, set_up=finalize_add, addition_generation=addition_generation)
 
-    def _finalize_add(self, host, set_up=True):
+    def _finalize_add(self, host, set_up=True, addition_generation=None):
         try:
             if set_up:
                 host.set_up()
@@ -2158,7 +2165,10 @@ class Cluster(object):
                 session.update_created_pools()
         finally:
             with host.lock:
-                host._currently_handling_node_addition = False
+                if (addition_generation is None or
+                        getattr(host, "_node_addition_generation", None) is addition_generation):
+                    host._currently_handling_node_addition = False
+                    host._node_addition_generation = None
 
     def on_remove(self, host):
         if self.is_shutdown:
@@ -3294,21 +3304,37 @@ class Session(object):
         distance = self._profile_manager.distance(host)
         if distance == HostDistance.IGNORED:
             return None
+        addition_generation = getattr(host, "_node_addition_generation", None) if is_host_addition else None
+
+        def is_stale_addition():
+            return (is_host_addition and
+                    getattr(host, "_node_addition_generation", None) is not addition_generation)
 
         def run_add_or_renew_pool():
+            if is_stale_addition():
+                return False
+
             try:
-               new_pool = HostConnection(host, distance, self)
+                new_pool = HostConnection(host, distance, self)
             except AuthenticationFailed as auth_exc:
+                if is_stale_addition():
+                    return False
                 conn_exc = ConnectionException(str(auth_exc), endpoint=host)
                 self.cluster.signal_connection_failure(host, conn_exc, is_host_addition)
                 return False
             except Exception as conn_exc:
+                if is_stale_addition():
+                    return False
                 log.warning("Failed to create connection pool for new host %s:",
                             host, exc_info=conn_exc)
                 # the host itself will still be marked down, so we need to pass
                 # a special flag to make sure the reconnector is created
                 self.cluster.signal_connection_failure(
                     host, conn_exc, is_host_addition, expect_host_to_be_down=True)
+                return False
+
+            if is_stale_addition():
+                new_pool.shutdown()
                 return False
 
             previous = self._pools.get(host)
@@ -3325,12 +3351,19 @@ class Session(object):
                     new_pool._set_keyspace_for_all_conns(self.keyspace, callback)
                     set_keyspace_event.wait(self.cluster.connect_timeout)
                     if not set_keyspace_event.is_set() or errors_returned:
+                        if is_stale_addition():
+                            new_pool.shutdown()
+                            self._lock.acquire()
+                            return False
                         log.warning("Failed setting keyspace for pool after keyspace changed during connect: %s", errors_returned)
                         self.cluster.on_down(host, is_host_addition)
                         new_pool.shutdown()
                         self._lock.acquire()
                         return False
                     self._lock.acquire()
+                if is_stale_addition():
+                    new_pool.shutdown()
+                    return False
                 self._pools[host] = new_pool
 
             log.debug("Added pool for host %s to session", host)
