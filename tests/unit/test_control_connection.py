@@ -32,9 +32,9 @@ class MockMetadata(object):
 
     def __init__(self):
         self.hosts = {
-            'uuid1': Host(endpoint=DefaultEndPoint("192.168.1.0"), conviction_policy_factory=SimpleConvictionPolicy, host_id='uuid1'),
-            'uuid2': Host(endpoint=DefaultEndPoint("192.168.1.1"), conviction_policy_factory=SimpleConvictionPolicy, host_id='uuid2'),
-            'uuid3': Host(endpoint=DefaultEndPoint("192.168.1.2"), conviction_policy_factory=SimpleConvictionPolicy, host_id='uuid3')
+            'uuid1': Host(endpoint=DefaultEndPoint("192.168.1.0"), conviction_policy_factory=SimpleConvictionPolicy, host_id='uuid1', release_version="3.11"),
+            'uuid2': Host(endpoint=DefaultEndPoint("192.168.1.1"), conviction_policy_factory=SimpleConvictionPolicy, host_id='uuid2', release_version="3.11"),
+            'uuid3': Host(endpoint=DefaultEndPoint("192.168.1.2"), conviction_policy_factory=SimpleConvictionPolicy, host_id='uuid3', release_version="3.11")
         }
         self._host_id_by_endpoint = {
             DefaultEndPoint("192.168.1.0"): 'uuid1',
@@ -43,7 +43,6 @@ class MockMetadata(object):
         }
         for host in self.hosts.values():
             host.set_up()
-            host.release_version = "3.11"
 
         self.cluster_name = None
         self.partitioner = None
@@ -83,14 +82,32 @@ class MockMetadata(object):
         self._host_id_by_endpoint[host.endpoint] = host.host_id
         self._host_id_by_endpoint.pop(old_endpoint, False)
 
+    def replace_host(self, host_id, source=None, **fields):
+        old_host = self.hosts.get(host_id)
+        changed_fields = []
+        for field, value in fields.items():
+            if getattr(old_host, field) != value:
+                changed_fields.append(field)
+
+        if not changed_fields:
+            return old_host, ()
+
+        new_host = old_host.copy_with(**dict((field, fields[field]) for field in changed_fields))
+        self.hosts[host_id] = new_host
+        if 'endpoint' in changed_fields:
+            self._host_id_by_endpoint.pop(old_host.endpoint, False)
+        self._host_id_by_endpoint[new_host.endpoint] = host_id
+        return new_host, tuple(changed_fields)
+
     def all_hosts_items(self):
         return list(self.hosts.items())
 
     def remove_host_by_host_id(self, host_id, endpoint=None):
         if endpoint and self._host_id_by_endpoint[endpoint] == host_id:
             self._host_id_by_endpoint.pop(endpoint, False)
-        self.removed_hosts.append(self.hosts.pop(host_id, False))
-        return bool(self.hosts.pop(host_id, False))
+        removed = self.hosts.pop(host_id, False)
+        self.removed_hosts.append(removed)
+        return bool(removed)
 
 
 class MockCluster(object):
@@ -118,8 +135,8 @@ class MockCluster(object):
         self.added_hosts.append(host)
         return host, True
 
-    def remove_host(self, host):
-        pass
+    def remove_host(self, host, source=None):
+        self.metadata.remove_host_by_host_id(host.host_id, host.endpoint)
 
     def on_up(self, host):
         pass
@@ -420,10 +437,11 @@ class ControlConnectionTest(unittest.TestCase):
         self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
         self.control_connection.refresh_node_list_and_token_map()
         assert 1 == len(self.cluster.added_hosts)
-        assert self.cluster.added_hosts[0].address == "192.168.1.3"
-        assert self.cluster.added_hosts[0].datacenter == "dc1"
-        assert self.cluster.added_hosts[0].rack == "rack1"
-        assert self.cluster.added_hosts[0].host_id == "uuid4"
+        host = self.cluster.metadata.get_host_by_host_id("uuid4")
+        assert host.address == "192.168.1.3"
+        assert host.datacenter == "dc1"
+        assert host.rack == "rack1"
+        assert host.host_id == "uuid4"
 
     def test_refresh_nodes_and_tokens_remove_host(self):
         del self.connection.peer_results[1][1]
@@ -594,14 +612,15 @@ class ControlConnectionTest(unittest.TestCase):
         self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
         self.control_connection.refresh_node_list_and_token_map()
         assert 1 == len(self.cluster.added_hosts)
-        assert self.cluster.added_hosts[0].endpoint.address == "192.168.1.3"
-        assert self.cluster.added_hosts[0].endpoint.port == 555
-        assert self.cluster.added_hosts[0].broadcast_rpc_address == "192.168.1.3"
-        assert self.cluster.added_hosts[0].broadcast_rpc_port == 555
-        assert self.cluster.added_hosts[0].broadcast_address == "10.0.0.3"
-        assert self.cluster.added_hosts[0].broadcast_port == 666
-        assert self.cluster.added_hosts[0].datacenter == "dc1"
-        assert self.cluster.added_hosts[0].rack == "rack1"
+        host = self.cluster.metadata.get_host_by_host_id("uuid4")
+        assert host.endpoint.address == "192.168.1.3"
+        assert host.endpoint.port == 555
+        assert host.broadcast_rpc_address == "192.168.1.3"
+        assert host.broadcast_rpc_port == 555
+        assert host.broadcast_address == "10.0.0.3"
+        assert host.broadcast_port == 666
+        assert host.datacenter == "dc1"
+        assert host.rack == "rack1"
 
     def test_refresh_nodes_and_tokens_add_host_detects_invalid_port(self):
         del self.connection.peer_results[:]
@@ -614,14 +633,15 @@ class ControlConnectionTest(unittest.TestCase):
         self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
         self.control_connection.refresh_node_list_and_token_map()
         assert 1 == len(self.cluster.added_hosts)
-        assert self.cluster.added_hosts[0].endpoint.address == "192.168.1.3"
-        assert self.cluster.added_hosts[0].endpoint.port == 9042  # fallback default
-        assert self.cluster.added_hosts[0].broadcast_rpc_address == "192.168.1.3"
-        assert self.cluster.added_hosts[0].broadcast_rpc_port == None
-        assert self.cluster.added_hosts[0].broadcast_address == "10.0.0.3"
-        assert self.cluster.added_hosts[0].broadcast_port == None
-        assert self.cluster.added_hosts[0].datacenter == "dc1"
-        assert self.cluster.added_hosts[0].rack == "rack1"
+        host = self.cluster.metadata.get_host_by_host_id("uuid4")
+        assert host.endpoint.address == "192.168.1.3"
+        assert host.endpoint.port == 9042  # fallback default
+        assert host.broadcast_rpc_address == "192.168.1.3"
+        assert host.broadcast_rpc_port == None
+        assert host.broadcast_address == "10.0.0.3"
+        assert host.broadcast_port == None
+        assert host.datacenter == "dc1"
+        assert host.rack == "rack1"
 
 
 class EventTimingTest(unittest.TestCase):

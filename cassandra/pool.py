@@ -32,9 +32,14 @@ except ImportError:
 
 from cassandra import AuthenticationFailed
 from cassandra.connection import ConnectionException, EndPoint, DefaultEndPoint
+from cassandra.events import (DriverEvent, HOST, HOST_CHANGED,
+                              HostEventPayload)
 from cassandra.policies import HostDistance
 
 log = logging.getLogger(__name__)
+
+
+_NOT_SET = object()
 
 
 class NoConnectionsAvailable(Exception):
@@ -43,6 +48,76 @@ class NoConnectionsAvailable(Exception):
     no open connections.
     """
     pass
+
+
+class HostRuntimeState(object):
+    """
+    Mutable runtime state shared by Host topology snapshots for one host_id.
+    """
+
+    def __init__(self, conviction_policy_factory, host=None, event_bus=None):
+        if conviction_policy_factory is None:
+            raise ValueError("conviction_policy_factory may not be None")
+
+        self.lock = RLock()
+        self.conviction_policy = conviction_policy_factory(host)
+        self.is_up = None
+        self._reconnection_handler = None
+        self._currently_handling_node_up = False
+        self.sharding_info = None
+        self._event_bus = event_bus
+        self._host = None
+        if host is not None:
+            self.bind_host(host)
+
+    def bind_host(self, host):
+        self._host = host
+        try:
+            self.conviction_policy.host = host
+        except AttributeError:
+            pass
+
+    def set_event_bus(self, event_bus):
+        self._event_bus = event_bus
+
+    def set_up(self, host):
+        if not self.is_up:
+            log.debug("Host %s is now marked up", host.endpoint)
+        self.conviction_policy.reset()
+        self.is_up = True
+
+    def set_down(self):
+        self.is_up = False
+
+    def signal_connection_failure(self, connection_exc):
+        return self.conviction_policy.add_failure(connection_exc)
+
+    def is_currently_reconnecting(self):
+        return self._reconnection_handler is not None
+
+    def get_and_set_reconnection_handler(self, new_handler):
+        with self.lock:
+            old = self._reconnection_handler
+            self._reconnection_handler = new_handler
+            return old
+
+    def set_sharding_info(self, host, sharding_info, source=None):
+        with self.lock:
+            old_sharding_info = self.sharding_info
+            if old_sharding_info == sharding_info:
+                return False
+            self.sharding_info = sharding_info
+
+        if self._event_bus:
+            payload = HostEventPayload(
+                host=host,
+                old_host=host,
+                new_host=host,
+                changed_fields=("sharding_info",),
+                old_values={"sharding_info": old_sharding_info},
+                new_values={"sharding_info": sharding_info})
+            self._event_bus.publish(DriverEvent(HOST_CHANGED, HOST, payload, source or host))
+        return True
 
 
 @total_ordering
@@ -160,26 +235,53 @@ class Host(object):
 
     _datacenter = None
     _rack = None
-    _reconnection_handler = None
-    lock = None
 
-    _currently_handling_node_up = False
+    _IMMUTABLE_FIELDS = frozenset((
+        "endpoint", "host_id", "_datacenter", "_rack", "broadcast_address",
+        "broadcast_port", "broadcast_rpc_address", "broadcast_rpc_port",
+        "listen_address", "listen_port", "release_version", "dse_version",
+        "dse_workload", "dse_workloads"))
 
-    sharding_info = None
-
-    def __init__(self, endpoint, conviction_policy_factory, datacenter=None, rack=None, host_id=None):
+    def __init__(self, endpoint, conviction_policy_factory, datacenter=None, rack=None,
+                 host_id=None, broadcast_address=None, broadcast_port=None,
+                 broadcast_rpc_address=None, broadcast_rpc_port=None,
+                 listen_address=None, listen_port=None, release_version=None,
+                 dse_version=None, dse_workload=None, dse_workloads=None,
+                 runtime_state=None, event_bus=None):
         if endpoint is None:
             raise ValueError("endpoint may not be None")
-        if conviction_policy_factory is None:
+        if conviction_policy_factory is None and runtime_state is None:
             raise ValueError("conviction_policy_factory may not be None")
-
-        self.endpoint = endpoint if isinstance(endpoint, EndPoint) else DefaultEndPoint(endpoint)
-        self.conviction_policy = conviction_policy_factory(self)
         if not host_id:
             raise ValueError("host_id may not be None")
-        self.host_id = host_id
-        self.set_location_info(datacenter, rack)
-        self.lock = RLock()
+
+        object.__setattr__(self, "_initialized", False)
+        object.__setattr__(self, "endpoint", endpoint if isinstance(endpoint, EndPoint) else DefaultEndPoint(endpoint))
+        object.__setattr__(self, "host_id", host_id)
+        object.__setattr__(self, "_datacenter", datacenter)
+        object.__setattr__(self, "_rack", rack)
+        object.__setattr__(self, "broadcast_address", broadcast_address)
+        object.__setattr__(self, "broadcast_port", broadcast_port)
+        object.__setattr__(self, "broadcast_rpc_address", broadcast_rpc_address)
+        object.__setattr__(self, "broadcast_rpc_port", broadcast_rpc_port)
+        object.__setattr__(self, "listen_address", listen_address)
+        object.__setattr__(self, "listen_port", listen_port)
+        object.__setattr__(self, "release_version", release_version)
+        object.__setattr__(self, "dse_version", dse_version)
+        object.__setattr__(self, "dse_workload", dse_workload)
+        object.__setattr__(self, "dse_workloads", dse_workloads)
+
+        runtime_state = runtime_state or HostRuntimeState(conviction_policy_factory, self, event_bus=event_bus)
+        runtime_state.bind_host(self)
+        if event_bus is not None:
+            runtime_state.set_event_bus(event_bus)
+        object.__setattr__(self, "_runtime", runtime_state)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_initialized", False) and name in self._IMMUTABLE_FIELDS:
+            raise AttributeError("Host topology field %r is immutable; replace the Host snapshot instead" % (name,))
+        object.__setattr__(self, name, value)
 
     @property
     def address(self):
@@ -199,50 +301,117 @@ class Host(object):
         """ The rack the node is in.  """
         return self._rack
 
+    @property
+    def lock(self):
+        return self._runtime.lock
+
+    @property
+    def conviction_policy(self):
+        return self._runtime.conviction_policy
+
+    @property
+    def is_up(self):
+        return self._runtime.is_up
+
+    @is_up.setter
+    def is_up(self, value):
+        self._runtime.is_up = value
+
+    @property
+    def sharding_info(self):
+        return self._runtime.sharding_info
+
+    @sharding_info.setter
+    def sharding_info(self, value):
+        self._runtime.set_sharding_info(self, value)
+
+    @property
+    def _reconnection_handler(self):
+        return self._runtime._reconnection_handler
+
+    @_reconnection_handler.setter
+    def _reconnection_handler(self, value):
+        self._runtime._reconnection_handler = value
+
+    @property
+    def _currently_handling_node_up(self):
+        return self._runtime._currently_handling_node_up
+
+    @_currently_handling_node_up.setter
+    def _currently_handling_node_up(self, value):
+        self._runtime._currently_handling_node_up = value
+
+    @property
+    def runtime_state(self):
+        return self._runtime
+
     def set_location_info(self, datacenter, rack):
         """
-        Sets the datacenter and rack for this node. Intended for internal
-        use (by the control connection, which periodically checks the
-        ring topology) only.
+        Return a Host snapshot with updated datacenter and rack.
+
+        Host topology is immutable after construction.  Callers that need to
+        publish topology changes should use :meth:`Metadata.replace_host` so
+        related caches observe a single HOST_CHANGED event.
         """
-        self._datacenter = datacenter
-        self._rack = rack
+        return self.copy_with(datacenter=datacenter, rack=rack)
+
+    def copy_with(self, endpoint=_NOT_SET, datacenter=_NOT_SET, rack=_NOT_SET,
+                  broadcast_address=_NOT_SET, broadcast_port=_NOT_SET,
+                  broadcast_rpc_address=_NOT_SET, broadcast_rpc_port=_NOT_SET,
+                  listen_address=_NOT_SET, listen_port=_NOT_SET,
+                  release_version=_NOT_SET, dse_version=_NOT_SET,
+                  dse_workload=_NOT_SET, dse_workloads=_NOT_SET,
+                  runtime_state=_NOT_SET):
+        """
+        Return a new immutable topology snapshot that shares this host's runtime state.
+        """
+        runtime_state = self._runtime if runtime_state is _NOT_SET else runtime_state
+        return Host(
+            self.endpoint if endpoint is _NOT_SET else endpoint,
+            lambda host: runtime_state.conviction_policy,
+            self.datacenter if datacenter is _NOT_SET else datacenter,
+            self.rack if rack is _NOT_SET else rack,
+            host_id=self.host_id,
+            broadcast_address=self.broadcast_address if broadcast_address is _NOT_SET else broadcast_address,
+            broadcast_port=self.broadcast_port if broadcast_port is _NOT_SET else broadcast_port,
+            broadcast_rpc_address=self.broadcast_rpc_address if broadcast_rpc_address is _NOT_SET else broadcast_rpc_address,
+            broadcast_rpc_port=self.broadcast_rpc_port if broadcast_rpc_port is _NOT_SET else broadcast_rpc_port,
+            listen_address=self.listen_address if listen_address is _NOT_SET else listen_address,
+            listen_port=self.listen_port if listen_port is _NOT_SET else listen_port,
+            release_version=self.release_version if release_version is _NOT_SET else release_version,
+            dse_version=self.dse_version if dse_version is _NOT_SET else dse_version,
+            dse_workload=self.dse_workload if dse_workload is _NOT_SET else dse_workload,
+            dse_workloads=self.dse_workloads if dse_workloads is _NOT_SET else dse_workloads,
+            runtime_state=runtime_state)
 
     def set_up(self):
-        if not self.is_up:
-            log.debug("Host %s is now marked up", self.endpoint)
-        self.conviction_policy.reset()
-        self.is_up = True
+        self._runtime.set_up(self)
 
     def set_down(self):
-        self.is_up = False
+        self._runtime.set_down()
 
     def signal_connection_failure(self, connection_exc):
-        return self.conviction_policy.add_failure(connection_exc)
+        return self._runtime.signal_connection_failure(connection_exc)
 
     def is_currently_reconnecting(self):
-        return self._reconnection_handler is not None
+        return self._runtime.is_currently_reconnecting()
 
     def get_and_set_reconnection_handler(self, new_handler):
         """
         Atomically replaces the reconnection handler for this
         host.  Intended for internal use only.
         """
-        with self.lock:
-            old = self._reconnection_handler
-            self._reconnection_handler = new_handler
-            return old
+        return self._runtime.get_and_set_reconnection_handler(new_handler)
 
     def __eq__(self, other):
-        if isinstance(other, Host):
-            return self.endpoint == other.endpoint
-        else:  # TODO Backward compatibility, remove next major
-            return self.endpoint.address == other
+        return isinstance(other, Host) and self.host_id == other.host_id
 
     def __hash__(self):
-        return hash(self.endpoint)
+        return hash(self.host_id)
 
     def __lt__(self, other):
+        if self.endpoint == other.endpoint:
+            return str(self.host_id) < str(other.host_id)
         return self.endpoint < other.endpoint
 
     def __str__(self):
@@ -441,6 +610,13 @@ class HostConnection(object):
         self.tablets_routing_v1 = first_connection.features.tablets_routing_v1
 
         log.debug("Finished initializing connection for host %s", self.host)
+
+    def rebind_host(self, host):
+        with self._lock:
+            old_host = self.host
+            self.host = host
+        if old_host is not host:
+            log.debug("Rebound connection pool from host %s to %s", old_host, host)
 
     def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None):
         if self.is_shutdown:
@@ -920,5 +1096,3 @@ class HostConnection(object):
     @property
     def _excess_connection_limit(self):
         return self.host.sharding_info.shards_count * self.max_excess_connections_per_shard_multiplier
-
-

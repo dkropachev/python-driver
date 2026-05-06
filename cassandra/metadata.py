@@ -37,6 +37,7 @@ except ImportError as e:
 from cassandra import SignatureDescriptor, ConsistencyLevel, InvalidRequest, Unauthorized
 import cassandra.cqltypes as types
 from cassandra.encoder import Encoder
+from cassandra.events import DriverEvent, HOST, HOST_CHANGED, HostEventPayload
 from cassandra.marshal import varint_unpack
 from cassandra.protocol import QueryMessage
 from cassandra.query import dict_factory, bind_params
@@ -121,13 +122,21 @@ class Metadata(object):
     dbaas = False
     """ A boolean indicating if connected to a DBaaS cluster """
 
-    def __init__(self):
+    def __init__(self, event_bus=None):
         self.keyspaces = {}
         self.dbaas = False
         self._hosts = {}
         self._host_id_by_endpoint = {}
+        self._runtime_states = {}
+        self._event_bus = event_bus
         self._hosts_lock = RLock()
         self._tablets = Tablets({})
+
+    def set_event_bus(self, event_bus):
+        self._event_bus = event_bus
+        with self._hosts_lock:
+            for runtime_state in self._runtime_states.values():
+                runtime_state.set_event_bus(event_bus)
 
     def export_schema_as_string(self):
         """
@@ -340,6 +349,7 @@ class Metadata(object):
             try:
                 return self._hosts[host.host_id], False
             except KeyError:
+                host = self._bind_runtime_state(host)
                 self._host_id_by_endpoint[host.endpoint] = host.host_id
                 self._hosts[host.host_id] = host
                 return host, True
@@ -347,14 +357,22 @@ class Metadata(object):
     def remove_host(self, host):
         self._tablets.drop_tablets_by_host_id(host.host_id)
         with self._hosts_lock:
+            current_host = self._hosts.get(host.host_id)
             self._host_id_by_endpoint.pop(host.endpoint, False)
+            if current_host is not None:
+                self._host_id_by_endpoint.pop(current_host.endpoint, False)
+            self._runtime_states.pop(host.host_id, None)
             return bool(self._hosts.pop(host.host_id, False))
 
     def remove_host_by_host_id(self, host_id, endpoint=None):
         self._tablets.drop_tablets_by_host_id(host_id)
         with self._hosts_lock:
-            if endpoint and self._host_id_by_endpoint[endpoint] == host_id:
+            current_host = self._hosts.get(host_id)
+            if endpoint and self._host_id_by_endpoint.get(endpoint) == host_id:
                 self._host_id_by_endpoint.pop(endpoint, False)
+            if current_host is not None:
+                self._host_id_by_endpoint.pop(current_host.endpoint, False)
+            self._runtime_states.pop(host_id, None)
             return bool(self._hosts.pop(host_id, False))
 
     def update_host(self, host, old_endpoint):
@@ -362,6 +380,65 @@ class Metadata(object):
         with self._hosts_lock:
             self._host_id_by_endpoint.pop(old_endpoint, False)
             self._host_id_by_endpoint[host.endpoint] = host.host_id
+
+    def replace_host(self, host_id, source=None, **fields):
+        """
+        Replace a Host topology snapshot for host_id and publish HOST_CHANGED.
+        """
+        with self._hosts_lock:
+            old_host = self._hosts.get(host_id)
+            if old_host is None:
+                return None, ()
+
+            changed_fields = []
+            old_values = {}
+            new_values = {}
+
+            for field, new_value in fields.items():
+                old_value = getattr(old_host, field)
+                if old_value != new_value:
+                    changed_fields.append(field)
+                    old_values[field] = old_value
+                    new_values[field] = new_value
+
+            if not changed_fields:
+                return old_host, ()
+
+            copy_kwargs = dict((field, fields[field]) for field in changed_fields)
+            new_host = old_host.copy_with(**copy_kwargs)
+            new_host.runtime_state.set_event_bus(self._event_bus)
+            new_host.runtime_state.bind_host(new_host)
+
+            self._hosts[host_id] = new_host
+            if "endpoint" in changed_fields:
+                if self._host_id_by_endpoint.get(old_host.endpoint) == host_id:
+                    self._host_id_by_endpoint.pop(old_host.endpoint, False)
+                self._host_id_by_endpoint[new_host.endpoint] = host_id
+            else:
+                self._host_id_by_endpoint[new_host.endpoint] = host_id
+
+        payload = HostEventPayload(
+            host_id=host_id,
+            old_host=old_host,
+            new_host=new_host,
+            changed_fields=tuple(changed_fields),
+            old_values=old_values,
+            new_values=new_values)
+        if self._event_bus:
+            self._event_bus.publish(DriverEvent(HOST_CHANGED, HOST, payload, source or self))
+        return new_host, tuple(changed_fields)
+
+    def _bind_runtime_state(self, host):
+        runtime_state = self._runtime_states.get(host.host_id)
+        if runtime_state is None:
+            runtime_state = host.runtime_state
+            self._runtime_states[host.host_id] = runtime_state
+        elif host.runtime_state is not runtime_state:
+            host = host.copy_with(runtime_state=runtime_state)
+
+        runtime_state.set_event_bus(self._event_bus)
+        runtime_state.bind_host(host)
+        return host
 
     def get_host(self, endpoint_or_address, port=None):
         """

@@ -101,6 +101,10 @@ class HostStateListener(object):
         """ Called when a node is removed from the cluster. """
         raise NotImplementedError()
 
+    def on_change(self, old_host, new_host, changed_fields):
+        """ Called when immutable topology metadata for a node is replaced. """
+        pass
+
 
 class LoadBalancingPolicy(HostStateListener):
     """
@@ -214,6 +218,15 @@ class RoundRobinPolicy(LoadBalancingPolicy):
         with self._hosts_lock:
             self._live_hosts = self._live_hosts.difference((host, ))
 
+    def on_change(self, old_host, new_host, changed_fields):
+        with self._hosts_lock:
+            if old_host in self._live_hosts:
+                self._live_hosts = frozenset(
+                    new_host if host == old_host else host
+                    for host in self._live_hosts)
+            elif new_host.is_up:
+                self._live_hosts = self._live_hosts.union((new_host, ))
+
 
 class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
     """
@@ -323,6 +336,17 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
 
     def on_remove(self, host):
         self.on_down(host)
+
+    def on_change(self, old_host, new_host, changed_fields):
+        old_dc = self._dc(old_host)
+        with self._hosts_lock:
+            was_live = old_host in self._dc_live_hosts.get(old_dc, ())
+
+        if was_live:
+            self.on_down(old_host)
+            self.on_up(new_host)
+        elif new_host.is_up:
+            self.on_up(new_host)
 
 class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
     """
@@ -449,6 +473,19 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
     def on_remove(self, host):
         self.on_down(host)
 
+    def on_change(self, old_host, new_host, changed_fields):
+        old_dc = self._dc(old_host)
+        old_rack = self._rack(old_host)
+        with self._hosts_lock:
+            was_live = (old_host in self._live_hosts.get((old_dc, old_rack), ()) or
+                        old_host in self._dc_live_hosts.get(old_dc, ()))
+
+        if was_live:
+            self.on_down(old_host)
+            self.on_up(new_host)
+        elif new_host.is_up:
+            self.on_up(new_host)
+
 class TokenAwarePolicy(LoadBalancingPolicy):
     """
     A :class:`.LoadBalancingPolicy` wrapper that adds token awareness to
@@ -540,6 +577,9 @@ class TokenAwarePolicy(LoadBalancingPolicy):
     def on_remove(self, *args, **kwargs):
         return self._child_policy.on_remove(*args, **kwargs)
 
+    def on_change(self, *args, **kwargs):
+        return self._child_policy.on_change(*args, **kwargs)
+
 
 class WhiteListRoundRobinPolicy(RoundRobinPolicy):
     """
@@ -592,6 +632,19 @@ class WhiteListRoundRobinPolicy(RoundRobinPolicy):
     def on_add(self, host):
         if host.address in self._allowed_hosts_resolved:
             RoundRobinPolicy.on_add(self, host)
+
+    def on_change(self, old_host, new_host, changed_fields):
+        old_allowed = old_host.address in self._allowed_hosts_resolved
+        new_allowed = new_host.address in self._allowed_hosts_resolved
+        with self._hosts_lock:
+            was_live = old_host in self._live_hosts
+
+        if was_live and new_allowed:
+            RoundRobinPolicy.on_change(self, old_host, new_host, changed_fields)
+        elif was_live:
+            RoundRobinPolicy.on_down(self, old_host)
+        elif new_allowed and new_host.is_up:
+            RoundRobinPolicy.on_up(self, new_host)
 
 
 class HostFilterPolicy(LoadBalancingPolicy):
@@ -653,6 +706,16 @@ class HostFilterPolicy(LoadBalancingPolicy):
 
     def on_remove(self, host, *args, **kwargs):
         return self._child_policy.on_remove(host, *args, **kwargs)
+
+    def on_change(self, old_host, new_host, changed_fields):
+        old_allowed = self.predicate(old_host)
+        new_allowed = self.predicate(new_host)
+        if old_allowed and new_allowed:
+            return self._child_policy.on_change(old_host, new_host, changed_fields)
+        elif old_allowed:
+            return self._child_policy.on_remove(old_host)
+        elif new_allowed and new_host.is_up:
+            return self._child_policy.on_add(new_host)
 
     @property
     def predicate(self):
@@ -1321,6 +1384,9 @@ class WrapperPolicy(LoadBalancingPolicy):
 
     def on_remove(self, *args, **kwargs):
         return self._child_policy.on_remove(*args, **kwargs)
+
+    def on_change(self, *args, **kwargs):
+        return self._child_policy.on_change(*args, **kwargs)
 
 
 class DefaultLoadBalancingPolicy(WrapperPolicy):

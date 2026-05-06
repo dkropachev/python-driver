@@ -43,6 +43,10 @@ import pytest
 log = logging.getLogger(__name__)
 
 
+def _with_location(host, datacenter, rack):
+    return host.set_location_info(datacenter, rack)
+
+
 class ReplicationFactorTest(unittest.TestCase):
 
     def test_replication_factor_parsing(self):
@@ -193,21 +197,20 @@ class StrategiesTest(unittest.TestCase):
         dc1_1 = Host('dc1.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc1_2 = Host('dc1.2', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc1_3 = Host('dc1.3', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        for host in (dc1_1, dc1_2, dc1_3):
-            host.set_location_info('dc1', 'rack1')
+        dc1_1, dc1_2, dc1_3 = [_with_location(host, 'dc1', 'rack1') for host in (dc1_1, dc1_2, dc1_3)]
         token_to_host_owner[MD5Token(0)] = dc1_1
         token_to_host_owner[MD5Token(100)] = dc1_2
         token_to_host_owner[MD5Token(200)] = dc1_3
 
         dc2_1 = Host('dc2.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc2_2 = Host('dc2.2', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        dc2_1.set_location_info('dc2', 'rack1')
-        dc2_2.set_location_info('dc2', 'rack1')
+        dc2_1 = _with_location(dc2_1, 'dc2', 'rack1')
+        dc2_2 = _with_location(dc2_2, 'dc2', 'rack1')
         token_to_host_owner[MD5Token(1)] = dc2_1
         token_to_host_owner[MD5Token(101)] = dc2_2
 
         dc3_1 = Host('dc3.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        dc3_1.set_location_info('dc3', 'rack3')
+        dc3_1 = _with_location(dc3_1, 'dc3', 'rack3')
         token_to_host_owner[MD5Token(2)] = dc3_1
 
         ring = [MD5Token(0),
@@ -242,7 +245,7 @@ class StrategiesTest(unittest.TestCase):
         for i in range(dc1hostnum):
 
             host = Host('dc1.{0}'.format(i), SimpleConvictionPolicy, host_id=uuid.uuid4())
-            host.set_location_info('dc1', "rack1")
+            host = _with_location(host, 'dc1', "rack1")
             for vnode_num in range(vnodes_per_host):
                 md5_token = MD5Token(current_token+vnode_num)
                 token_to_host_owner[md5_token] = host
@@ -269,10 +272,10 @@ class StrategiesTest(unittest.TestCase):
         dc1_2 = Host('dc1.2', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc1_3 = Host('dc1.3', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc1_4 = Host('dc1.4', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        dc1_1.set_location_info('dc1', 'rack1')
-        dc1_2.set_location_info('dc1', 'rack1')
-        dc1_3.set_location_info('dc1', 'rack2')
-        dc1_4.set_location_info('dc1', 'rack2')
+        dc1_1 = _with_location(dc1_1, 'dc1', 'rack1')
+        dc1_2 = _with_location(dc1_2, 'dc1', 'rack1')
+        dc1_3 = _with_location(dc1_3, 'dc1', 'rack2')
+        dc1_4 = _with_location(dc1_4, 'dc1', 'rack2')
         token_to_host_owner[MD5Token(0)] = dc1_1
         token_to_host_owner[MD5Token(100)] = dc1_2
         token_to_host_owner[MD5Token(200)] = dc1_3
@@ -282,9 +285,9 @@ class StrategiesTest(unittest.TestCase):
         dc2_1 = Host('dc2.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc2_2 = Host('dc2.2', SimpleConvictionPolicy, host_id=uuid.uuid4())
         dc2_3 = Host('dc2.3', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        dc2_1.set_location_info('dc2', 'rack1')
-        dc2_2.set_location_info('dc2', 'rack1')
-        dc2_3.set_location_info('dc2', 'rack2')
+        dc2_1 = _with_location(dc2_1, 'dc2', 'rack1')
+        dc2_2 = _with_location(dc2_2, 'dc2', 'rack1')
+        dc2_3 = _with_location(dc2_3, 'dc2', 'rack2')
         token_to_host_owner[MD5Token(1)] = dc2_1
         token_to_host_owner[MD5Token(101)] = dc2_2
         token_to_host_owner[MD5Token(201)] = dc2_3
@@ -305,7 +308,7 @@ class StrategiesTest(unittest.TestCase):
 
     def test_nts_make_token_replica_map_empty_dc(self):
         host = Host('1', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        host.set_location_info('dc1', 'rack1')
+        host = _with_location(host, 'dc1', 'rack1')
         token_to_host_owner = {MD5Token(0): host}
         ring = [MD5Token(0)]
         nts = NetworkTopologyStrategy({'dc1': 1, 'dc2': 0})
