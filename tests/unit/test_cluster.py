@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import unittest
-
+from concurrent.futures import Future
 import logging
 import socket
+import unittest
+import uuid
 
 from unittest.mock import patch, Mock
-import uuid
 
 from cassandra import ConsistencyLevel, DriverException, Timeout, Unavailable, RequestExecutionException, ReadTimeout, WriteTimeout, CoordinationFailure, ReadFailure, WriteFailure, FunctionFailure, AlreadyExists,\
     InvalidRequest, Unauthorized, AuthenticationFailed, OperationTimedOut, UnsupportedOperation, RequestValidationException, ConfigurationException, ProtocolVersion
@@ -161,6 +161,347 @@ class ClusterTest(unittest.TestCase):
             else:
                 assert cp.address == '127.0.0.3'
                 assert cp.port == 9999
+
+    def test_on_add_clears_in_progress_flag_when_later_session_add_fails(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        successful_session = Mock()
+        successful_session.add_or_renew_pool.return_value = Future()
+        successful_session.update_created_pools.return_value = set()
+        failing_session = Mock()
+        failing_session.add_or_renew_pool.side_effect = RuntimeError("pool add failed")
+        cluster.sessions = [successful_session, failing_session]
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            assert not host._currently_handling_node_addition
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            assert successful_session.add_or_renew_pool.call_count == 2
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_removes_pool_created_by_running_future_after_add_aborts(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        running_future = Future()
+        running_future.set_running_or_notify_cancel()
+
+        class RunningPoolSession(object):
+
+            def __init__(self):
+                self.pool_created = False
+                self.remove_pool_calls = 0
+                self.generation = None
+                self.update_created_pools = Mock(return_value=set())
+
+            def add_or_renew_pool(self, add_host, is_host_addition):
+                self.generation = getattr(add_host, "_node_addition_generation", None)
+                return running_future
+
+            def complete_running_pool_creation(self, add_host):
+                current_generation = getattr(add_host, "_node_addition_generation", None)
+                if self.generation is None or current_generation is self.generation:
+                    self.pool_created = True
+                running_future.set_result(True)
+
+            def remove_pool(self, remove_host):
+                self.remove_pool_calls += 1
+                if remove_host is host and self.pool_created:
+                    self.pool_created = False
+
+            def shutdown(self):
+                pass
+
+        running_session = RunningPoolSession()
+        failing_session = Mock()
+        failing_session.add_or_renew_pool.side_effect = RuntimeError("pool add failed")
+        failing_session.update_created_pools.return_value = set()
+        cluster.sessions = [running_session, failing_session]
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            assert running_session.remove_pool_calls == 1
+
+            running_session.complete_running_pool_creation(host)
+
+            assert running_session.pool_created is False
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_aborted_future_does_not_remove_newer_successful_pool(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+
+        class FencedPoolSession(object):
+
+            def __init__(self):
+                self.pool = None
+                self.add_calls = 0
+                self.stale_future = Future()
+                self.stale_future.set_running_or_notify_cancel()
+                self.stale_generation = None
+                self.update_created_pools = Mock(return_value=set())
+
+            def add_or_renew_pool(self, add_host, is_host_addition):
+                self.add_calls += 1
+                if self.add_calls == 1:
+                    self.stale_generation = getattr(add_host, "_node_addition_generation", None)
+                    return self.stale_future
+
+                self.pool = "fresh-pool"
+                completed_future = Future()
+                completed_future.set_result(True)
+                return completed_future
+
+            def complete_stale_pool_creation(self, add_host):
+                current_generation = getattr(add_host, "_node_addition_generation", None)
+                if self.stale_generation is None or current_generation is self.stale_generation:
+                    self.pool = "stale-pool"
+                self.stale_future.set_result(True)
+
+            def remove_pool(self, remove_host):
+                if remove_host is host:
+                    self.pool = None
+
+            def shutdown(self):
+                pass
+
+        pool_session = FencedPoolSession()
+        recovered_future = Future()
+        recovered_future.set_result(True)
+        failing_session = Mock()
+        failing_session.add_or_renew_pool.side_effect = [RuntimeError("pool add failed"), recovered_future]
+        failing_session.update_created_pools.return_value = set()
+        cluster.sessions = [pool_session, failing_session]
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            cluster.on_add(host, refresh_nodes=False)
+            assert pool_session.pool == "fresh-pool"
+
+            pool_session.complete_stale_pool_creation(host)
+
+            assert pool_session.pool == "fresh-pool"
+        finally:
+            cluster.shutdown()
+
+    def test_add_or_renew_pool_does_not_signal_stale_addition_failure(self):
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        host._node_addition_generation = object()
+
+        session = object.__new__(Session)
+        session.cluster = Mock(connect_timeout=1)
+        session.cluster.signal_connection_failure = Mock()
+        session._profile_manager = Mock()
+        session._profile_manager.distance.return_value = HostDistance.LOCAL
+        session.keyspace = None
+        session._pools = {}
+
+        def submit(fn, *args, **kwargs):
+            future = Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except Exception as exc:
+                future.set_exception(exc)
+            return future
+
+        session.submit = submit
+
+        def raise_after_add_aborts(*args, **kwargs):
+            host._node_addition_generation = None
+            raise RuntimeError("stale connect failure")
+
+        with patch("cassandra.cluster.HostConnection", side_effect=raise_after_add_aborts):
+            future = session.add_or_renew_pool(host, is_host_addition=True)
+
+        assert future.result() is False
+        session.cluster.signal_connection_failure.assert_not_called()
+
+    def test_on_add_excludes_host_from_query_plan_when_pool_future_fails(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        failed_future = Future()
+        session = Mock()
+        session.add_or_renew_pool.return_value = failed_future
+        session.update_created_pools.return_value = set()
+        cluster.sessions = [session]
+
+        try:
+            cluster.on_add(host, refresh_nodes=False)
+
+            failed_future.set_result(False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+            assert host.is_up is False
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_failure_does_not_allow_reentrant_add_during_cleanup(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        failed_future = Future()
+        successful_future = Future()
+        successful_future.set_result(True)
+        session = Mock()
+        session.add_or_renew_pool.side_effect = [failed_future, successful_future]
+        session.update_created_pools.return_value = set()
+        cluster.sessions = [session]
+
+        original_on_down = cluster.profile_manager.on_down
+
+        def reentrant_add_while_cleanup_removes_host(cleanup_host):
+            cluster.on_add(host, refresh_nodes=False)
+            original_on_down(cleanup_host)
+
+        cluster.profile_manager.on_down = Mock(side_effect=reentrant_add_while_cleanup_removes_host)
+
+        try:
+            cluster.on_add(host, refresh_nodes=False)
+
+            failed_future.set_result(False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+            assert host.is_up is False
+            assert session.add_or_renew_pool.call_count == 1
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_listener_failure_does_not_mark_successful_add_down(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        listener = Mock()
+        listener.on_add.side_effect = RuntimeError("listener failed")
+        cluster.register_listener(listener)
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host.is_up is True
+            assert host in list(load_balancer.make_query_plan())
+            assert not host.is_currently_reconnecting()
+            assert not host._currently_handling_node_addition
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_waits_for_all_session_pool_futures_before_marking_host_up(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+        completed_future = Future()
+        completed_future.set_result(True)
+        pending_future = Future()
+        first_session = Mock()
+        first_session.add_or_renew_pool.return_value = completed_future
+        second_session = Mock()
+        second_session.add_or_renew_pool.return_value = pending_future
+        listener = Mock()
+        cluster.sessions = [first_session, second_session]
+        cluster.register_listener(listener)
+
+        try:
+            cluster.on_add(host, refresh_nodes=False)
+
+            assert host.is_up is not True
+            listener.on_add.assert_not_called()
+            first_session.update_created_pools.assert_not_called()
+            second_session.update_created_pools.assert_not_called()
+
+            pending_future.set_result(True)
+
+            assert host.is_up is True
+            listener.on_add.assert_called_once_with(host)
+            first_session.update_created_pools.assert_called_once_with()
+            second_session.update_created_pools.assert_called_once_with()
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_excludes_host_from_query_plan_until_pool_futures_complete(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        pending_future = Future()
+        session = Mock()
+        session.add_or_renew_pool.return_value = pending_future
+        session.update_created_pools.return_value = set()
+        cluster.sessions = [session]
+
+        try:
+            cluster.on_add(host, refresh_nodes=False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+
+            pending_future.set_result(True)
+
+            assert list(load_balancer.make_query_plan()) == [host]
+        finally:
+            cluster.shutdown()
+
+    def test_on_up_waits_for_all_session_pool_futures_before_marking_host_up(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+        completed_future = Future()
+        completed_future.set_result(True)
+        pending_future = Future()
+        first_session = Mock()
+        first_session.add_or_renew_pool.return_value = completed_future
+        second_session = Mock()
+        second_session.add_or_renew_pool.return_value = pending_future
+        listener = Mock()
+        cluster.sessions = [first_session, second_session]
+        cluster.register_listener(listener)
+
+        try:
+            cluster.on_up(host)
+
+            assert host.is_up is not True
+            listener.on_up.assert_not_called()
+            first_session.update_created_pools.assert_not_called()
+            second_session.update_created_pools.assert_not_called()
+
+            pending_future.set_result(True)
+
+            assert host.is_up is True
+            listener.on_up.assert_called_once_with(host)
+            first_session.update_created_pools.assert_called_once_with()
+            second_session.update_created_pools.assert_called_once_with()
+        finally:
+            cluster.shutdown()
+
+    def test_on_up_excludes_host_from_query_plan_until_pool_futures_complete(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        host.set_down()
+        pending_future = Future()
+        session = Mock()
+        session.add_or_renew_pool.return_value = pending_future
+        session.update_created_pools.return_value = set()
+        cluster.sessions = [session]
+
+        try:
+            cluster.on_up(host)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+
+            pending_future.set_result(True)
+
+            assert list(load_balancer.make_query_plan()) == [host]
+        finally:
+            cluster.shutdown()
 
     def test_invalid_contact_point_types(self):
         with pytest.raises(ValueError):

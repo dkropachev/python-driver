@@ -80,8 +80,8 @@ class MockMetadata(object):
 
     def update_host(self, host, old_endpoint):
         host, created = self.add_or_return_host(host)
-        self._host_id_by_endpoint[host.endpoint] = host.host_id
         self._host_id_by_endpoint.pop(old_endpoint, False)
+        self._host_id_by_endpoint[host.endpoint] = host.host_id
 
     def all_hosts_items(self):
         return list(self.hosts.items())
@@ -112,11 +112,17 @@ class MockCluster(object):
         self.endpoint_factory = DefaultEndPointFactory().configure(self)
         self.ssl_options = None
 
-    def add_host(self, endpoint, datacenter, rack, signal=False, refresh_nodes=True, host_id=None):
+    def add_host(self, endpoint, datacenter, rack, signal=False, refresh_nodes=True, host_id=None,
+                 is_zero_token=None):
         host = Host(endpoint, SimpleConvictionPolicy, datacenter, rack, host_id=host_id)
-        host, _ = self.metadata.add_or_return_host(host)
-        self.added_hosts.append(host)
-        return host, True
+        if is_zero_token is not None:
+            host.is_zero_token = is_zero_token
+        host, new = self.metadata.add_or_return_host(host)
+        if is_zero_token is not None:
+            host.is_zero_token = is_zero_token
+        if new:
+            self.added_hosts.append(host)
+        return host, new
 
     def remove_host(self, host):
         pass
@@ -205,6 +211,32 @@ class ControlConnectionTest(unittest.TestCase):
         self.control_connection = ControlConnection(self.cluster, 1, 0, 0, 0)
         self.control_connection._connection = self.connection
         self.control_connection._time = self.time
+
+    def _assert_zero_token_host_without_token_map_entry(self, endpoint, host_id):
+        zero_token_host = self.cluster.metadata.get_host(endpoint)
+        assert zero_token_host is not None
+        assert zero_token_host.host_id == host_id
+        assert zero_token_host.datacenter == "dc1"
+        assert zero_token_host.rack == "rack1"
+        assert zero_token_host.is_zero_token
+        assert zero_token_host not in self.cluster.metadata.token_map
+        return zero_token_host
+
+    def test_mock_add_host_updates_zero_token_status_for_existing_host(self):
+        endpoint = DefaultEndPoint("192.168.1.0")
+
+        host, new = self.cluster.add_host(endpoint, "dc1", "rack1", signal=False,
+                                          host_id="uuid1", is_zero_token=True)
+
+        assert new is False
+        assert host.is_zero_token is True
+
+        same_host, new = self.cluster.add_host(endpoint, "dc1", "rack1", signal=False,
+                                               host_id="uuid1", is_zero_token=False)
+
+        assert new is False
+        assert same_host is host
+        assert same_host.is_zero_token is False
 
     def test_wait_for_schema_agreement(self):
         """
@@ -335,7 +367,6 @@ class ControlConnectionTest(unittest.TestCase):
              [None, None, "a", "dc1", "rack1", ["1", "101", "201"], 'uuid1'],
              ["192.168.1.7", "10.0.0.1", "a", None, "rack1", ["1", "101", "201"], 'uuid2'],
              ["192.168.1.6", "10.0.0.1", "a", "dc1", None, ["1", "101", "201"], 'uuid3'],
-             ["192.168.1.5", "10.0.0.1", "a", "dc1", "rack1", None, 'uuid4'],
              ["192.168.1.4", "10.0.0.1", "a", "dc1", "rack1", ["1", "101", "201"], None]]])
         refresh_and_validate_added_hosts()
 
@@ -349,7 +380,6 @@ class ControlConnectionTest(unittest.TestCase):
              [None, 9042, None, 7040, "a", "dc1", "rack1", ["2", "102", "202"], "uuid2"],
              ["192.168.1.5", 9042, "10.0.0.2", 7040, "a", None, "rack1", ["2", "102", "202"], "uuid2"],
              ["192.168.1.5", 9042, "10.0.0.2", 7040, "a", "dc1", None, ["2", "102", "202"], "uuid2"],
-             ["192.168.1.5", 9042, "10.0.0.2", 7040, "a", "dc1", "rack1", None, "uuid2"],
              ["192.168.1.5", 9042, "10.0.0.2", 7040, "a", "dc1", "rack1", ["2", "102", "202"], None]]])
         refresh_and_validate_added_hosts()
 
@@ -424,6 +454,61 @@ class ControlConnectionTest(unittest.TestCase):
         assert self.cluster.added_hosts[0].datacenter == "dc1"
         assert self.cluster.added_hosts[0].rack == "rack1"
         assert self.cluster.added_hosts[0].host_id == "uuid4"
+
+    def test_refresh_nodes_and_tokens_adds_zero_token_host_without_token_map_entry(self):
+        # Zero-token nodes are valid topology members, but they do not own token ranges.
+        self.connection.peer_results[1].append(
+            ["192.168.1.3", "10.0.0.3", "a", "dc1", "rack1", None, "uuid4"]
+        )
+        self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
+
+        self.control_connection.refresh_node_list_and_token_map()
+
+        zero_token_host = self._assert_zero_token_host_without_token_map_entry(
+            DefaultEndPoint("192.168.1.3"), "uuid4")
+        assert 1 == len(self.cluster.added_hosts)
+        assert self.cluster.added_hosts[0] is zero_token_host
+        assert [] == self.cluster.metadata.removed_hosts
+
+    def test_refresh_nodes_and_tokens_adds_empty_token_host_without_token_map_entry(self):
+        self.connection.peer_results[1].append(
+            ["192.168.1.3", "10.0.0.3", "a", "dc1", "rack1", [], "uuid4"]
+        )
+        self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
+
+        self.control_connection.refresh_node_list_and_token_map()
+
+        zero_token_host = self._assert_zero_token_host_without_token_map_entry(
+            DefaultEndPoint("192.168.1.3"), "uuid4")
+        assert 1 == len(self.cluster.added_hosts)
+        assert self.cluster.added_hosts[0] is zero_token_host
+
+    def test_refresh_nodes_and_tokens_keeps_zero_token_local_host_without_token_map_entry(self):
+        self.connection.local_results[1][0][7] = None
+
+        self.control_connection.refresh_node_list_and_token_map()
+
+        self._assert_zero_token_host_without_token_map_entry(
+            DefaultEndPoint("192.168.1.0"), "uuid1")
+        assert [] == self.cluster.added_hosts
+        assert [] == self.cluster.metadata.removed_hosts
+
+    def test_refresh_nodes_and_tokens_updates_zero_token_status_when_tokens_change(self):
+        self.connection.peer_results[1].append(
+            ["192.168.1.3", "10.0.0.3", "a", "dc1", "rack1", None, "uuid4"]
+        )
+        self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
+
+        self.control_connection.refresh_node_list_and_token_map()
+        zero_token_host = self._assert_zero_token_host_without_token_map_entry(
+            DefaultEndPoint("192.168.1.3"), "uuid4")
+
+        self.connection.peer_results[1][-1][5] = ["3", "103", "203"]
+        self.control_connection.refresh_node_list_and_token_map()
+
+        assert not zero_token_host.is_zero_token
+        assert zero_token_host in self.cluster.metadata.token_map
+        assert self.cluster.metadata.token_map[zero_token_host] == ["3", "103", "203"]
 
     def test_refresh_nodes_and_tokens_remove_host(self):
         del self.connection.peer_results[1][1]
@@ -602,6 +687,29 @@ class ControlConnectionTest(unittest.TestCase):
         assert self.cluster.added_hosts[0].broadcast_port == 666
         assert self.cluster.added_hosts[0].datacenter == "dc1"
         assert self.cluster.added_hosts[0].rack == "rack1"
+
+    def test_refresh_nodes_and_tokens_adds_zero_token_host_from_peers_v2_without_token_map_entry(self):
+        del self.connection.peer_results[:]
+        self.connection.peer_results.extend(self.connection.peer_results_v2)
+        self.connection.peer_results[1].append(
+            ["192.168.1.3", 555, "10.0.0.3", 666, "a", "dc1", "rack1", None, "uuid4"]
+        )
+        self.connection.wait_for_responses = Mock(return_value=_node_meta_results(
+            self.connection.local_results, self.connection.peer_results))
+        self.cluster.scheduler.schedule = lambda delay, f, *args, **kwargs: f(*args, **kwargs)
+
+        self.control_connection.refresh_node_list_and_token_map()
+
+        zero_token_host = self._assert_zero_token_host_without_token_map_entry(
+            DefaultEndPoint("192.168.1.3", 555), "uuid4")
+        assert 1 == len(self.cluster.added_hosts)
+        assert self.cluster.added_hosts[0] is zero_token_host
+        assert zero_token_host.endpoint.port == 555
+        assert zero_token_host.broadcast_rpc_address == "192.168.1.3"
+        assert zero_token_host.broadcast_rpc_port == 555
+        assert zero_token_host.broadcast_address == "10.0.0.3"
+        assert zero_token_host.broadcast_port == 666
+        assert [] == self.cluster.metadata.removed_hosts
 
     def test_refresh_nodes_and_tokens_add_host_detects_invalid_port(self):
         del self.connection.peer_results[:]

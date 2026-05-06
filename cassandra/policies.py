@@ -121,9 +121,38 @@ class LoadBalancingPolicy(HostStateListener):
     """
 
     _hosts_lock = None
+    _ignore_zero_token_hosts = True
 
     def __init__(self):
         self._hosts_lock = Lock()
+
+    def _is_ignored_zero_token_host(self, host):
+        if getattr(host, 'is_zero_token', False) is not True:
+            return False
+
+        child_policy = getattr(self, '_child_policy', None)
+        if child_policy is not None:
+            # Preserve child opt-outs through wrapper layers.
+            child_filter = getattr(child_policy, '_is_ignored_zero_token_host', None)
+            if child_filter is not None:
+                return bool(child_filter(host))
+            return bool(getattr(child_policy, '_ignore_zero_token_hosts', self._ignore_zero_token_hosts))
+
+        return bool(self._ignore_zero_token_hosts)
+
+    def _filter_zero_token_hosts(self, hosts):
+        return tuple(h for h in hosts if not self._is_ignored_zero_token_host(h))
+
+    def _is_in_flight_host(self, host):
+        return ((getattr(host, '_currently_handling_node_up', False) is True or
+                 getattr(host, '_currently_handling_node_addition', False) is True) and
+                getattr(host, 'is_up', None) is not True)
+
+    def _is_ignored_query_plan_host(self, host):
+        return self._is_ignored_zero_token_host(host) or self._is_in_flight_host(host)
+
+    def _filter_query_plan_hosts(self, hosts):
+        return tuple(h for h in hosts if not self._is_ignored_query_plan_host(h))
 
     def distance(self, host):
         """
@@ -178,10 +207,13 @@ class RoundRobinPolicy(LoadBalancingPolicy):
 
     def populate(self, cluster, hosts):
         self._live_hosts = frozenset(hosts)
-        if len(hosts) > 1:
-            self._position = randint(0, len(hosts) - 1)
+        live_hosts = self._filter_zero_token_hosts(hosts)
+        if len(live_hosts) > 1:
+            self._position = randint(0, len(live_hosts) - 1)
 
     def distance(self, host):
+        if self._is_ignored_zero_token_host(host):
+            return HostDistance.IGNORED
         return HostDistance.LOCAL
 
     def make_query_plan(self, working_keyspace=None, query=None):
@@ -190,7 +222,7 @@ class RoundRobinPolicy(LoadBalancingPolicy):
         pos = self._position
         self._position += 1
 
-        hosts = self._live_hosts
+        hosts = self._filter_query_plan_hosts(self._live_hosts)
         length = len(hosts)
         if length:
             pos %= length
@@ -257,6 +289,9 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
         self._position = randint(0, len(hosts) - 1) if hosts else 0
 
     def distance(self, host):
+        if self._is_ignored_zero_token_host(host):
+            return HostDistance.IGNORED
+
         dc = self._dc(host)
         if dc == self.local_dc:
             return HostDistance.LOCAL
@@ -264,7 +299,7 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
         if not self.used_hosts_per_remote_dc:
             return HostDistance.IGNORED
         else:
-            dc_hosts = self._dc_live_hosts.get(dc)
+            dc_hosts = self._filter_zero_token_hosts(self._dc_live_hosts.get(dc, ()))
             if not dc_hosts:
                 return HostDistance.IGNORED
 
@@ -279,7 +314,7 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
         pos = self._position
         self._position += 1
 
-        local_live = self._dc_live_hosts.get(self.local_dc, ())
+        local_live = self._filter_query_plan_hosts(self._dc_live_hosts.get(self.local_dc, ()))
         pos = (pos % len(local_live)) if local_live else 0
         for host in islice(cycle(local_live), pos, pos + len(local_live)):
             yield host
@@ -287,14 +322,15 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
         # the dict can change, so get candidate DCs iterating over keys of a copy
         other_dcs = [dc for dc in self._dc_live_hosts.copy().keys() if dc != self.local_dc]
         for dc in other_dcs:
-            remote_live = self._dc_live_hosts.get(dc, ())
+            remote_live = self._filter_query_plan_hosts(self._dc_live_hosts.get(dc, ()))
             for host in remote_live[:self.used_hosts_per_remote_dc]:
                 yield host
 
     def on_up(self, host):
         # not worrying about threads because this will happen during
         # control connection startup/refresh
-        if not self.local_dc and host.datacenter:
+        if (not self.local_dc and host.datacenter and
+                not self._is_ignored_zero_token_host(host)):
             self.local_dc = host.datacenter
             log.info("Using datacenter '%s' for DCAwareRoundRobinPolicy (via host '%s'); "
                         "if incorrect, please specify a local_dc to the constructor, "
@@ -372,6 +408,9 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
         self._position = randint(0, len(hosts) - 1) if hosts else 0
 
     def distance(self, host):
+        if self._is_ignored_zero_token_host(host):
+            return HostDistance.IGNORED
+
         rack = self._rack(host)
         dc = self._dc(host)
         if rack == self.local_rack and dc == self.local_dc:
@@ -383,7 +422,7 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
         if not self.used_hosts_per_remote_dc:
             return HostDistance.IGNORED
 
-        dc_hosts = self._dc_live_hosts.get(dc, ())
+        dc_hosts = self._filter_zero_token_hosts(self._dc_live_hosts.get(dc, ()))
         if not dc_hosts:
             return HostDistance.IGNORED
         if host in dc_hosts and dc_hosts.index(host) < self.used_hosts_per_remote_dc:
@@ -395,14 +434,15 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
         pos = self._position
         self._position += 1
 
-        local_rack_live = self._live_hosts.get((self.local_dc, self.local_rack), ())
+        local_rack_live = self._filter_query_plan_hosts(self._live_hosts.get((self.local_dc, self.local_rack), ()))
         pos = (pos % len(local_rack_live)) if local_rack_live else 0
         # Slice the cyclic iterator to start from pos and include the next len(local_live) elements
         # This ensures we get exactly one full cycle starting from pos
         for host in islice(cycle(local_rack_live), pos, pos + len(local_rack_live)):
             yield host
 
-        local_live = [host for host in self._dc_live_hosts.get(self.local_dc, ()) if host.rack != self.local_rack]
+        local_live = [host for host in self._filter_query_plan_hosts(self._dc_live_hosts.get(self.local_dc, ()))
+                      if host.rack != self.local_rack]
         pos = (pos % len(local_live)) if local_live else 0
         for host in islice(cycle(local_live), pos, pos + len(local_live)):
             yield host
@@ -410,6 +450,7 @@ class RackAwareRoundRobinPolicy(LoadBalancingPolicy):
         # the dict can change, so get candidate DCs iterating over keys of a copy
         for dc, remote_live in self._dc_live_hosts.copy().items():
             if dc != self.local_dc:
+                remote_live = self._filter_query_plan_hosts(remote_live)
                 for host in remote_live[:self.used_hosts_per_remote_dc]:
                     yield host
 
@@ -491,6 +532,9 @@ class TokenAwarePolicy(LoadBalancingPolicy):
                 (self.__class__.__name__, self._cluster_metadata.partitioner))
 
     def distance(self, *args, **kwargs):
+        host = args[0] if args else kwargs.get('host')
+        if host is not None and self._is_ignored_zero_token_host(host):
+            return HostDistance.IGNORED
         return self._child_policy.distance(*args, **kwargs)
 
     def make_query_plan(self, working_keyspace=None, query=None):
@@ -499,7 +543,8 @@ class TokenAwarePolicy(LoadBalancingPolicy):
         child = self._child_policy
         if query is None or query.routing_key is None or keyspace is None:
             for host in child.make_query_plan(keyspace, query):
-                yield host
+                if not self._is_ignored_query_plan_host(host):
+                    yield host
             return
 
         replicas = []
@@ -520,13 +565,15 @@ class TokenAwarePolicy(LoadBalancingPolicy):
         def yield_in_order(hosts):
             for distance in [HostDistance.LOCAL_RACK, HostDistance.LOCAL, HostDistance.REMOTE]:
                 for replica in hosts:
-                    if replica.is_up and child.distance(replica) == distance:
+                    if (not self._is_ignored_query_plan_host(replica) and
+                            replica.is_up and child.distance(replica) == distance):
                         yield replica
 
         # yield replicas: local_rack, local, remote
         yield from yield_in_order(replicas)
         # yield rest of the cluster: local_rack, local, remote
-        yield from yield_in_order([host for host in child.make_query_plan(keyspace, query) if host not in replicas])
+        yield from yield_in_order([host for host in child.make_query_plan(keyspace, query)
+                                   if host not in replicas and not self._is_ignored_query_plan_host(host)])
 
     def on_up(self, *args, **kwargs):
         return self._child_policy.on_up(*args, **kwargs)
@@ -553,6 +600,8 @@ class WhiteListRoundRobinPolicy(RoundRobinPolicy):
     Where connection errors occur when connection
     attempts are made to private IP addresses remotely
     """
+
+    _ignore_zero_token_hosts = False
 
     def __init__(self, hosts):
         """
@@ -674,6 +723,9 @@ class HostFilterPolicy(LoadBalancingPolicy):
         :attr:`~HostDistance.IGNORED` if falsy, and defers to the child policy
         otherwise.
         """
+        if self._is_ignored_zero_token_host(host):
+            return HostDistance.IGNORED
+
         if self.predicate(host):
             return self._child_policy.distance(host)
         else:
@@ -699,7 +751,7 @@ class HostFilterPolicy(LoadBalancingPolicy):
             working_keyspace=working_keyspace, query=query
         )
         for host in child_qp:
-            if self.predicate(host):
+            if not self._is_ignored_query_plan_host(host) and self.predicate(host):
                 yield host
 
     def check_supported(self):
@@ -1305,6 +1357,9 @@ class WrapperPolicy(LoadBalancingPolicy):
         self._child_policy = child_policy
 
     def distance(self, *args, **kwargs):
+        host = args[0] if args else kwargs.get('host')
+        if host is not None and self._is_ignored_zero_token_host(host):
+            return HostDistance.IGNORED
         return self._child_policy.distance(*args, **kwargs)
 
     def populate(self, cluster, hosts):
@@ -1347,14 +1402,15 @@ class DefaultLoadBalancingPolicy(WrapperPolicy):
         target_host = self._cluster_metadata.get_host(addr)
 
         child = self._child_policy
-        if target_host and target_host.is_up:
+        if target_host and target_host.is_up and not self._is_ignored_query_plan_host(target_host):
             yield target_host
             for h in child.make_query_plan(keyspace, query):
-                if h != target_host:
+                if h != target_host and not self._is_ignored_query_plan_host(h):
                     yield h
         else:
             for h in child.make_query_plan(keyspace, query):
-                yield h
+                if not self._is_ignored_query_plan_host(h):
+                    yield h
 
 
 # TODO for backward compatibility, remove in next major
