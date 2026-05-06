@@ -1870,6 +1870,18 @@ class Cluster(object):
 
         self._start_reconnector(host, is_host_addition=False)
 
+    def _cleanup_failed_on_add_handling(self, host):
+        with host.lock:
+            host.set_down()
+            host._currently_handling_node_addition = False
+
+        self.profile_manager.on_down(host)
+        self.control_connection.on_down(host)
+        for session in tuple(self.sessions):
+            session.remove_pool(host)
+
+        self._start_reconnector(host, is_host_addition=True)
+
     def _on_up_future_completed(self, host, futures, results, lock, finished_future):
         with lock:
             futures.discard(finished_future)
@@ -2100,14 +2112,12 @@ class Cluster(object):
 
                 for exc in [f for f in futures_results if isinstance(f, Exception)]:
                     log.error("Unexpected failure while adding node %s, will not mark up:", host, exc_info=exc)
-                    with host.lock:
-                        host._currently_handling_node_addition = False
+                    self._cleanup_failed_on_add_handling(host)
                     return
 
                 if not all(futures_results):
                     log.warning("Connection pool could not be created, not marking node %s up", host)
-                    with host.lock:
-                        host._currently_handling_node_addition = False
+                    self._cleanup_failed_on_add_handling(host)
                     return
 
                 self._finalize_add(host)
@@ -2127,8 +2137,7 @@ class Cluster(object):
             add_aborted = True
             for future in tuple(futures):
                 future.cancel()
-            with host.lock:
-                host._currently_handling_node_addition = False
+            self._cleanup_failed_on_add_handling(host)
             raise
 
     def _finalize_add(self, host, set_up=True):

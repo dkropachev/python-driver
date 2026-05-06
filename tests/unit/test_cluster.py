@@ -103,7 +103,7 @@ class ClusterTest(unittest.TestCase):
 
     def test_on_add_clears_in_progress_flag_when_later_session_add_fails(self):
         cluster = Cluster(protocol_version=4)
-        host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
         successful_session = Mock()
         successful_session.add_or_renew_pool.return_value = Future()
         successful_session.update_created_pools.return_value = set()
@@ -116,11 +116,33 @@ class ClusterTest(unittest.TestCase):
                 cluster.on_add(host, refresh_nodes=False)
 
             assert not host._currently_handling_node_addition
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
 
             with pytest.raises(RuntimeError):
                 cluster.on_add(host, refresh_nodes=False)
 
             assert successful_session.add_or_renew_pool.call_count == 2
+        finally:
+            cluster.shutdown()
+
+    def test_on_add_excludes_host_from_query_plan_when_pool_future_fails(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        failed_future = Future()
+        session = Mock()
+        session.add_or_renew_pool.return_value = failed_future
+        session.update_created_pools.return_value = set()
+        cluster.sessions = [session]
+
+        try:
+            cluster.on_add(host, refresh_nodes=False)
+
+            failed_future.set_result(False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+            assert host.is_up is False
         finally:
             cluster.shutdown()
 
