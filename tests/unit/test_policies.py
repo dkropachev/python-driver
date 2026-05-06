@@ -216,6 +216,19 @@ def test_zero_token_hosts_ignored_by_round_robin_policies(policy):
     assert set(policy.make_query_plan()) == {host, zero_token_host}
     assert policy.distance(zero_token_host) != HostDistance.IGNORED
 
+
+def test_zero_token_host_does_not_initialize_dc_aware_local_dc():
+    policy = DCAwareRoundRobinPolicy()
+    zero_token_host = make_host("127.0.0.1", datacenter="dc_zero_token", is_zero_token=True)
+    host = make_host("127.0.0.2", datacenter="dc1")
+
+    policy.on_add(zero_token_host)
+    policy.on_add(host)
+
+    assert policy.local_dc == "dc1"
+    assert list(policy.make_query_plan()) == [host]
+
+
 @pytest.mark.parametrize("policy_specialization, constructor_args", [(DCAwareRoundRobinPolicy, ("dc1", )), (RackAwareRoundRobinPolicy, ("dc1", "rack1"))])
 class TestRackOrDCAwareRoundRobinPolicy:
 

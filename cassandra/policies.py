@@ -329,7 +329,8 @@ class DCAwareRoundRobinPolicy(LoadBalancingPolicy):
     def on_up(self, host):
         # not worrying about threads because this will happen during
         # control connection startup/refresh
-        if not self.local_dc and host.datacenter:
+        if (not self.local_dc and host.datacenter and
+                not self._is_ignored_zero_token_host(host)):
             self.local_dc = host.datacenter
             log.info("Using datacenter '%s' for DCAwareRoundRobinPolicy (via host '%s'); "
                         "if incorrect, please specify a local_dc to the constructor, "
