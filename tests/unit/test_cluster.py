@@ -146,6 +146,37 @@ class ClusterTest(unittest.TestCase):
         finally:
             cluster.shutdown()
 
+    def test_on_add_failure_does_not_allow_reentrant_add_during_cleanup(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        failed_future = Future()
+        successful_future = Future()
+        successful_future.set_result(True)
+        session = Mock()
+        session.add_or_renew_pool.side_effect = [failed_future, successful_future]
+        session.update_created_pools.return_value = set()
+        cluster.sessions = [session]
+
+        original_on_down = cluster.profile_manager.on_down
+
+        def reentrant_add_while_cleanup_removes_host(cleanup_host):
+            cluster.on_add(host, refresh_nodes=False)
+            original_on_down(cleanup_host)
+
+        cluster.profile_manager.on_down = Mock(side_effect=reentrant_add_while_cleanup_removes_host)
+
+        try:
+            cluster.on_add(host, refresh_nodes=False)
+
+            failed_future.set_result(False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host not in list(load_balancer.make_query_plan())
+            assert host.is_up is False
+            assert session.add_or_renew_pool.call_count == 1
+        finally:
+            cluster.shutdown()
+
     def test_on_add_waits_for_all_session_pool_futures_before_marking_host_up(self):
         cluster = Cluster(protocol_version=4)
         host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())

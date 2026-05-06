@@ -1873,12 +1873,14 @@ class Cluster(object):
     def _cleanup_failed_on_add_handling(self, host):
         with host.lock:
             host.set_down()
-            host._currently_handling_node_addition = False
 
         self.profile_manager.on_down(host)
         self.control_connection.on_down(host)
         for session in tuple(self.sessions):
             session.remove_pool(host)
+
+        with host.lock:
+            host._currently_handling_node_addition = False
 
         self._start_reconnector(host, is_host_addition=True)
 
