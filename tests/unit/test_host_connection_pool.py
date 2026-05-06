@@ -217,13 +217,14 @@ class _PoolTests(unittest.TestCase):
         Test host equality has correct logic
         """
 
-        a = Host('127.0.0.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        b = Host('127.0.0.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
-        c = Host('127.0.0.2', SimpleConvictionPolicy, host_id=uuid.uuid4())
+        host_id = uuid.uuid4()
+        a = Host('127.0.0.1', SimpleConvictionPolicy, host_id=host_id)
+        b = Host('127.0.0.2', SimpleConvictionPolicy, host_id=host_id)
+        c = Host('127.0.0.1', SimpleConvictionPolicy, host_id=uuid.uuid4())
 
-        assert a == b, 'Two Host instances should be equal when sharing.'
-        assert a != c, 'Two Host instances should NOT be equal when using two different addresses.'
-        assert b != c, 'Two Host instances should NOT be equal when using two different addresses.'
+        assert a == b, 'Two Host instances should be equal when sharing host_id.'
+        assert a != c, 'Two Host instances should NOT be equal when using different host_id values.'
+        assert b != c, 'Two Host instances should NOT be equal when using different host_id values.'
 
 
 class HostConnectionTests(_PoolTests):

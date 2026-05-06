@@ -1020,12 +1020,13 @@ class TestOrdering(unittest.TestCase):
         """
         hosts = [Host(addr, SimpleConvictionPolicy, host_id=uuid.uuid4()) for addr in
                  ("127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4")]
-        hosts_equal = [Host(addr, SimpleConvictionPolicy, host_id=uuid.uuid4()) for addr in
-                       ("127.0.0.1", "127.0.0.1")]
-        hosts_equal_conviction = [Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4()), Host("127.0.0.1", ConvictionPolicy, host_id=uuid.uuid4())]
+        hosts_equal = [Host("127.0.0.1", SimpleConvictionPolicy, host_id="a"),
+                       Host("127.0.0.1", SimpleConvictionPolicy, host_id="b")]
+        hosts_equal_conviction = [Host("127.0.0.1", SimpleConvictionPolicy, host_id="a"),
+                                  Host("127.0.0.1", ConvictionPolicy, host_id="b")]
         check_sequence_consistency(hosts)
-        check_sequence_consistency(hosts_equal, equal=True)
-        check_sequence_consistency(hosts_equal_conviction, equal=True)
+        check_sequence_consistency(hosts_equal)
+        check_sequence_consistency(hosts_equal_conviction)
 
     def test_date_order(self):
         """

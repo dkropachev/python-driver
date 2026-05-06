@@ -56,6 +56,9 @@ from cassandra.connection import (ClientRoutesEndPointFactory, ConnectionExcepti
 from cassandra.cqltypes import UserType
 import cassandra.cqltypes as types
 from cassandra.encoder import Encoder
+from cassandra.events import (_EventBus, DriverEvent, HOST, HOST_ADDED,
+                              HOST_REMOVED, HOST_UP, HOST_DOWN,
+                              HOST_CHANGED, HostEventPayload)
 from cassandra.protocol import (QueryMessage, ResultMessage,
                                 ErrorMessage, ReadTimeoutErrorMessage,
                                 WriteTimeoutErrorMessage,
@@ -505,8 +508,26 @@ class GraphAnalyticsExecutionProfile(GraphExecutionProfile):
 
 class ProfileManager(object):
 
-    def __init__(self):
+    _EVENT_TYPES = (HOST_CHANGED,)
+
+    def __init__(self, event_bus=None):
         self.profiles = dict()
+        self._event_bus = event_bus
+        if event_bus:
+            for event_type in self._EVENT_TYPES:
+                event_bus.subscribe(event_type, self._handle_host_event)
+
+    def _handle_host_event(self, event):
+        payload = event.payload
+        if event.type == HOST_CHANGED:
+            if payload.old_host is not payload.new_host:
+                self.on_change(payload.old_host, payload.new_host, payload.changed_fields)
+
+    def shutdown(self):
+        if self._event_bus:
+            for event_type in self._EVENT_TYPES:
+                self._event_bus.unsubscribe(event_type, self._handle_host_event)
+            self._event_bus = None
 
     def _profiles_without_explicit_lbps(self):
         names = (profile_name for
@@ -548,12 +569,54 @@ class ProfileManager(object):
         for p in self.profiles.values():
             p.load_balancing_policy.on_remove(host)
 
+    def on_change(self, old_host, new_host, changed_fields):
+        for p in self.profiles.values():
+            p.load_balancing_policy.on_change(old_host, new_host, changed_fields)
+
     @property
     def default(self):
         """
         internal-only; no checks are done because this entry is populated on cluster init
         """
         return self.profiles[EXEC_PROFILE_DEFAULT]
+
+
+class _HostStateListenerAdapter(object):
+
+    def __init__(self, cluster, event_bus):
+        self._cluster = weakref.proxy(cluster)
+        self._event_bus = event_bus
+        event_bus.subscribe(HOST_UP, self._handle_host_event)
+        event_bus.subscribe(HOST_DOWN, self._handle_host_event)
+        event_bus.subscribe(HOST_ADDED, self._handle_host_event)
+        event_bus.subscribe(HOST_REMOVED, self._handle_host_event)
+
+    def _handle_host_event(self, event):
+        try:
+            listeners = self._cluster.listeners
+        except ReferenceError:
+            self.shutdown()
+            return
+
+        payload = event.payload
+        host = payload.host
+        for listener in listeners:
+            if event.type == HOST_UP:
+                listener.on_up(host)
+            elif event.type == HOST_DOWN:
+                listener.on_down(host)
+            elif event.type == HOST_ADDED:
+                listener.on_add(host)
+            elif event.type == HOST_REMOVED:
+                listener.on_remove(host)
+
+    def shutdown(self):
+        if self._event_bus:
+            self._event_bus.unsubscribe(HOST_UP, self._handle_host_event)
+            self._event_bus.unsubscribe(HOST_DOWN, self._handle_host_event)
+            self._event_bus.unsubscribe(HOST_ADDED, self._handle_host_event)
+            self._event_bus.unsubscribe(HOST_REMOVED, self._handle_host_event)
+            self._event_bus = None
 
 
 EXEC_PROFILE_DEFAULT = object()
@@ -1395,7 +1458,8 @@ class Cluster(object):
         else:
             self.timestamp_generator = MonotonicTimestampGenerator()
 
-        self.profile_manager = ProfileManager()
+        self._event_bus = _EventBus()
+        self.profile_manager = ProfileManager(self._event_bus)
         self.profile_manager.profiles[EXEC_PROFILE_DEFAULT] = ExecutionProfile(
             self.load_balancing_policy,
             self.default_retry_policy,
@@ -1483,11 +1547,12 @@ class Cluster(object):
 
         self._listeners = set()
         self._listener_lock = Lock()
+        self._host_listener_adapter = None
 
         # let Session objects be GC'ed (and shutdown) when the user no longer
         # holds a reference.
         self.sessions = WeakSet()
-        self.metadata = Metadata()
+        self.metadata = Metadata(self._event_bus)
         self.control_connection = None
         self._prepared_statements = WeakValueDictionary()
         self._prepared_statement_lock = Lock()
@@ -1509,6 +1574,7 @@ class Cluster(object):
             self.status_event_refresh_window,
             schema_metadata_enabled, token_metadata_enabled,
             schema_meta_page_size=schema_metadata_page_size)
+        self._host_listener_adapter = _HostStateListenerAdapter(self, self._event_bus)
 
         if client_id is None:
             self.client_id = uuid.uuid4()
@@ -1838,6 +1904,13 @@ class Cluster(object):
         for session in tuple(self.sessions):
             session.shutdown()
 
+        if self._host_listener_adapter:
+            self._host_listener_adapter.shutdown()
+            self._host_listener_adapter = None
+
+        if self.profile_manager:
+            self.profile_manager.shutdown()
+
         self.executor.shutdown()
 
         if self.metrics_enabled and self.metrics:
@@ -1861,6 +1934,19 @@ class Cluster(object):
         for keyspace, type_map in self._user_types.items():
             for udt_name, klass in type_map.items():
                 session.user_type_registered(keyspace, udt_name, klass)
+
+    def _publish_host_event(self, event_type, host=None, old_host=None,
+                            new_host=None, changed_fields=(), old_values=None,
+                            new_values=None, refresh_nodes=True, source=None):
+        payload = HostEventPayload(
+            host=host,
+            old_host=old_host,
+            new_host=new_host,
+            changed_fields=changed_fields,
+            old_values=old_values,
+            new_values=new_values,
+            refresh_nodes=refresh_nodes)
+        return self._event_bus.publish(DriverEvent(event_type, HOST, payload, source or self))
 
     def _cleanup_failed_on_up_handling(self, host):
         self.profile_manager.on_down(host)
@@ -1897,8 +1983,7 @@ class Cluster(object):
             log.info("Connection pools established for node %s", host)
             # mark the host as up and notify all listeners
             host.set_up()
-            for listener in self.listeners:
-                listener.on_up(host)
+            self._publish_host_event(HOST_UP, host=host)
         finally:
             with host.lock:
                 host._currently_handling_node_up = False
@@ -1975,6 +2060,7 @@ class Cluster(object):
                 with host.lock:
                     host.set_up()
                     host._currently_handling_node_up = False
+                self._publish_host_event(HOST_UP, host=host)
 
         # for testing purposes
         return futures
@@ -2007,11 +2093,7 @@ class Cluster(object):
     def on_down_potentially_blocking(self, host, is_host_addition):
         self.profile_manager.on_down(host)
         self.control_connection.on_down(host)
-        for session in tuple(self.sessions):
-            session.on_down(host)
-
-        for listener in self.listeners:
-            listener.on_down(host)
+        self._publish_host_event(HOST_DOWN, host=host)
 
         self._start_reconnector(host, is_host_addition)
 
@@ -2061,7 +2143,7 @@ class Cluster(object):
         if distance == HostDistance.IGNORED:
             log.debug("Not adding connection pool for new host %r because the "
                       "load balancing policy has marked it as IGNORED", host)
-            self._finalize_add(host, set_up=False)
+            self._finalize_add(host, set_up=False, refresh_nodes=refresh_nodes)
             return
 
         futures_lock = Lock()
@@ -2090,7 +2172,7 @@ class Cluster(object):
                 log.warning("Connection pool could not be created, not marking node %s up", host)
                 return
 
-            self._finalize_add(host)
+            self._finalize_add(host, refresh_nodes=refresh_nodes)
 
         have_future = False
         for session in tuple(self.sessions):
@@ -2101,31 +2183,28 @@ class Cluster(object):
                 future.add_done_callback(future_completed)
 
         if not have_future:
-            self._finalize_add(host)
+            self._finalize_add(host, refresh_nodes=refresh_nodes)
 
-    def _finalize_add(self, host, set_up=True):
+    def _finalize_add(self, host, set_up=True, refresh_nodes=True):
         if set_up:
             host.set_up()
-
-        for listener in self.listeners:
-            listener.on_add(host)
 
         # see if there are any pools to add or remove now that the host is marked up
         for session in tuple(self.sessions):
             session.update_created_pools()
 
-    def on_remove(self, host):
+        self._publish_host_event(HOST_ADDED, host=host, refresh_nodes=refresh_nodes)
+
+    def on_remove(self, host, source=None):
         if self.is_shutdown:
             return
 
         log.debug("[cluster] Removing host %s", host)
         host.set_down()
         self.profile_manager.on_remove(host)
-        for session in tuple(self.sessions):
-            session.on_remove(host)
-        for listener in self.listeners:
-            listener.on_remove(host)
-        self.control_connection.on_remove(host)
+        if source is not self.control_connection:
+            self.control_connection.on_remove(host)
+        self._publish_host_event(HOST_REMOVED, host=host, source=source)
 
         reconnection_handler = host.get_and_set_reconnection_handler(None)
         if reconnection_handler:
@@ -2148,21 +2227,23 @@ class Cluster(object):
         with self.metadata._hosts_lock:
             if endpoint in self.metadata._host_id_by_endpoint:
                 return self.metadata._hosts[self.metadata._host_id_by_endpoint[endpoint]], False
-        host, new = self.metadata.add_or_return_host(Host(endpoint, self.conviction_policy_factory, datacenter, rack, host_id=host_id))
+        host, new = self.metadata.add_or_return_host(
+            Host(endpoint, self.conviction_policy_factory, datacenter, rack,
+                 host_id=host_id, event_bus=self._event_bus))
         if new and signal:
             log.info("New Cassandra host %r discovered", host)
             self.on_add(host, refresh_nodes)
 
         return host, new
 
-    def remove_host(self, host):
+    def remove_host(self, host, source=None):
         """
         Called when the control connection observes that a node has left the
         ring.  Intended for internal use only.
         """
         if host and self.metadata.remove_host(host):
             log.info("Cassandra host %s removed", host)
-            self.on_remove(host)
+            self.on_remove(host, source=source)
 
     def register_listener(self, listener):
         """
@@ -2387,6 +2468,34 @@ class Cluster(object):
         with self._prepared_statement_lock:
             self._prepared_statements[query_id] = prepared_statement
 
+
+class _SessionHostEventHandler(object):
+
+    _EVENT_TYPES = (HOST_DOWN, HOST_REMOVED, HOST_CHANGED)
+
+    def __init__(self, session, event_bus):
+        self._session_ref = weakref.ref(session, self._session_finalized)
+        self._event_bus = event_bus
+        for event_type in self._EVENT_TYPES:
+            event_bus.subscribe(event_type, self)
+
+    def _session_finalized(self, session_ref):
+        self.shutdown()
+
+    def __call__(self, event):
+        session = self._session_ref()
+        if session is None:
+            self.shutdown()
+            return
+        session._handle_host_event(event)
+
+    def shutdown(self):
+        if self._event_bus:
+            for event_type in self._EVENT_TYPES:
+                self._event_bus.unsubscribe(event_type, self)
+            self._event_bus = None
+
+
 class Session(object):
     """
     A collection of connection pools for each host in the cluster.
@@ -2606,6 +2715,7 @@ class Session(object):
     _profile_manager = None
     _metrics = None
     _request_init_callbacks = None
+    _host_event_handler = None
     _graph_paging_available = False
 
     def __init__(self, cluster, hosts, keyspace=None):
@@ -2638,6 +2748,8 @@ class Session(object):
             if self.keyspace:
                 msg += " using keyspace '%s'" % self.keyspace
             raise NoHostAvailable(msg, [h.address for h in hosts])
+
+        self._host_event_handler = _SessionHostEventHandler(self, self.cluster._event_bus)
 
         self.session_id = uuid.uuid4()
 
@@ -3165,7 +3277,8 @@ class Session(object):
         Intended for internal use only.
         """
         futures = []
-        for host in tuple(self._pools.keys()):
+        for pool in tuple(self._pools.values()):
+            host = pool.host
             if host != excluded_host and host.is_up:
                 future = ResponseFuture(self, PrepareMessage(query=query, keyspace=keyspace),
                                             None, self.default_timeout)
@@ -3217,6 +3330,10 @@ class Session(object):
         for pool in tuple(self._pools.values()):
             pool.shutdown()
 
+        if self._host_event_handler:
+            self._host_event_handler.shutdown()
+            self._host_event_handler = None
+
     def __enter__(self):
         return self
 
@@ -3256,7 +3373,7 @@ class Session(object):
                     host, conn_exc, is_host_addition, expect_host_to_be_down=True)
                 return False
 
-            previous = self._pools.get(host)
+            previous = self._pools.get(host.host_id)
             with self._lock:
                 while new_pool._keyspace != self.keyspace:
                     self._lock.release()
@@ -3276,7 +3393,7 @@ class Session(object):
                         self._lock.acquire()
                         return False
                     self._lock.acquire()
-                self._pools[host] = new_pool
+                self._pools[host.host_id] = new_pool
 
             log.debug("Added pool for host %s to session", host)
             if previous:
@@ -3287,7 +3404,7 @@ class Session(object):
         return self.submit(run_add_or_renew_pool)
 
     def remove_pool(self, host):
-        pool = self._pools.pop(host, None)
+        pool = self._pools.pop(host.host_id, None)
         if pool:
             log.debug("Removed connection pool for %r", host)
             return self.submit(pool.shutdown)
@@ -3309,7 +3426,7 @@ class Session(object):
         futures = set()
         for host in self.cluster.metadata.all_hosts():
             distance = self._profile_manager.distance(host)
-            pool = self._pools.get(host)
+            pool = self._pools.get(host.host_id)
             future = None
             if not pool or pool.is_shutdown:
                 # we don't eagerly set is_up on previously ignored hosts. None is included here
@@ -3339,6 +3456,30 @@ class Session(object):
     def on_remove(self, host):
         """ Internal """
         self.on_down(host)
+
+    def on_change(self, old_host, new_host, changed_fields):
+        """ Internal """
+        pool = self._pools.get(new_host.host_id)
+        if not pool:
+            self.update_created_pools()
+            return None
+
+        if "endpoint" in changed_fields:
+            return self.add_or_renew_pool(new_host, is_host_addition=False)
+
+        pool.rebind_host(new_host)
+        self.update_created_pools()
+        return None
+
+    def _handle_host_event(self, event):
+        payload = event.payload
+        if event.type == HOST_DOWN:
+            self.on_down(payload.host)
+        elif event.type == HOST_REMOVED:
+            self.on_remove(payload.host)
+        elif event.type == HOST_CHANGED:
+            if payload.old_host is not payload.new_host:
+                self.on_change(payload.old_host, payload.new_host, payload.changed_fields)
 
     def set_keyspace(self, keyspace):
         """
@@ -3408,7 +3549,10 @@ class Session(object):
             return self.cluster.executor.submit(fn, *args, **kwargs)
 
     def get_pool_state(self):
-        return dict((host, pool.get_state()) for host, pool in tuple(self._pools.items()))
+        return dict((pool.host, pool.get_state()) for pool in tuple(self._pools.values()))
+
+    def get_pool_state_by_host_id(self):
+        return dict((host_id, pool.get_state()) for host_id, pool in tuple(self._pools.items()))
 
     def get_pools(self):
         return self._pools.values()
@@ -3480,6 +3624,8 @@ class ControlConnection(object):
     Internal
     """
 
+    _HOST_EVENT_TYPES = (HOST_CHANGED,)
+
     _SELECT_PEERS = "SELECT peer, data_center, host_id, rack, release_version, rpc_address, schema_version, tokens FROM system.peers"
     _SELECT_PEERS_NO_TOKENS_TEMPLATE = "SELECT host_id, peer, data_center, rack, rpc_address, {nt_col_name}, release_version, schema_version FROM system.peers"
     _SELECT_LOCAL = "SELECT broadcast_address, cluster_name, data_center, host_id, listen_address, partitioner, rack, release_version, rpc_address, schema_version, tokens FROM system.local WHERE key='local'"
@@ -3547,6 +3693,15 @@ class ControlConnection(object):
         self._reconnection_lock = RLock()
 
         self._event_schedule_times = {}
+        self._event_bus = getattr(cluster, '_event_bus', None)
+        if self._event_bus:
+            for event_type in self._HOST_EVENT_TYPES:
+                self._event_bus.subscribe(event_type, self._handle_host_event)
+
+    def _handle_host_event(self, event):
+        payload = event.payload
+        if event.type == HOST_CHANGED:
+            self.on_change(payload.old_host, payload.new_host, payload.changed_fields)
 
     def connect(self):
         if self._is_shutdown:
@@ -3770,6 +3925,10 @@ class ControlConnection(object):
             if self._connection:
                 self._connection.close()
                 self._connection = None
+        if self._event_bus:
+            for event_type in self._HOST_EVENT_TYPES:
+                self._event_bus.unsubscribe(event_type, self._handle_host_event)
+            self._event_bus = None
 
     def refresh_schema(self, force=False, **kwargs):
         try:
@@ -3884,6 +4043,19 @@ class ControlConnection(object):
             host = self._cluster.metadata.get_host(endpoint)
             datacenter = row.get("data_center")
             rack = row.get("rack")
+            host_fields = {
+                "endpoint": endpoint,
+                "datacenter": datacenter,
+                "rack": rack,
+                "broadcast_address": _NodeInfo.get_broadcast_address(row),
+                "broadcast_port": _NodeInfo.get_broadcast_port(row),
+                "broadcast_rpc_address": _NodeInfo.get_broadcast_rpc_address(row),
+                "broadcast_rpc_port": _NodeInfo.get_broadcast_rpc_port(row),
+                "release_version": row.get("release_version"),
+                "dse_version": row.get("dse_version"),
+                "dse_workload": row.get("workload"),
+                "dse_workloads": row.get("workloads"),
+            }
 
             if host is None:
                 host = self._cluster.metadata.get_host_by_host_id(host_id)
@@ -3892,40 +4064,36 @@ class ControlConnection(object):
                     reconnector = host.get_and_set_reconnection_handler(None)
                     if reconnector:
                         reconnector.cancel()
-                    self._cluster.on_down(host, is_host_addition=False, expect_host_to_be_down=True)
-
-                    old_endpoint = host.endpoint
-                    host.endpoint = endpoint
-                    self._cluster.metadata.update_host(host, old_endpoint)
-                    self._cluster.on_up(host)
 
             if host is None:
                 log.debug("[control connection] Found new host to connect to: %s", endpoint)
                 host, _ = self._cluster.add_host(endpoint, datacenter=datacenter, rack=rack, signal=True, refresh_nodes=False, host_id=host_id)
                 should_rebuild_token_map = True
-            else:
-                should_rebuild_token_map |= self._update_location_info(host, datacenter, rack)
 
-            host.host_id = host_id
-            host.broadcast_address = _NodeInfo.get_broadcast_address(row)
-            host.broadcast_port = _NodeInfo.get_broadcast_port(row)
-            host.broadcast_rpc_address = _NodeInfo.get_broadcast_rpc_address(row)
-            host.broadcast_rpc_port = _NodeInfo.get_broadcast_rpc_port(row)
-            host.release_version = row.get("release_version")
-            host.dse_version = row.get("dse_version")
-            host.dse_workload = row.get("workload")
-            host.dse_workloads = row.get("workloads")
+            replace_host = getattr(self._cluster.metadata, "replace_host", None)
+            if replace_host:
+                host, changed_fields = replace_host(host_id, source=self, **host_fields)
+                should_rebuild_token_map |= bool(changed_fields)
+            else:
+                old_endpoint = host.endpoint
+                for field, value in host_fields.items():
+                    if field == "datacenter":
+                        object.__setattr__(host, "_datacenter", value)
+                    elif field == "rack":
+                        object.__setattr__(host, "_rack", value)
+                    else:
+                        object.__setattr__(host, field, value)
+                self._cluster.metadata.update_host(host, old_endpoint=old_endpoint)
 
             tokens = row.get("tokens", None)
             if partitioner and tokens and self._token_meta_enabled:
                 token_map[host] = tokens
-            self._cluster.metadata.update_host(host, old_endpoint=endpoint)
 
         for old_host_id, old_host in self._cluster.metadata.all_hosts_items():
             if old_host_id not in found_host_ids:
                 should_rebuild_token_map = True
                 log.debug("[control connection] Removing host not found in peers metadata: %r", old_host)
-                self._cluster.metadata.remove_host_by_host_id(old_host_id, old_host.endpoint)
+                self._cluster.remove_host(old_host, source=self)
 
         log.debug("[control connection] Finished fetching ring info")
         if partitioner and should_rebuild_token_map:
@@ -3973,12 +4141,13 @@ class ControlConnection(object):
         if host.datacenter == datacenter and host.rack == rack:
             return False
 
-        # If the dc/rack information changes, we need to update the load balancing policy.
-        # For that, we remove and re-add the node against the policy. Not the most elegant, and assumes
-        # that the policy will update correctly, but in practice this should work.
-        self._cluster.profile_manager.on_down(host)
-        host.set_location_info(datacenter, rack)
-        self._cluster.profile_manager.on_up(host)
+        replace_host = getattr(self._cluster.metadata, "replace_host", None)
+        if replace_host:
+            replace_host(host.host_id, source=self, datacenter=datacenter, rack=rack)
+            return True
+
+        new_host = host.set_location_info(datacenter, rack)
+        self._cluster.metadata.update_host(new_host, old_endpoint=host.endpoint)
         return True
 
     def _delay_for_event_type(self, event_type, delay_window):
@@ -4260,6 +4429,16 @@ class ControlConnection(object):
         else:
             self.refresh_node_list_and_token_map(force_token_rebuild=True)
 
+    def on_change(self, old_host, new_host, changed_fields):
+        if "endpoint" not in changed_fields:
+            return
+
+        c = self._connection
+        if c and c.endpoint == old_host.endpoint:
+            log.debug("[control connection] Control connection host (%s) endpoint changed to %s. Reconnecting",
+                      old_host, new_host.endpoint)
+            self.reconnect()
+
     def get_connections(self):
         c = getattr(self, '_connection', None)
         return [c] if c else []
@@ -4443,6 +4622,10 @@ class ResponseFuture(object):
 
     _warned_timeout = False
 
+    @staticmethod
+    def _pool_key(host):
+        return host.host_id if isinstance(host, Host) else host
+
     def __init__(self, session, message, query, timeout, metrics=None, prepared_statement=None,
                  retry_policy=RetryPolicy(), row_factory=None, load_balancer=None, start_time=None,
                  speculative_execution_plan=None, continuous_paging_state=None, host=None):
@@ -4524,7 +4707,7 @@ class ResponseFuture(object):
             # Capture connection stats before pool.return_connection() can alter state
             conn_in_flight = self._connection.in_flight
 
-            pool = self.session._pools.get(self._current_host)
+            pool = self.session._pools.get(self._pool_key(self._current_host))
             if pool and not pool.is_shutdown:
                 # Do not return the stream ID to the pool yet. We cannot reuse it
                 # because the node might still be processing the query and will
@@ -4607,7 +4790,7 @@ class ResponseFuture(object):
         if message is None:
             message = self.message
 
-        pool = self.session._pools.get(host)
+        pool = self.session._pools.get(self._pool_key(host))
         if not pool:
             self._errors[host] = ConnectionException("Host has been marked down or removed")
             return None
