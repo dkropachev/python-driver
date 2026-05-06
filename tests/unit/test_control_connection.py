@@ -113,12 +113,16 @@ class MockCluster(object):
         self.ssl_options = None
 
     def add_host(self, endpoint, datacenter, rack, signal=False, refresh_nodes=True, host_id=None,
-                 is_zero_token=False):
+                 is_zero_token=None):
         host = Host(endpoint, SimpleConvictionPolicy, datacenter, rack, host_id=host_id)
-        host.is_zero_token = is_zero_token
-        host, _ = self.metadata.add_or_return_host(host)
-        self.added_hosts.append(host)
-        return host, True
+        if is_zero_token is not None:
+            host.is_zero_token = is_zero_token
+        host, new = self.metadata.add_or_return_host(host)
+        if is_zero_token is not None:
+            host.is_zero_token = is_zero_token
+        if new:
+            self.added_hosts.append(host)
+        return host, new
 
     def remove_host(self, host):
         pass
@@ -217,6 +221,22 @@ class ControlConnectionTest(unittest.TestCase):
         assert zero_token_host.is_zero_token
         assert zero_token_host not in self.cluster.metadata.token_map
         return zero_token_host
+
+    def test_mock_add_host_updates_zero_token_status_for_existing_host(self):
+        endpoint = DefaultEndPoint("192.168.1.0")
+
+        host, new = self.cluster.add_host(endpoint, "dc1", "rack1", signal=False,
+                                          host_id="uuid1", is_zero_token=True)
+
+        assert new is False
+        assert host.is_zero_token is True
+
+        same_host, new = self.cluster.add_host(endpoint, "dc1", "rack1", signal=False,
+                                               host_id="uuid1", is_zero_token=False)
+
+        assert new is False
+        assert same_host is host
+        assert same_host.is_zero_token is False
 
     def test_wait_for_schema_agreement(self):
         """
