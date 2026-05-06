@@ -2077,6 +2077,7 @@ class Cluster(object):
         have_future = False
         add_aborted = False
         futures = set()
+        finalize_add = None
         try:
             self.profile_manager.on_add(host)
             self.control_connection.on_add(host, refresh_nodes)
@@ -2089,58 +2090,60 @@ class Cluster(object):
             if distance == HostDistance.IGNORED:
                 log.debug("Not adding connection pool for new host %r because the "
                           "load balancing policy has marked it as IGNORED", host)
-                self._finalize_add(host, set_up=False)
-                return
+                finalize_add = False
+            else:
+                futures_lock = Lock()
+                futures_results = []
 
-            futures_lock = Lock()
-            futures_results = []
+                def future_completed(future):
+                    with futures_lock:
+                        futures.discard(future)
 
-            def future_completed(future):
-                with futures_lock:
-                    futures.discard(future)
+                        if add_aborted:
+                            return
 
-                    if add_aborted:
+                        try:
+                            futures_results.append(future.result())
+                        except Exception as exc:
+                            futures_results.append(exc)
+
+                        if futures:
+                            return
+
+                    log.debug('All futures have completed for added host %s', host)
+
+                    for exc in [f for f in futures_results if isinstance(f, Exception)]:
+                        log.error("Unexpected failure while adding node %s, will not mark up:", host, exc_info=exc)
+                        self._cleanup_failed_on_add_handling(host)
                         return
 
-                    try:
-                        futures_results.append(future.result())
-                    except Exception as exc:
-                        futures_results.append(exc)
-
-                    if futures:
+                    if not all(futures_results):
+                        log.warning("Connection pool could not be created, not marking node %s up", host)
+                        self._cleanup_failed_on_add_handling(host)
                         return
 
-                log.debug('All futures have completed for added host %s', host)
+                    self._finalize_add(host)
 
-                for exc in [f for f in futures_results if isinstance(f, Exception)]:
-                    log.error("Unexpected failure while adding node %s, will not mark up:", host, exc_info=exc)
-                    self._cleanup_failed_on_add_handling(host)
-                    return
+                for session in tuple(self.sessions):
+                    future = session.add_or_renew_pool(host, is_host_addition=True)
+                    if future is not None:
+                        have_future = True
+                        futures.add(future)
 
-                if not all(futures_results):
-                    log.warning("Connection pool could not be created, not marking node %s up", host)
-                    self._cleanup_failed_on_add_handling(host)
-                    return
+                for future in tuple(futures):
+                    future.add_done_callback(future_completed)
 
-                self._finalize_add(host)
-
-            for session in tuple(self.sessions):
-                future = session.add_or_renew_pool(host, is_host_addition=True)
-                if future is not None:
-                    have_future = True
-                    futures.add(future)
-
-            for future in tuple(futures):
-                future.add_done_callback(future_completed)
-
-            if not have_future:
-                self._finalize_add(host)
+                if not have_future:
+                    finalize_add = True
         except Exception:
             add_aborted = True
             for future in tuple(futures):
                 future.cancel()
             self._cleanup_failed_on_add_handling(host)
             raise
+
+        if finalize_add is not None:
+            self._finalize_add(host, set_up=finalize_add)
 
     def _finalize_add(self, host, set_up=True):
         try:

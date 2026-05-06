@@ -177,6 +177,25 @@ class ClusterTest(unittest.TestCase):
         finally:
             cluster.shutdown()
 
+    def test_on_add_listener_failure_does_not_mark_successful_add_down(self):
+        cluster = Cluster(protocol_version=4)
+        host = Host("127.0.0.1", SimpleConvictionPolicy, datacenter="dc1", rack="rack1", host_id=uuid.uuid4())
+        listener = Mock()
+        listener.on_add.side_effect = RuntimeError("listener failed")
+        cluster.register_listener(listener)
+
+        try:
+            with pytest.raises(RuntimeError):
+                cluster.on_add(host, refresh_nodes=False)
+
+            load_balancer = cluster.profile_manager.default.load_balancing_policy
+            assert host.is_up is True
+            assert host in list(load_balancer.make_query_plan())
+            assert not host.is_currently_reconnecting()
+            assert not host._currently_handling_node_addition
+        finally:
+            cluster.shutdown()
+
     def test_on_add_waits_for_all_session_pool_futures_before_marking_host_up(self):
         cluster = Cluster(protocol_version=4)
         host = Host("127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
