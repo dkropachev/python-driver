@@ -17,12 +17,14 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, ANY, call, patch
 
-from cassandra import OperationTimedOut, SchemaTargetType, SchemaChangeType
+from cassandra import (AuthenticationFailed, OperationTimedOut,
+                       SchemaTargetType, SchemaChangeType)
 from cassandra.protocol import ResultMessage, RESULT_KIND_ROWS
 from cassandra.cluster import (Cluster, ControlConnection, _Scheduler,
                                ProfileManager, EXEC_PROFILE_DEFAULT,
                                ExecutionProfile,
-                               ControlConnectionQueryFallback)
+                               ControlConnectionQueryFallback,
+                               _ControlReconnectionHandler)
 from cassandra.pool import Host
 from cassandra.connection import (ConnectionException, EndPoint, DefaultEndPoint,
                                   DefaultEndPointFactory, UnixSocketEndPoint)
@@ -619,6 +621,71 @@ class ControlConnectionTest(unittest.TestCase):
         self.control_connection._signal_error()
 
         self.cluster.executor.submit.assert_not_called()
+
+    def test_signal_error_leaves_an_in_flight_reconnection_alone(self):
+        # _reconnect() cancels the handler and restarts its schedule from the
+        # initial delay, so repeated errors must not keep resetting the backoff.
+        host = self.cluster.metadata.get_host_by_host_id('uuid1')
+        host.set_down()
+        self._use_cluster_down_handling()
+        self.control_connection._reconnection_handler = Mock()
+        self.connection.is_defunct = True
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
+        self.cluster.executor.reset_mock()
+
+        self.control_connection._signal_error()
+
+        self.cluster.executor.submit.assert_not_called()
+
+    def _make_reconnection_handler(self):
+        handler = _ControlReconnectionHandler(
+            self.control_connection, self.cluster.scheduler, iter([1.0]),
+            self.control_connection._get_and_set_reconnection_handler,
+            new_handler=None)
+        self.control_connection._reconnection_handler = handler
+        return handler
+
+    def test_reconnection_handler_releases_its_slot_when_it_gives_up(self):
+        for exc, next_delay in ((AuthenticationFailed('bad password'), 1.0),
+                                (ConnectionException('refused'), None)):
+            with self.subTest(exc=exc, next_delay=next_delay):
+                handler = self._make_reconnection_handler()
+
+                handler.on_exception(exc, next_delay)
+
+                assert self.control_connection._reconnection_handler is None
+
+    def test_reconnection_handler_keeps_its_slot_while_it_retries(self):
+        handler = self._make_reconnection_handler()
+
+        assert handler.on_exception(ConnectionException('refused'), 1.0)
+
+        assert self.control_connection._reconnection_handler is handler
+
+    def test_reconnection_handler_never_releases_a_replacement(self):
+        handler = self._make_reconnection_handler()
+        replacement = self._make_reconnection_handler()
+
+        handler.on_exception(AuthenticationFailed('bad password'), 1.0)
+
+        assert self.control_connection._reconnection_handler is replacement
+
+    def test_signal_error_reconnects_once_a_reconnection_has_given_up(self):
+        host = self.cluster.metadata.get_host_by_host_id('uuid1')
+        host.set_down()
+        self._use_cluster_down_handling()
+        handler = self._make_reconnection_handler()
+        handler.on_exception(AuthenticationFailed('bad password'), 1.0)
+        self.connection.is_defunct = True
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
+        self.cluster.executor.reset_mock()
+
+        self.control_connection._signal_error()
+
+        self.cluster.executor.submit.assert_called_once_with(
+            self.control_connection._reconnect)
 
     def test_defunct_control_reconnects_when_down_dispatch_is_dropped(self):
         # on_down() marks the host down but the executor refuses the DOWN

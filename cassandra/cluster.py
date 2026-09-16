@@ -3744,10 +3744,27 @@ class _ControlReconnectionHandler(_ReconnectionHandler):
     def on_exception(self, exc, next_delay):
         # TODO only overridden to add logging, so add logging
         if isinstance(exc, AuthenticationFailed):
-            return False
+            keep_retrying = False
         else:
             log.debug("Error trying to reconnect control connection: %r", exc)
-            return True
+            keep_retrying = True
+
+        if not keep_retrying or next_delay is None:
+            # This handler will never run again. Release the slot it occupies,
+            # or the next error would find a dead handler parked there and
+            # conclude a reconnection was already in progress.
+            self._release()
+
+        return keep_retrying
+
+    def _release(self):
+        try:
+            control_connection = self.control_connection
+            with control_connection._reconnection_lock:
+                if control_connection._reconnection_handler is self:
+                    control_connection._reconnection_handler = None
+        except ReferenceError:
+            pass  # our weak reference to the ControlConnection is no good
 
 
 def _watch_callback(obj_weakref, method_name, *args, **kwargs):
@@ -4608,7 +4625,15 @@ class ControlConnection(object):
                     return
 
         # If the connection is not defunct, the host is unresolved, or DOWN
-        # handling was suppressed, reconnect manually.
+        # handling was suppressed, reconnect manually. An in-flight
+        # reconnection handler is already retrying on its own schedule, and
+        # _reconnect() would cancel it and restart that schedule from its
+        # initial delay, so leave it alone. This mirrors on_down().
+        if self._reconnection_handler is not None:
+            log.debug("[control connection] Reconnection already in progress, "
+                      "not starting another one")
+            return
+
         self.reconnect()
 
     def on_up(self, host):
