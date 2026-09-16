@@ -779,7 +779,8 @@ class ClusterDownHandlingTest(unittest.TestCase):
         self.addCleanup(self.cluster.shutdown)
         self.cluster.profile_manager.distance = Mock(
             return_value=HostDistance.LOCAL)
-        self.cluster.on_down_potentially_blocking = Mock()
+        # The real method reports whether the executor accepted the work.
+        self.cluster.on_down_potentially_blocking = Mock(return_value=True)
         self.host = Host(
             "127.0.0.1", SimpleConvictionPolicy, host_id=uuid.uuid4())
         self.host.set_up()
@@ -922,6 +923,31 @@ class ClusterDownHandlingTest(unittest.TestCase):
 
         assert self.host.is_up is False
         self.cluster.on_down_potentially_blocking.assert_not_called()
+
+    def test_on_down_reports_undispatched_when_the_executor_rejects_it(self):
+        # Restore the real method so the executor submission is exercised.
+        del self.cluster.on_down_potentially_blocking
+        real_executor = self.cluster.executor
+        self.addCleanup(setattr, self.cluster, 'executor', real_executor)
+        self.cluster.executor = Mock()
+        self.cluster.executor.submit.side_effect = RuntimeError(
+            "cannot schedule new futures")
+
+        assert not self.cluster.on_down(self.host, is_host_addition=False)
+
+        assert self.host.is_up is False
+        self.cluster.executor.submit.assert_called_once()
+
+    def test_on_down_reports_dispatched_when_the_executor_accepts_it(self):
+        del self.cluster.on_down_potentially_blocking
+        real_executor = self.cluster.executor
+        self.addCleanup(setattr, self.cluster, 'executor', real_executor)
+        self.cluster.executor = Mock()
+
+        assert self.cluster.on_down(self.host, is_host_addition=False)
+
+        self.cluster.executor.submit.assert_called_once()
+
 
 class ProtocolVersionTests(unittest.TestCase):
 

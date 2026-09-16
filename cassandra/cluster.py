@@ -184,18 +184,24 @@ def _future_completed(future):
 def run_in_executor(f):
     """
     A decorator to run the given method in the ThreadPoolExecutor.
+
+    The wrapper returns whether the call was handed to the executor. It is
+    False when the cluster is shutting down or the executor rejected the
+    submission, in which case the wrapped method never runs.
     """
 
     @wraps(f)
     def new_f(self, *args, **kwargs):
 
         if self.is_shutdown:
-            return
+            return False
         try:
             future = self.executor.submit(f, self, *args, **kwargs)
             future.add_done_callback(_future_completed)
+            return True
         except Exception:
             log.exception("Failed to submit task to executor")
+            return False
 
     return new_f
 
@@ -2051,8 +2057,10 @@ class Cluster(object):
                 return False
         log.warning("Host %s has been marked down", host)
 
-        self.on_down_potentially_blocking(host, is_host_addition)
-        return True
+        # on_down_potentially_blocking() reports whether the executor accepted
+        # it. A dropped submission runs no DOWN callback, so it must not be
+        # reported as dispatched.
+        return self.on_down_potentially_blocking(host, is_host_addition)
 
     def on_add(self, host, refresh_nodes=True):
         if self.is_shutdown:

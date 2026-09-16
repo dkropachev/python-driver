@@ -241,7 +241,8 @@ class ControlConnectionTest(unittest.TestCase):
         self.cluster.profile_manager = Mock()
         self.cluster.profile_manager.distance.return_value = \
             HostDistance.LOCAL
-        self.cluster.on_down_potentially_blocking = Mock()
+        # The real method reports whether the executor accepted the work.
+        self.cluster.on_down_potentially_blocking = Mock(return_value=True)
         self.cluster.on_down = Cluster.on_down.__get__(self.cluster)
         self.cluster.signal_connection_failure = \
             Cluster.signal_connection_failure.__get__(self.cluster)
@@ -618,6 +619,27 @@ class ControlConnectionTest(unittest.TestCase):
         self.control_connection._signal_error()
 
         self.cluster.executor.submit.assert_not_called()
+
+    def test_defunct_control_reconnects_when_down_dispatch_is_dropped(self):
+        # on_down() marks the host down but the executor refuses the DOWN
+        # callback, so nothing else will reconnect the control connection.
+        host = self.cluster.metadata.get_host_by_host_id('uuid1')
+        host.set_up()
+        self._use_cluster_down_handling()
+        self.cluster.on_down_potentially_blocking = \
+            Cluster.on_down_potentially_blocking.__get__(self.cluster)
+        self.connection.is_defunct = True
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
+        self.cluster.executor.reset_mock()
+        self.cluster.executor.submit.side_effect = [
+            RuntimeError('cannot schedule new futures'), Mock()]
+
+        self.control_connection._signal_error()
+
+        assert host.is_up is False
+        assert self.cluster.executor.submit.call_args_list[-1] == call(
+            self.control_connection._reconnect)
 
     def test_refresh_network_local_preserves_known_unix_endpoint(self):
         maintenance_endpoint, local_host = \
