@@ -677,6 +677,34 @@ class ControlConnectionTest(unittest.TestCase):
 
         assert self.control_connection._reconnection_handler is replacement
 
+    def test_reconnection_handler_keeps_the_connection_it_installs(self):
+        # run() closes the connection it opened, which is right for the host
+        # handler that only probes with it, but this one hands it to the
+        # control connection.
+        handler = self._make_reconnection_handler()
+        self.control_connection._connection = None
+        conn = Mock()
+
+        with patch.object(handler, 'try_reconnect', return_value=conn):
+            handler.run()
+
+        assert self.control_connection._connection is conn
+        conn.close.assert_not_called()
+
+    def test_reconnecting_successfully_releases_a_parked_handler(self):
+        # A handler installed by an earlier failure is still backing off when
+        # an unrelated reconnect succeeds. Left in the slot it would look like
+        # a reconnection in progress to every later error.
+        handler = self._make_reconnection_handler()
+        self.control_connection._connection = None
+
+        with patch.object(self.control_connection, '_reconnect_internal',
+                          return_value=Mock()):
+            self.control_connection._reconnect()
+
+        assert self.control_connection._reconnection_handler is None
+        assert handler._cancelled
+
     def test_signal_error_reconnects_once_a_reconnection_has_given_up(self):
         host = self.cluster.metadata.get_host_by_host_id('uuid1')
         host.set_down()

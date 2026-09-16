@@ -3731,6 +3731,10 @@ class _ControlReconnectionHandler(_ReconnectionHandler):
     Internal
     """
 
+    # on_reconnection() installs the connection as the control connection,
+    # so it must outlive the handler run that opened it.
+    _keeps_connection = True
+
     def __init__(self, control_connection, *args, **kwargs):
         _ReconnectionHandler.__init__(self, *args, **kwargs)
         self.control_connection = weakref.proxy(control_connection)
@@ -3878,6 +3882,14 @@ class ControlConnection(object):
         """
         Replace existing connection (if there is one) and close it.
         """
+        # Whatever put this connection in place, the reconnection is over. A
+        # handler left parked in the slot would be mistaken for one still
+        # retrying, and its next attempt would replace this connection.
+        with self._reconnection_lock:
+            if self._reconnection_handler:
+                self._reconnection_handler.cancel()
+                self._reconnection_handler = None
+
         with self._lock:
             old = self._connection
             self._connection = conn
@@ -4033,10 +4045,16 @@ class ControlConnection(object):
                 return
             self._reconnect_pending = True
 
-        if self._submit(self._reconnect) is None:
-            # Nothing was queued, so nothing will clear the flag.
-            with self._reconnection_lock:
-                self._reconnect_pending = False
+        submitted = None
+        try:
+            submitted = self._submit(self._reconnect)
+        finally:
+            if submitted is None:
+                # Nothing was queued, so nothing will clear the flag. This has
+                # to hold even when the submission raised, or no further
+                # reconnection would ever be attempted.
+                with self._reconnection_lock:
+                    self._reconnect_pending = False
 
     def _reconnect(self):
         # An attempt that has started no longer collapses a later one: the
@@ -4648,13 +4666,16 @@ class ControlConnection(object):
         # handling was suppressed, reconnect manually. An in-flight
         # reconnection handler is already retrying on its own schedule, and
         # _reconnect() would cancel it and restart that schedule from its
-        # initial delay, so leave it alone. This mirrors on_down().
-        if self._reconnection_handler is not None:
-            log.debug("[control connection] Reconnection already in progress, "
-                      "not starting another one")
-            return
+        # initial delay, so leave it alone. This mirrors on_down(). The check
+        # and the reconnect share the lock so that a handler releasing the slot
+        # as it gives up cannot slip between them and leave nobody reconnecting.
+        with self._reconnection_lock:
+            if self._reconnection_handler is not None:
+                log.debug("[control connection] Reconnection already in progress, "
+                          "not starting another one")
+                return
 
-        self.reconnect()
+            self.reconnect()
 
     def on_up(self, host):
         pass
@@ -4662,8 +4683,13 @@ class ControlConnection(object):
     def on_down(self, host):
 
         conn = self._connection
-        if self._connection_matches_host(conn, host) and \
-                self._reconnection_handler is None:
+        if not self._connection_matches_host(conn, host):
+            return
+
+        with self._reconnection_lock:
+            if self._reconnection_handler is not None:
+                return
+
             log.debug("[control connection] Control connection host (%s) is "
                       "considered down, starting reconnection", host)
             # this will result in a task being submitted to the executor to reconnect

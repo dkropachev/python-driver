@@ -46,10 +46,16 @@ Bug Fixes
   that an accepted DOWN transition already performs. Two related cases are fixed with
   it: a control connection whose reconnection attempts are already backing off no longer
   has that schedule cancelled and restarted from its initial delay by every further
-  error, and a reconnection handler that has stopped for good -- after an
-  ``AuthenticationFailed``, or once its retry schedule is exhausted -- now releases the
-  slot it occupies, so a later error starts a fresh reconnection instead of mistaking the
-  dead handler for one still retrying.
+  error, and a reconnection handler that has stopped for good -- once its retry schedule
+  is exhausted -- now releases the slot it occupies, so a later error starts a fresh
+  reconnection instead of mistaking the dead handler for one still retrying. The slot is
+  likewise released once a connection is installed, so a handler whose backoff outlived
+  the reconnection that succeeded without it no longer blocks the next one.
+* The control connection is no longer closed immediately after a reconnection handler
+  restores it. ``_ReconnectionHandler.run()`` closed the connection it had just opened,
+  which is right for the host handler that only uses it to probe the host, but left the
+  control connection dead the moment its backoff finally succeeded -- until a heartbeat
+  noticed, or forever with ``idle_heartbeat_interval=0``.
 
 Others
 ------
