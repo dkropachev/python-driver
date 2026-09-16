@@ -43,6 +43,18 @@ Bug Fixes
   ``InvalidRequest`` on the fallback path, since it would change the keyspace of the
   shared connection under every other session using it; the keyspace has to be chosen
   when the session is created (#1013).
+* Fix the client-side timeout never firing for a request on the control-connection
+  fallback path while the driver's own ``USE`` is in flight. The ``USE`` is sent
+  without recording a host attempt, and ``_on_speculative_execute`` checked its
+  "no attempt recorded yet" guard before the deadline, so with a speculative
+  execution policy configured a repeatedly failing ``USE`` rescheduled the callback
+  every 10ms instead of ever timing the request out. The deadline is now checked
+  first (#1013).
+* Fix ``ResponseFuture._req_id`` being left pointing at the driver's own ``USE``
+  instead of the request actually in flight, when the ``SET_KEYSPACE`` reply is
+  processed before ``send_msg()`` returns. On a later timeout the driver then
+  orphaned the wrong stream id and left the real request in the connection's
+  request map (#1013).
 
 Others
 ------

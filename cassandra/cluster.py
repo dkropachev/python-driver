@@ -5079,6 +5079,18 @@ class ResponseFuture(object):
         self._timer = None
         if not self._event.is_set():
 
+            # Check the deadline before the PYTHON-836 guard below. That guard
+            # only exists to keep speculative queries from running ahead of the
+            # main thread's first query; it must not swallow an expired client
+            # timeout. The driver's own USE on the control-connection fallback
+            # path is sent with record_attempt=False, so attempted_hosts stays
+            # empty for its whole round trip - and if that USE keeps failing and
+            # retrying, the 0.01s reschedule below would spin forever instead of
+            # ever timing the request out.
+            if self._time_remaining is not None and self._time_remaining <= 0:
+                self._on_timeout()
+                return
+
             # PYTHON-836, the speculative queries must be after
             # the query is sent from the main thread, otherwise the
             # query from the main thread may raise NoHostAvailable
@@ -5090,10 +5102,6 @@ class ResponseFuture(object):
                 self._timer = self.session.cluster.connection_class.create_timer(0.01, self._on_speculative_execute)
                 return
 
-            if self._time_remaining is not None:
-                if self._time_remaining <= 0:
-                    self._on_timeout()
-                    return
             self.send_request(error_no_hosts=False)
             self._start_timer()
 
@@ -5239,6 +5247,7 @@ class ResponseFuture(object):
 
         request_id = None
         request_sent = False
+        previous_req_id = self._req_id
         try:
             request_id = self._borrow_control_connection(connection)
             self._connection = connection
@@ -5248,11 +5257,17 @@ class ResponseFuture(object):
             cb = partial(self._handle_control_connection_response, connection, cb)
 
             log.debug("No usable node pools; falling back to control connection for host %s", host)
+            # Record the stream id before sending, not after. The reply can be
+            # handled re-entrantly - a SET_KEYSPACE reply sends the real message
+            # from inside this very call - and that nested send has to be the one
+            # whose id survives in _req_id. Assigning after send_msg() would put
+            # the already-completed USE id there instead, so a later timeout would
+            # orphan the wrong stream and leave the real request in _requests.
+            self._req_id = request_id
             encoded_size = connection.send_msg(message, request_id, cb=cb,
                                                encoder=self._protocol_handler.encode_message,
                                                decoder=self._protocol_handler.decode_message,
                                                result_metadata=result_meta)
-            self._req_id = request_id
             if record_size:
                 self.request_encoded_size = encoded_size
             request_sent = True
@@ -5272,6 +5287,10 @@ class ResponseFuture(object):
                 self._metrics.on_connection_error()
         finally:
             if request_id is not None and not request_sent:
+                # Only roll back if nothing else claimed _req_id in the meantime,
+                # so a nested send that did go out keeps its id.
+                if self._req_id == request_id:
+                    self._req_id = previous_req_id
                 self._release_control_connection_request(connection, request_id)
 
         return None

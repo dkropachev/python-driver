@@ -583,6 +583,68 @@ class ResponseFutureTests(unittest.TestCase):
         conflict = control_connection._attach_application_session('ks1', session2)
         assert conflict is not None and 'already attached' in conflict
 
+    def test_control_connection_fallback_req_id_tracks_real_message(self):
+        session = self._make_fallback_session(keyspace='ks1')
+        connection = self.make_control_connection()
+        connection.get_request_id.side_effect = [7, 8]
+        session.cluster.control_connection._connection = connection
+        session.cluster.get_control_connection_host.return_value = Mock(endpoint=connection.endpoint)
+
+        def send_msg(message, request_id, cb=None, **kwargs):
+            # the SET_KEYSPACE reply lands before send_msg() returns, so the real
+            # query is sent re-entrantly from inside this very call
+            if getattr(message, 'query', None) == 'USE ks1':
+                connection.keyspace = 'ks1'
+                cb(Mock(spec=ResultMessage, kind=RESULT_KIND_SET_KEYSPACE,
+                        new_keyspace='ks1'))
+            return 128
+
+        connection.send_msg.side_effect = send_msg
+
+        rf = self.make_response_future(session)
+        assert rf.send_request()
+
+        # 7 is the USE's stream id, 8 the real query's. _req_id has to be 8: on a
+        # later timeout it is the id popped from _requests and orphaned, so the
+        # USE id here would leave the real request in flight and unorphaned.
+        assert [c[0][1] for c in connection.send_msg.call_args_list] == [7, 8]
+        assert rf._req_id == 8
+
+    def test_control_connection_fallback_req_id_restored_when_send_fails(self):
+        session = self._make_fallback_session(keyspace=None)
+        connection = self.make_control_connection()
+        session.cluster.control_connection._connection = connection
+        session.cluster.get_control_connection_host.return_value = Mock(endpoint=connection.endpoint)
+        connection.send_msg.side_effect = ConnectionBusy('no streams')
+
+        rf = self.make_response_future(session)
+        rf._req_id = 42
+        # nothing could be sent, so the future ends as NoHostAvailable
+        assert not rf.send_request()
+
+        # a request that never went out must not leave its id behind for
+        # _on_timeout() to orphan
+        assert rf._req_id == 42
+
+    def test_speculative_execute_honours_expired_deadline_without_attempts(self):
+        session = self.make_basic_session()
+        session.cluster._default_load_balancing_policy.make_query_plan.return_value = []
+        rf = self.make_response_future(session)
+        rf.timeout = 1
+        rf._start_time = time.time() - 5
+        rf.attempted_hosts = []
+        rf._on_timeout = Mock()
+        session.cluster.connection_class.create_timer.reset_mock()
+
+        rf._on_speculative_execute()
+
+        # the PYTHON-836 "no attempt recorded yet" guard must not swallow an
+        # already-expired client timeout: the driver's own USE is sent with
+        # record_attempt=False, so a retrying USE would otherwise reschedule
+        # this callback every 10ms forever and the request would never time out
+        rf._on_timeout.assert_called_once_with()
+        session.cluster.connection_class.create_timer.assert_not_called()
+
     def _make_fallback_session(self, cluster=None, keyspace=None):
         session = self.make_basic_session()
         if cluster is not None:
