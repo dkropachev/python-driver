@@ -33,8 +33,12 @@ Bug Fixes
 ---------
 * Prevent sessions from leaking keyspace state when application queries fall back to
   the shared control connection. The first fallback session binds that connection to
-  its keyspace (including no keyspace); later fallback sessions with a different
-  keyspace are rejected (#1013).
+  its keyspace (including no keyspace); other fallback sessions with a different
+  keyspace are rejected while that binding is held. The binding is released once
+  every session holding it has been shut down or garbage collected, so a later
+  session can take it over. Taking it over from a session without a keyspace is
+  rejected when the previous holder left the shared connection in a keyspace, since
+  CQL offers no way back to "no keyspace" (#1013).
 
 Others
 ------

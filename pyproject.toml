@@ -154,6 +154,7 @@ build-frontend = "build[uv]"
 environment = { CASS_DRIVER_BUILD_CONCURRENCY = "2", CASS_DRIVER_BUILD_EXTENSIONS_ARE_MUST = "yes", CFLAGS = "-g0 -O3" }
 skip = [
     "cp39*",
+    "pp39*",
     "cp3*t-*",
     "*i686",
     "*win32",

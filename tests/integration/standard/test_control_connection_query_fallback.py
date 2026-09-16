@@ -106,22 +106,27 @@ class ControlConnectionQueryFallbackIntegrationTests(unittest.TestCase):
         assert str(row.rpc_address) == _UNREACHABLE_BROADCAST_RPC_ADDRESS
         assert row.release_version
 
-    def test_shared_control_connection_accepts_only_one_session_keyspace(self):
+    def _bootstrap_keyspaces(self, *keyspaces, tables=()):
         bootstrap_cluster = TestCluster(
             allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
             connect_timeout=1,
         )
         try:
             setup_session = bootstrap_cluster.connect()
-            for keyspace in ('fallback_ks_one', 'fallback_ks_two'):
+            for keyspace in keyspaces:
                 setup_session.execute("DROP KEYSPACE IF EXISTS {}".format(keyspace))
                 setup_session.execute(
                     "CREATE KEYSPACE {} WITH replication = "
                     "{{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}".format(keyspace))
-            setup_session.execute(
-                "CREATE TABLE fallback_ks_one.items (id int PRIMARY KEY, value text)")
+            for table in tables:
+                setup_session.execute(table)
         finally:
             bootstrap_cluster.shutdown()
+
+    def test_shared_control_connection_accepts_only_one_session_keyspace(self):
+        self._bootstrap_keyspaces(
+            'fallback_ks_one', 'fallback_ks_two',
+            tables=("CREATE TABLE fallback_ks_one.items (id int PRIMARY KEY, value text)",))
 
         self.cluster = TestCluster(
             allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
@@ -154,4 +159,38 @@ class ControlConnectionQueryFallbackIntegrationTests(unittest.TestCase):
             "SELECT value FROM items WHERE id IN (1, 2)")
 
         assert {row.value for row in select_one.result()} == {'one', 'prepared-one'}
+        assert self.cluster.control_connection._connection is control_connection
+
+    def test_shared_control_connection_keyspace_is_reclaimed_after_shutdown(self):
+        self._bootstrap_keyspaces('fallback_ks_one', 'fallback_ks_two')
+
+        self.cluster = TestCluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
+            connect_timeout=1,
+        )
+        session_one = self.cluster.connect('fallback_ks_one')
+        control_connection = self.cluster.control_connection._connection
+
+        assert list(session_one.get_pools()) == []
+        session_one.execute("SELECT key FROM system.local WHERE key='local'")
+        assert control_connection.keyspace == 'fallback_ks_one'
+
+        # while the binding is held, another keyspace cannot use the fallback
+        with pytest.raises(InvalidRequest, match='already attached'):
+            self.cluster.connect('fallback_ks_two')
+
+        session_one.shutdown()
+
+        # the binding is released with its only holder, so it can be taken over
+        session_two = self.cluster.connect('fallback_ks_two')
+        session_two.execute("SELECT key FROM system.local WHERE key='local'")
+        assert control_connection.keyspace == 'fallback_ks_two'
+
+        session_two.shutdown()
+
+        # ...but not by a session without a keyspace: the shared connection is
+        # still in 'fallback_ks_two' and CQL cannot unset it
+        with pytest.raises(InvalidRequest, match='cannot be reset to no keyspace'):
+            self.cluster.connect()
+
         assert self.cluster.control_connection._connection is control_connection
