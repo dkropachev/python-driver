@@ -4037,7 +4037,20 @@ class ControlConnection(object):
         # this, a burst of errors queues one _reconnect() each, and every one
         # of them past the first cancels the reconnection handler the previous
         # one installed and restarts its backoff schedule.
+        #
+        # An in-flight reconnection handler is already retrying on its own
+        # schedule, and _reconnect() would cancel it and restart that schedule
+        # from its initial delay. The check lives here rather than in the
+        # callers so that it covers every entry point: return_connection() is
+        # driven by the heartbeat and fires once per idle_heartbeat_interval
+        # for as long as the control connection stays defunct, which would
+        # otherwise reset the backoff on every pass and stop it ever growing.
+        # The lock is an RLock, so callers already holding it re-enter safely.
         with self._reconnection_lock:
+            if self._reconnection_handler is not None:
+                log.debug("[control connection] Reconnection already in progress, "
+                          "not starting another one")
+                return
             if self._reconnect_pending:
                 log.debug("[control connection] A reconnection attempt is "
                           "already queued")
@@ -4662,19 +4675,9 @@ class ControlConnection(object):
                     return
 
         # If the connection is not defunct, the host is unresolved, or DOWN
-        # handling was suppressed, reconnect manually. An in-flight
-        # reconnection handler is already retrying on its own schedule, and
-        # _reconnect() would cancel it and restart that schedule from its
-        # initial delay, so leave it alone. This mirrors on_down(). The check
-        # and the reconnect share the lock so that a handler releasing the slot
-        # as it gives up cannot slip between them and leave nobody reconnecting.
-        with self._reconnection_lock:
-            if self._reconnection_handler is not None:
-                log.debug("[control connection] Reconnection already in progress, "
-                          "not starting another one")
-                return
-
-            self.reconnect()
+        # handling was suppressed, reconnect manually. reconnect() leaves an
+        # in-flight reconnection handler alone on its own schedule.
+        self.reconnect()
 
     def on_up(self, host):
         pass
@@ -4685,14 +4688,10 @@ class ControlConnection(object):
         if not self._connection_matches_host(conn, host):
             return
 
-        with self._reconnection_lock:
-            if self._reconnection_handler is not None:
-                return
-
-            log.debug("[control connection] Control connection host (%s) is "
-                      "considered down, starting reconnection", host)
-            # this will result in a task being submitted to the executor to reconnect
-            self.reconnect()
+        log.debug("[control connection] Control connection host (%s) is "
+                  "considered down, starting reconnection", host)
+        # this will result in a task being submitted to the executor to reconnect
+        self.reconnect()
 
     def on_add(self, host, refresh_nodes=True):
         if refresh_nodes:

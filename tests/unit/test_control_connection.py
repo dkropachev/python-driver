@@ -733,9 +733,10 @@ class ControlConnectionTest(unittest.TestCase):
     def test_reconnect_is_queued_again_once_the_attempt_starts(self):
         self.cluster.executor.reset_mock()
         self.control_connection.reconnect()
+        self.control_connection._connection = None
 
         with patch.object(self.control_connection, '_reconnect_internal',
-                          side_effect=NoHostAvailable('no host', {})):
+                          return_value=Mock()):
             self.control_connection._reconnect()
 
         self.control_connection.reconnect()
@@ -743,6 +744,49 @@ class ControlConnectionTest(unittest.TestCase):
         assert self.cluster.executor.submit.call_args_list == [
             call(self.control_connection._reconnect),
             call(self.control_connection._reconnect)]
+
+    def test_reconnect_defers_to_a_handler_left_by_a_failed_attempt(self):
+        self.cluster.executor.reset_mock()
+        self.control_connection.reconnect()
+
+        with patch.object(self.control_connection, '_reconnect_internal',
+                          side_effect=NoHostAvailable('no host', {})):
+            self.control_connection._reconnect()
+
+        handler = self.control_connection._reconnection_handler
+        assert handler is not None
+
+        self.control_connection.reconnect()
+
+        # The handler installed by the failed attempt is retrying on its own
+        # schedule; starting another attempt would cancel it and restart that
+        # schedule from its initial delay.
+        self.cluster.executor.submit.assert_called_once_with(
+            self.control_connection._reconnect)
+        assert self.control_connection._reconnection_handler is handler
+        assert not handler._cancelled
+
+    def test_returning_a_defunct_connection_does_not_restart_the_backoff(self):
+        # The heartbeat hands a defunct control connection back once per
+        # idle_heartbeat_interval for as long as it stays defunct. Each of
+        # those must leave the parked handler's schedule alone.
+        self.cluster.executor.reset_mock()
+
+        with patch.object(self.control_connection, '_reconnect_internal',
+                          side_effect=NoHostAvailable('no host', {})):
+            self.control_connection._reconnect()
+
+        handler = self.control_connection._reconnection_handler
+        assert handler is not None
+        self.cluster.executor.reset_mock()
+
+        self.connection.is_defunct = True
+        for _ in range(3):
+            self.control_connection.return_connection(self.connection)
+
+        self.cluster.executor.submit.assert_not_called()
+        assert self.control_connection._reconnection_handler is handler
+        assert not handler._cancelled
 
     def test_reconnect_is_queued_again_after_a_rejected_submission(self):
         self.cluster.executor.reset_mock()
