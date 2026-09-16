@@ -24,7 +24,7 @@ import uuid
 from cassandra import ConsistencyLevel, DriverException, Timeout, Unavailable, RequestExecutionException, ReadTimeout, WriteTimeout, CoordinationFailure, ReadFailure, WriteFailure, FunctionFailure, AlreadyExists,\
     InvalidRequest, Unauthorized, AuthenticationFailed, OperationTimedOut, UnsupportedOperation, RequestValidationException, ConfigurationException, ProtocolVersion
 from cassandra.cluster import _Scheduler, Session, Cluster, ResultSet, SchemaAgreementScope, ControlConnectionQueryFallback, default_lbp_factory, \
-    ExecutionProfile, _ConfigMode, EXEC_PROFILE_DEFAULT
+    ExecutionProfile, _ConfigMode, EXEC_PROFILE_DEFAULT, _NOT_SET
 from cassandra.connection import ConnectionBusy, ConnectionException
 from cassandra.driver_config import DriverConfigReporter
 from cassandra.pool import Host
@@ -244,6 +244,8 @@ class ClusterTest(unittest.TestCase):
         mocked_add_or_renew_pool.assert_called_once_with(host, is_host_addition=False)
         assert session._initial_connect_futures == {future}
         assert session._pools == {}
+        assert set(cluster.control_connection._application_sessions) == set()
+        assert cluster.control_connection._get_application_keyspace() is _NOT_SET
 
     def test_compression_autodisabled_without_libraries(self):
         with patch.dict('cassandra.cluster.locally_supported_compressions', {}, clear=True):

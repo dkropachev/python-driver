@@ -38,7 +38,11 @@ Bug Fixes
   every session holding it has been shut down or garbage collected, so a later
   session can take it over. Taking it over from a session without a keyspace is
   rejected when the previous holder left the shared connection in a keyspace, since
-  CQL offers no way back to "no keyspace" (#1013).
+  CQL offers no way back to "no keyspace". An explicit ``USE`` statement -- including
+  the one ``Session.set_keyspace()`` executes -- is now rejected with
+  ``InvalidRequest`` on the fallback path, since it would change the keyspace of the
+  shared connection under every other session using it; the keyspace has to be chosen
+  when the session is created (#1013).
 
 Others
 ------

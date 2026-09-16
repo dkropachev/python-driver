@@ -21,7 +21,7 @@ from unittest.mock import Mock, MagicMock, ANY, patch
 
 from cassandra import ConsistencyLevel, InvalidRequest, Unavailable, SchemaTargetType, SchemaChangeType, OperationTimedOut
 from cassandra.cluster import (Session, ResponseFuture, NoHostAvailable, ProtocolVersion,
-                               ControlConnection, ControlConnectionQueryFallback)
+                               ControlConnection, ControlConnectionQueryFallback, _NOT_SET)
 from cassandra.connection import Connection, ConnectionBusy, ConnectionException
 from cassandra.protocol import (ReadTimeoutErrorMessage, WriteTimeoutErrorMessage,
                                 UnavailableErrorMessage, ResultMessage, QueryMessage,
@@ -444,6 +444,7 @@ class ResponseFutureTests(unittest.TestCase):
         for query_string in (
                 "USE newks",
                 "-- select another keyspace\nUSE newks",
+                "// select another keyspace\nUSE newks",
                 "/* select another keyspace */ USE newks"):
             with self.subTest(query_string=query_string):
                 session = self.make_basic_session()
@@ -466,6 +467,11 @@ class ResponseFutureTests(unittest.TestCase):
                 assert rf._req_id is None
                 with pytest.raises(InvalidRequest, match='Cannot change keyspace'):
                     rf.result()
+
+                # the rejected USE must not have claimed the binding
+                control_connection = session.cluster.control_connection
+                assert control_connection._get_application_keyspace() is _NOT_SET
+                assert not control_connection._application_sessions
 
     def test_control_connection_fallback_accepts_stream_id_zero(self):
         session = self.make_basic_session()
@@ -557,6 +563,25 @@ class ResponseFutureTests(unittest.TestCase):
                 assert rf2._req_id is None
                 with pytest.raises(InvalidRequest, match='already attached'):
                     rf2.result()
+
+    def test_control_connection_fallback_rebinds_same_session_new_keyspace(self):
+        session1 = self.make_basic_session()
+        control_connection = session1.cluster.control_connection
+        connection = self.make_control_connection()
+        control_connection._connection = connection
+
+        assert control_connection._attach_application_session('ks1', session1) is None
+        connection.keyspace = 'ks1'
+
+        # the session holding the binding is not in conflict with itself: it
+        # may rebind to the keyspace it switched to
+        assert control_connection._attach_application_session('ks2', session1) is None
+        assert control_connection._get_application_keyspace() == 'ks2'
+
+        session2 = self.make_basic_session()
+        session2.cluster = session1.cluster
+        conflict = control_connection._attach_application_session('ks1', session2)
+        assert conflict is not None and 'already attached' in conflict
 
     def _make_fallback_session(self, cluster=None, keyspace=None):
         session = self.make_basic_session()

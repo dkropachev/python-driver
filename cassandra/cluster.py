@@ -603,6 +603,12 @@ class ControlConnectionQueryFallback(enum.Enum):
     the shared connection in a keyspace, because CQL offers no way back to
     "no keyspace"; that case is rejected with :class:`.InvalidRequest`.
 
+    An explicit ``USE`` statement -- including the one
+    :meth:`.Session.set_keyspace` executes -- is rejected with
+    :class:`.InvalidRequest` on the fallback path, because it would change the
+    keyspace of the shared connection under every other session using it. The
+    keyspace has to be chosen when the session is created.
+
     The fallback path is not used for requests targeted to an explicit host.
     """
 
@@ -3468,6 +3474,12 @@ class Session(object):
         """
         Set the default keyspace for all queries made through this Session.
         This operation blocks until complete.
+
+        Raises :class:`.InvalidRequest` when the session uses the
+        control-connection fallback path (see
+        :class:`.ControlConnectionQueryFallback`), where the keyspace of the
+        shared connection cannot be changed; create a Session with the wanted
+        keyspace instead.
         """
         self.execute('USE %s' % (protect_name(keyspace),))
 
@@ -5166,8 +5178,8 @@ class ResponseFuture(object):
             return False
         query = getattr(message.query, 'query_string', message.query)
         return isinstance(query, str) and \
-            re.match(r'^(?:\s|--[^\r\n]*(?:\r?\n|$)|/\*.*?\*/)*USE\b',
-                     query, re.IGNORECASE | re.DOTALL) is not None
+            re.match(r'^(?:\s|(?:--|//)[^\r\n]*(?:\r?\n|$)|/\*(?:[^*]|\*(?!/))*\*/)*USE\b',
+                     query, re.IGNORECASE) is not None
 
     def _control_connection_failed(self):
         self._set_final_exception(NoHostAvailable(
@@ -5211,8 +5223,6 @@ class ResponseFuture(object):
 
     def _send_control_connection_message(self, message=None, cb=None, connection=None,
                                          host=None, record_attempt=True, record_size=True):
-        self._control_connection_query_attempted = True
-
         if message is None:
             message = self.message
 
