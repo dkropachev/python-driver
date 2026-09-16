@@ -309,8 +309,13 @@ class _ReconnectionHandler(object):
                     self.scheduler.schedule(next_delay, self.run)
         else:
             if not self._cancelled:
-                self.on_reconnection(conn)
+                # Mark the handoff before it happens: on_reconnection() adopts
+                # the connection and may then raise (installing the new control
+                # connection closes the old one, which runs user callbacks). If
+                # the flag were set afterwards, that raise would leave us
+                # closing a connection the subclass is already using.
                 handed_off = self._keeps_connection
+                self.on_reconnection(conn)
                 self.callback(*(self.callback_args), **(self.callback_kwargs))
         finally:
             if conn and not handed_off:
