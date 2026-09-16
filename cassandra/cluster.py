@@ -3861,6 +3861,7 @@ class ControlConnection(object):
 
         self._reconnection_handler = None
         self._reconnection_lock = RLock()
+        self._reconnect_pending = False
 
         self._event_schedule_times = {}
 
@@ -4021,9 +4022,28 @@ class ControlConnection(object):
         if self._is_shutdown:
             return
 
-        self._submit(self._reconnect)
+        # Collapse attempts that are queued but have not started yet. Without
+        # this, a burst of errors queues one _reconnect() each, and every one
+        # of them past the first cancels the reconnection handler the previous
+        # one installed and restarts its backoff schedule.
+        with self._reconnection_lock:
+            if self._reconnect_pending:
+                log.debug("[control connection] A reconnection attempt is "
+                          "already queued")
+                return
+            self._reconnect_pending = True
+
+        if self._submit(self._reconnect) is None:
+            # Nothing was queued, so nothing will clear the flag.
+            with self._reconnection_lock:
+                self._reconnect_pending = False
 
     def _reconnect(self):
+        # An attempt that has started no longer collapses a later one: the
+        # connection it is about to install may itself fail immediately.
+        with self._reconnection_lock:
+            self._reconnect_pending = False
+
         log.debug("[control connection] Attempting to reconnect")
         try:
             self._set_new_connection(self._reconnect_internal())

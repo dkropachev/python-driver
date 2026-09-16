@@ -24,7 +24,7 @@ from cassandra.cluster import (Cluster, ControlConnection, _Scheduler,
                                ProfileManager, EXEC_PROFILE_DEFAULT,
                                ExecutionProfile,
                                ControlConnectionQueryFallback,
-                               _ControlReconnectionHandler)
+                               NoHostAvailable, _ControlReconnectionHandler)
 from cassandra.pool import Host
 from cassandra.connection import (ConnectionException, EndPoint, DefaultEndPoint,
                                   DefaultEndPointFactory, UnixSocketEndPoint)
@@ -683,6 +683,44 @@ class ControlConnectionTest(unittest.TestCase):
         self.cluster.executor.reset_mock()
 
         self.control_connection._signal_error()
+
+        self.cluster.executor.submit.assert_called_once_with(
+            self.control_connection._reconnect)
+
+    def test_reconnect_collapses_an_attempt_that_has_not_started(self):
+        self.cluster.executor.reset_mock()
+
+        self.control_connection.reconnect()
+        self.control_connection.reconnect()
+
+        self.cluster.executor.submit.assert_called_once_with(
+            self.control_connection._reconnect)
+
+    def test_reconnect_is_queued_again_once_the_attempt_starts(self):
+        self.cluster.executor.reset_mock()
+        self.control_connection.reconnect()
+
+        with patch.object(self.control_connection, '_reconnect_internal',
+                          side_effect=NoHostAvailable('no host', {})):
+            self.control_connection._reconnect()
+
+        self.control_connection.reconnect()
+
+        assert self.cluster.executor.submit.call_args_list == [
+            call(self.control_connection._reconnect),
+            call(self.control_connection._reconnect)]
+
+    def test_reconnect_is_queued_again_after_a_rejected_submission(self):
+        self.cluster.executor.reset_mock()
+        self.cluster.is_shutdown = True
+        self.addCleanup(setattr, self.cluster, 'is_shutdown', False)
+
+        self.control_connection.reconnect()
+
+        self.cluster.executor.submit.assert_not_called()
+
+        self.cluster.is_shutdown = False
+        self.control_connection.reconnect()
 
         self.cluster.executor.submit.assert_called_once_with(
             self.control_connection._reconnect)
