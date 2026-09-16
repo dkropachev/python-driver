@@ -653,27 +653,27 @@ class ControlConnectionTest(unittest.TestCase):
         return handler
 
     def test_reconnection_handler_releases_its_slot_when_it_gives_up(self):
-        for exc, next_delay in ((AuthenticationFailed('bad password'), 1.0),
-                                (ConnectionException('refused'), None)):
-            with self.subTest(exc=exc, next_delay=next_delay):
-                handler = self._make_reconnection_handler()
-
-                handler.on_exception(exc, next_delay)
-
-                assert self.control_connection._reconnection_handler is None
-
-    def test_reconnection_handler_keeps_its_slot_while_it_retries(self):
         handler = self._make_reconnection_handler()
 
-        assert handler.on_exception(ConnectionException('refused'), 1.0)
+        handler.on_exception(ConnectionException('refused'), None)
 
-        assert self.control_connection._reconnection_handler is handler
+        assert self.control_connection._reconnection_handler is None
+
+    def test_reconnection_handler_keeps_its_slot_while_it_retries(self):
+        for exc in (ConnectionException('refused'),
+                    AuthenticationFailed('bad password')):
+            with self.subTest(exc=exc):
+                handler = self._make_reconnection_handler()
+
+                assert handler.on_exception(exc, 1.0)
+
+                assert self.control_connection._reconnection_handler is handler
 
     def test_reconnection_handler_never_releases_a_replacement(self):
         handler = self._make_reconnection_handler()
         replacement = self._make_reconnection_handler()
 
-        handler.on_exception(AuthenticationFailed('bad password'), 1.0)
+        handler.on_exception(ConnectionException('refused'), None)
 
         assert self.control_connection._reconnection_handler is replacement
 
@@ -710,7 +710,7 @@ class ControlConnectionTest(unittest.TestCase):
         host.set_down()
         self._use_cluster_down_handling()
         handler = self._make_reconnection_handler()
-        handler.on_exception(AuthenticationFailed('bad password'), 1.0)
+        handler.on_exception(ConnectionException('refused'), None)
         self.connection.is_defunct = True
         self.connection.last_error = ConnectionException(
             'control connection failed')

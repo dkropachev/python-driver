@@ -3746,20 +3746,19 @@ class _ControlReconnectionHandler(_ReconnectionHandler):
         self.control_connection._set_new_connection(connection)
 
     def on_exception(self, exc, next_delay):
-        # TODO only overridden to add logging, so add logging
-        if isinstance(exc, AuthenticationFailed):
-            keep_retrying = False
-        else:
-            log.debug("Error trying to reconnect control connection: %r", exc)
-            keep_retrying = True
+        # Every reason to stop retrying is worth retrying here: an attempt
+        # covers the whole query plan, so an authentication failure is a
+        # failure of the host it happened to reach, not of the cluster.
+        log.debug("Error trying to reconnect control connection: %r", exc)
 
-        if not keep_retrying or next_delay is None:
-            # This handler will never run again. Release the slot it occupies,
-            # or the next error would find a dead handler parked there and
-            # conclude a reconnection was already in progress.
+        if next_delay is None:
+            # The schedule is exhausted, so this handler will never run again.
+            # Release the slot it occupies, or the next error would find a dead
+            # handler parked there and conclude a reconnection was already in
+            # progress.
             self._release()
 
-        return keep_retrying
+        return True
 
     def _release(self):
         try:
