@@ -249,6 +249,12 @@ class ControlConnectionTest(unittest.TestCase):
         self.cluster.signal_connection_failure = \
             Cluster.signal_connection_failure.__get__(self.cluster)
 
+    def _discount_down_for(self, host):
+        """Model a session pool that keeps ``host`` up despite a conviction."""
+        session = Mock()
+        session.get_pool_state.return_value = {host: {'open_count': 1}}
+        self._use_cluster_down_handling([session])
+
     def test_wait_for_schema_agreement(self):
         """
         Basic test with all schema versions agreeing
@@ -758,51 +764,52 @@ class ControlConnectionTest(unittest.TestCase):
         assert host_index[local_host] is not None
         assert Cluster.get_control_connection_host(self.cluster) is local_host
 
-        connection_error = ConnectionException('control connection failed')
+        # A DOWN transition discounted because a usable session pool remains
+        # queues no control on_down callback, so the reconnect is direct.
+        self._discount_down_for(local_host)
         self.connection.is_defunct = True
-        self.connection.last_error = connection_error
-        # Model a conviction whose DOWN transition is discounted because a
-        # usable session pool remains: no control on_down callback is queued.
-        self.cluster.signal_connection_failure = Mock(return_value=False)
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
         self.cluster.executor.reset_mock()
 
         self.control_connection._signal_error()
 
-        self.cluster.signal_connection_failure.assert_called_once_with(
-            local_host, connection_error, is_host_addition=False)
+        assert local_host.is_up is True
+        self.cluster.on_down_potentially_blocking.assert_not_called()
         self.cluster.executor.submit.assert_called_once_with(
             self.control_connection._reconnect)
 
     def test_unix_signal_error_reconnects_if_down_notification_suppressed(self):
         _, local_host = self._discover_local_host_over_unix()
-        connection_error = ConnectionException('control connection failed')
+        self._discount_down_for(local_host)
         self.connection.is_defunct = True
-        self.connection.last_error = connection_error
-        self.cluster.signal_connection_failure = Mock(return_value=False)
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
         self.cluster.executor.reset_mock()
 
         self.control_connection._signal_error()
 
-        self.cluster.signal_connection_failure.assert_called_once_with(
-            local_host, connection_error, is_host_addition=False)
+        assert local_host.is_up is True
+        self.cluster.on_down_potentially_blocking.assert_not_called()
         self.cluster.executor.submit.assert_called_once_with(
             self.control_connection._reconnect)
 
     def test_tcp_route_mismatch_reconnects_if_down_notification_suppressed(self):
         self.control_connection.refresh_node_list_and_token_map()
         local_host = self.cluster.metadata.get_host_by_host_id('uuid1')
+        local_host.set_up()
         self.connection.endpoint = DefaultEndPoint('192.168.1.0', 19042)
         self.connection.original_endpoint = local_host.endpoint
-        connection_error = ConnectionException('control connection failed')
+        self._discount_down_for(local_host)
         self.connection.is_defunct = True
-        self.connection.last_error = connection_error
-        self.cluster.signal_connection_failure = Mock(return_value=False)
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
         self.cluster.executor.reset_mock()
 
         self.control_connection._signal_error()
 
-        self.cluster.signal_connection_failure.assert_called_once_with(
-            local_host, connection_error, is_host_addition=False)
+        assert local_host.is_up is True
+        self.cluster.on_down_potentially_blocking.assert_not_called()
         self.cluster.executor.submit.assert_called_once_with(
             self.control_connection._reconnect)
 
@@ -838,16 +845,15 @@ class ControlConnectionTest(unittest.TestCase):
         _, local_host = self._discover_local_host_over_unix()
         self._refresh_control_connection_over_network()
         local_host.set_down()
-        connection_error = ConnectionException('control connection failed')
+        self._use_cluster_down_handling()
         self.connection.is_defunct = True
-        self.connection.last_error = connection_error
-        self.cluster.signal_connection_failure = Mock(return_value=False)
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
         self.cluster.executor.reset_mock()
 
         self.control_connection._signal_error()
 
-        self.cluster.signal_connection_failure.assert_called_once_with(
-            local_host, connection_error, is_host_addition=False)
+        self.cluster.on_down_potentially_blocking.assert_not_called()
         self.cluster.executor.submit.assert_called_once_with(
             self.control_connection._reconnect)
 
@@ -855,17 +861,16 @@ class ControlConnectionTest(unittest.TestCase):
         _, local_host = self._discover_local_host_over_unix()
         self._refresh_control_connection_over_network()
         local_host.get_and_set_reconnection_handler(Mock())
-        connection_error = ConnectionException('control connection failed')
+        self._use_cluster_down_handling()
         self.connection.is_defunct = True
-        self.connection.last_error = connection_error
-
-        self.cluster.signal_connection_failure = Mock(return_value=False)
+        self.connection.last_error = ConnectionException(
+            'control connection failed')
         self.cluster.executor.reset_mock()
 
         self.control_connection._signal_error()
 
-        self.cluster.signal_connection_failure.assert_called_once_with(
-            local_host, connection_error, is_host_addition=False)
+        assert local_host.is_up is False
+        self.cluster.on_down_potentially_blocking.assert_not_called()
         self.cluster.executor.submit.assert_called_once_with(
             self.control_connection._reconnect)
 
