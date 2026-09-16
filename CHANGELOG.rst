@@ -29,6 +29,28 @@ Features
   statements skip re-sending result metadata on EXECUTE, and the driver automatically
   refreshes cached metadata when the server detects a schema change (DRIVER-153)
 
+Bug Fixes
+---------
+* A defunct control connection is no longer left unreconnected when the cluster does not
+  run DOWN handling for its host (#847). ``ControlConnection._signal_error()`` treated the
+  conviction policy accepting a failure as a guarantee that a DOWN callback would
+  reconnect it, but the two are not the same: ``Cluster.on_down()`` deliberately skips
+  DOWN handling when a session pool to the host is still open, when the host is already
+  down or already reconnecting, and when pool creation is disabled -- and the default
+  ``SimpleConvictionPolicy`` rejects the conviction outright for ``OperationTimedOut``.
+  In all of those cases the control connection stayed defunct with nothing scheduled to
+  replace it. ``Cluster.on_down()`` and ``Cluster.signal_connection_failure()`` now return
+  whether DOWN handling was actually dispatched, and the control connection reconnects
+  directly whenever it was not. This applies uniformly to TCP, Unix socket,
+  alternate-route and stable host-ID connections, and does not duplicate the reconnect
+  that an accepted DOWN transition already performs. Two related cases are fixed with
+  it: a control connection whose reconnection attempts are already backing off no longer
+  has that schedule cancelled and restarted from its initial delay by every further
+  error, and a reconnection handler that has stopped for good -- after an
+  ``AuthenticationFailed``, or once its retry schedule is exhausted -- now releases the
+  slot it occupies, so a later error starts a fresh reconnection instead of mistaking the
+  dead handler for one still retrying.
+
 Others
 ------
 * ``DCAwareRoundRobinPolicy.local_dc`` is now read-only. It is set by the constructor,
