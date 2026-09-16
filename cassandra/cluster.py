@@ -45,7 +45,7 @@ from weakref import WeakValueDictionary
 
 from cassandra import (ConsistencyLevel, AuthenticationFailed, OperationTimedOut, UnsupportedOperation,
                        SchemaTargetType, DriverException, ProtocolVersion,
-                       UnresolvableContactPoints, DependencyException)
+                       UnresolvableContactPoints, DependencyException, InvalidRequest)
 from cassandra.auth import _proxy_execute_key, PlainTextAuthProvider
 from cassandra.client_routes import ClientRoutesChangeType, ClientRoutesConfig, _ClientRoutesHandler
 from cassandra.connection import (ClientRoutesEndPointFactory, ConnectionException, ConnectionShutdown,
@@ -594,6 +594,11 @@ class ControlConnectionQueryFallback(enum.Enum):
     ``SkipPoolCreation`` disables node-pool creation for the session and uses
     the control-connection fallback path for application queries.
 
+    The first session using fallback binds the shared control connection to its
+    keyspace, including :const:`None`. Later sessions may use fallback only
+    when their keyspace matches that binding; a different keyspace is rejected.
+    The binding lasts for the lifetime of the :class:`Cluster`.
+
     The fallback path is not used for requests targeted to an explicit host.
     """
 
@@ -923,6 +928,8 @@ class Cluster(object):
     ``Disabled`` keeps the old behavior.
     ``Fallback`` enables control-connection fallback when no usable node pools exist.
     ``SkipPoolCreation`` skips node-pool creation and uses the control connection fallback path.
+    The first fallback session binds the shared control connection to its keyspace;
+    later fallback sessions must use the same keyspace.
     This fallback is still not used for requests targeted to an explicit host.
     """
 
@@ -2651,6 +2658,17 @@ class Session(object):
                     msg += " using keyspace '%s'" % self.keyspace
                 raise NoHostAvailable(msg, [h.address for h in hosts])
 
+        if fallback_mode is not ControlConnectionQueryFallback.Disabled and \
+                (fallback_mode is ControlConnectionQueryFallback.SkipPoolCreation or
+                 not any(pool and not pool.is_shutdown for pool in self._pools.values())):
+            control_connection = self.cluster.control_connection
+            if not control_connection._attach_application_session(self.keyspace):
+                attached_keyspace = control_connection._get_application_keyspace()
+                raise InvalidRequest(
+                    "Control-connection fallback is already attached to keyspace %r; "
+                    "cannot attach a Session using keyspace %r" %
+                    (attached_keyspace, self.keyspace))
+
         self.session_id = uuid.uuid4()
 
         if self.cluster.column_encryption_policy is not None:
@@ -3835,6 +3853,13 @@ class ControlConnection(object):
 
         self._event_schedule_times = {}
 
+        # The first fallback Session binds application use of the shared
+        # control connection to one keyspace (including None). Keeping that
+        # binding stable avoids connection-level USE state leaking between
+        # Sessions without adding a dispatcher to this exceptional path.
+        self._application_query_lock = Lock()
+        self._application_keyspace = _NOT_SET
+
     def connect(self):
         if self._is_shutdown:
             return
@@ -3855,6 +3880,18 @@ class ControlConnection(object):
         if old:
             log.debug("[control connection] Closing old connection %r, replacing with %r", old, conn)
             old.close()
+
+    def _attach_application_session(self, keyspace):
+        """Bind fallback use to ``keyspace`` or verify an existing binding."""
+        with self._application_query_lock:
+            if self._application_keyspace is _NOT_SET:
+                self._application_keyspace = keyspace
+                return True
+            return self._application_keyspace == keyspace
+
+    def _get_application_keyspace(self):
+        with self._application_query_lock:
+            return self._application_keyspace
 
     def _try_connect_to_hosts(self):
         errors = {}
@@ -4050,11 +4087,12 @@ class ControlConnection(object):
                 return
             else:
                 self._is_shutdown = True
-
             log.debug("Shutting down control connection")
-            if self._connection:
-                self._connection.close()
-                self._connection = None
+            connection = self._connection
+            self._connection = None
+
+        if connection:
+            connection.close()
 
     def refresh_schema(self, force=False, **kwargs):
         try:
@@ -5022,6 +5060,8 @@ class ResponseFuture(object):
         if error_no_hosts:
             if self._fallback_to_control_connection():
                 req_id = self._query_control_connection()
+                if req_id is _NOT_SET:
+                    return True
                 if req_id is not None:
                     self._req_id = req_id
                     return True
@@ -5066,7 +5106,50 @@ class ResponseFuture(object):
             connection.in_flight -= 1
         cb(response)
 
-    def _query_control_connection(self, message=None, cb=None, connection=None, host=None):
+    def _is_keyspace_change_query(self, message=None):
+        message = self.message if message is None else message
+        if not isinstance(message, QueryMessage):
+            return False
+        query = getattr(message.query, 'query_string', message.query)
+        return isinstance(query, str) and \
+            re.match(r'^(?:(?:\s+)|(?:--[^\r\n]*(?:\r?\n|$))|(?:/\*.*?\*/))*USE\b',
+                     query, re.IGNORECASE | re.DOTALL) is not None
+
+    def _control_connection_failed(self):
+        self._set_final_exception(NoHostAvailable(
+            "Unable to complete the operation against any hosts", self._errors))
+
+    def _set_control_connection_keyspace(self, connection, host, keyspace):
+        message = QueryMessage(
+            query='USE %s' % protect_name(keyspace),
+            consistency_level=ConsistencyLevel.ONE)
+
+        def keyspace_set(response):
+            if isinstance(response, ResultMessage) and response.kind == RESULT_KIND_SET_KEYSPACE:
+                connection.keyspace = response.new_keyspace
+                if self._send_control_connection_message(connection=connection, host=host) is None:
+                    self._control_connection_failed()
+            elif isinstance(response, ErrorMessage):
+                self._set_final_exception(response.to_exception())
+            elif isinstance(response, ConnectionException):
+                self._errors[host] = response
+                self.session.submit(self._retry_task, False, host)
+            elif isinstance(response, Exception):
+                self._set_final_exception(response)
+            else:
+                self._set_final_exception(ConnectionException(
+                    "Unexpected response while setting the control-connection keyspace: %r" %
+                    (response,), connection.endpoint))
+
+        request_id = self._send_control_connection_message(
+            message=message, cb=keyspace_set, connection=connection,
+            host=host, record_attempt=False, record_size=False)
+        if request_id is None:
+            self._control_connection_failed()
+        return request_id
+
+    def _send_control_connection_message(self, message=None, cb=None, connection=None,
+                                         host=None, record_attempt=True, record_size=True):
         self._control_connection_query_attempted = True
 
         if message is None:
@@ -5094,12 +5177,16 @@ class ResponseFuture(object):
             cb = partial(self._handle_control_connection_response, connection, cb)
 
             log.debug("No usable node pools; falling back to control connection for host %s", host)
-            self.request_encoded_size = connection.send_msg(message, request_id, cb=cb,
-                                                            encoder=self._protocol_handler.encode_message,
-                                                            decoder=self._protocol_handler.decode_message,
-                                                            result_metadata=result_meta)
+            encoded_size = connection.send_msg(message, request_id, cb=cb,
+                                               encoder=self._protocol_handler.encode_message,
+                                               decoder=self._protocol_handler.decode_message,
+                                               result_metadata=result_meta)
+            self._req_id = request_id
+            if record_size:
+                self.request_encoded_size = encoded_size
             request_sent = True
-            self.attempted_hosts.append(host)
+            if record_attempt:
+                self.attempted_hosts.append(host)
             return request_id
         except NoConnectionsAvailable as exc:
             log.debug("Control connection is at capacity")
@@ -5117,6 +5204,45 @@ class ResponseFuture(object):
                 self._release_control_connection_request(connection, request_id)
 
         return None
+
+    def _query_control_connection(self, message=None, cb=None, connection=None, host=None):
+        self._control_connection_query_attempted = True
+        control_connection = self.session.cluster.control_connection
+        if control_connection is None:
+            self._errors['control connection'] = ConnectionException(
+                "Control connection is not connected")
+            return None
+
+        keyspace = self.session.keyspace
+        if not control_connection._attach_application_session(keyspace):
+            attached_keyspace = control_connection._get_application_keyspace()
+            self._set_final_exception(InvalidRequest(
+                "Control-connection fallback is already attached to keyspace %r; "
+                "cannot use it from a Session using keyspace %r" %
+                (attached_keyspace, keyspace)))
+            return _NOT_SET
+
+        if self._is_keyspace_change_query(message):
+            self._set_final_exception(InvalidRequest(
+                "Cannot change keyspace while using control-connection fallback; "
+                "create a Session with the attached keyspace instead"))
+            return _NOT_SET
+
+        if connection is None:
+            connection = control_connection._connection
+        if connection is None:
+            self._errors['control connection'] = ConnectionException(
+                "Control connection is not connected")
+            return None
+
+        if host is None:
+            host = self.session.cluster.get_control_connection_host() or connection.endpoint
+
+        if keyspace is not None and connection.keyspace != keyspace:
+            return self._set_control_connection_keyspace(connection, host, keyspace)
+
+        return self._send_control_connection_message(
+            message=message, cb=cb, connection=connection, host=host)
 
     def _query(self, host, message=None, cb=None):
         if message is None:

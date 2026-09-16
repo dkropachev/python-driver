@@ -224,6 +224,11 @@ class ClusterTest(unittest.TestCase):
         assert session._pools == {}
         assert session.update_created_pools() == set()
 
+        same_keyspace_session = Session(cluster, [host])
+        assert same_keyspace_session.keyspace is None
+        with pytest.raises(InvalidRequest, match='already attached'):
+            Session(cluster, [host], keyspace='different')
+
     def test_control_connection_query_fallback_fallback_tolerates_empty_initial_pools(self):
         cluster = Cluster(
             allow_control_connection_query_fallback=ControlConnectionQueryFallback.Fallback,

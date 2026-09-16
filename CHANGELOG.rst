@@ -29,6 +29,13 @@ Features
   statements skip re-sending result metadata on EXECUTE, and the driver automatically
   refreshes cached metadata when the server detects a schema change (DRIVER-153)
 
+Bug Fixes
+---------
+* Prevent sessions from leaking keyspace state when application queries fall back to
+  the shared control connection. The first fallback session binds that connection to
+  its keyspace (including no keyspace); later fallback sessions with a different
+  keyspace are rejected (#1013).
+
 Others
 ------
 * ``DCAwareRoundRobinPolicy.local_dc`` is now read-only. It is set by the constructor,

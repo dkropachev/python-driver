@@ -18,9 +18,10 @@ from collections import deque
 from threading import RLock
 from unittest.mock import Mock, MagicMock, ANY, patch
 
-from cassandra import ConsistencyLevel, Unavailable, SchemaTargetType, SchemaChangeType, OperationTimedOut
-from cassandra.cluster import Session, ResponseFuture, NoHostAvailable, ProtocolVersion, ControlConnectionQueryFallback
-from cassandra.connection import Connection, ConnectionException
+from cassandra import ConsistencyLevel, InvalidRequest, Unavailable, SchemaTargetType, SchemaChangeType, OperationTimedOut
+from cassandra.cluster import (Session, ResponseFuture, NoHostAvailable, ProtocolVersion,
+                               ControlConnection, ControlConnectionQueryFallback)
+from cassandra.connection import Connection, ConnectionBusy, ConnectionException
 from cassandra.protocol import (ReadTimeoutErrorMessage, WriteTimeoutErrorMessage,
                                 UnavailableErrorMessage, ResultMessage, QueryMessage,
                                 ExecuteMessage,
@@ -40,8 +41,15 @@ class ResponseFutureTests(unittest.TestCase):
 
     def make_basic_session(self):
         s = Mock(spec=Session)
+        s.keyspace = None
+        s.is_shutdown = False
         s.row_factory = lambda col_names, rows: [(col_names, rows)]
         s.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Disabled
+        s.cluster.control_connection = ControlConnection(
+            s.cluster, timeout=1,
+            schema_event_refresh_window=0,
+            topology_event_refresh_window=0,
+            status_event_refresh_window=0)
         return s
 
     def make_pool(self):
@@ -62,6 +70,7 @@ class ResponseFutureTests(unittest.TestCase):
         connection.orphaned_threshold = 75
         connection.orphaned_threshold_reached = False
         connection.is_control_connection = True
+        connection.keyspace = None
         connection.get_request_id.return_value = 7
         connection.send_msg.return_value = 128
         # These tests exercise control-connection query fallback, not tablet
@@ -430,33 +439,122 @@ class ResponseFutureTests(unittest.TestCase):
         with pytest.raises(NoHostAvailable):
             rf.result()
 
-    def test_control_connection_fallback_updates_connection_keyspace(self):
+    def test_control_connection_fallback_rejects_use(self):
+        for query_string in (
+                "USE newks",
+                "-- select another keyspace\nUSE newks",
+                "/* select another keyspace */ USE newks"):
+            with self.subTest(query_string=query_string):
+                session = self.make_basic_session()
+                session.cluster.allow_control_connection_query_fallback = \
+                    ControlConnectionQueryFallback.Fallback
+                session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
+                session._pools = {}
+
+                connection = self.make_control_connection()
+                session.cluster.control_connection._connection = connection
+
+                query = SimpleStatement(query_string)
+                rf = ResponseFuture(
+                    session,
+                    QueryMessage(query=query.query_string, consistency_level=ConsistencyLevel.ONE),
+                    query, 1)
+                assert rf.send_request()
+
+                connection.send_msg.assert_not_called()
+                assert rf._req_id is None
+                with pytest.raises(InvalidRequest, match='Cannot change keyspace'):
+                    rf.result()
+
+    def test_control_connection_fallback_accepts_stream_id_zero(self):
         session = self.make_basic_session()
-        session.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Fallback
-        session.cluster._default_load_balancing_policy.make_query_plan.return_value = ['ip1']
+        session.cluster.allow_control_connection_query_fallback = \
+            ControlConnectionQueryFallback.SkipPoolCreation
+        session.cluster._default_load_balancing_policy.make_query_plan.return_value = []
         session._pools = {}
-
-        def set_keyspace_for_all_pools(keyspace, callback):
-            session.keyspace = keyspace
-            callback({})
-
-        session._set_keyspace_for_all_pools.side_effect = set_keyspace_for_all_pools
+        session.keyspace = 'ks'
 
         connection = self.make_control_connection()
-        connection.keyspace = 'oldks'
+        connection.get_request_id.return_value = 0
         session.cluster.control_connection._connection = connection
-        control_host = Mock(endpoint=connection.endpoint)
-        session.cluster.get_control_connection_host.return_value = control_host
 
         rf = self.make_response_future(session)
         assert rf.send_request()
+        assert rf._req_id == 0
+        assert rf._final_exception is None
+        assert connection.send_msg.call_args[0][0].query == 'USE ks'
 
-        result = Mock(spec=ResultMessage, kind=RESULT_KIND_SET_KEYSPACE, new_keyspace='newks')
-        connection.send_msg.call_args[1]['cb'](result)
+    def test_control_connection_fallback_binds_first_session_keyspace(self):
+        session1 = self.make_basic_session()
+        session1.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.SkipPoolCreation
+        session1.cluster._default_load_balancing_policy.make_query_plan.return_value = []
+        session1._pools = {}
+        session1.keyspace = 'ks1'
 
-        assert connection.keyspace == 'newks'
-        assert session.keyspace == 'newks'
-        assert rf.result().current_rows == []
+        session2 = self.make_basic_session()
+        session2.cluster = session1.cluster
+        session2._pools = {}
+        session2.keyspace = 'ks1'
+
+        connection = self.make_control_connection()
+        connection.get_request_id.side_effect = [7, 8, 9]
+        session1.cluster.control_connection._connection = connection
+        control_host = Mock(endpoint=connection.endpoint)
+        session1.cluster.get_control_connection_host.return_value = control_host
+
+        rf1 = self.make_response_future(session1)
+        rf2 = self.make_response_future(session2)
+        assert rf1.send_request()
+
+        assert connection.send_msg.call_count == 1
+        assert connection.send_msg.call_args_list[0][0][0].query == 'USE ks1'
+
+        connection.send_msg.call_args_list[0][1]['cb'](
+            Mock(spec=ResultMessage, kind=RESULT_KIND_SET_KEYSPACE, new_keyspace='ks1'))
+        assert connection.send_msg.call_count == 2
+        assert connection.send_msg.call_args_list[1][0][0] is rf1.message
+
+        connection.send_msg.call_args_list[1][1]['cb'](
+            self.make_mock_response(['value'], [('one',)]))
+        assert rf2.send_request()
+        assert connection.send_msg.call_count == 3
+        assert connection.send_msg.call_args_list[2][0][0] is rf2.message
+        connection.send_msg.call_args_list[2][1]['cb'](
+            self.make_mock_response(['value'], [('two',)]))
+
+        assert rf1.result().one() == (['value'], [('one',)])
+        assert rf2.result().one() == (['value'], [('two',)])
+        assert connection.keyspace == 'ks1'
+        assert session1.cluster.control_connection._get_application_keyspace() == 'ks1'
+
+    def test_control_connection_fallback_rejects_different_session_keyspace(self):
+        for first_keyspace, second_keyspace in (
+                ('ks1', 'ks2'), ('ks1', None), (None, 'ks1')):
+            with self.subTest(first_keyspace=first_keyspace,
+                              second_keyspace=second_keyspace):
+                session1 = self.make_basic_session()
+                session1.cluster.allow_control_connection_query_fallback = \
+                    ControlConnectionQueryFallback.SkipPoolCreation
+                session1.cluster._default_load_balancing_policy.make_query_plan.return_value = []
+                session1._pools = {}
+                session1.keyspace = first_keyspace
+
+                session2 = self.make_basic_session()
+                session2.cluster = session1.cluster
+                session2._pools = {}
+                session2.keyspace = second_keyspace
+
+                connection = self.make_control_connection()
+                session1.cluster.control_connection._connection = connection
+                assert session1.cluster.control_connection._attach_application_session(first_keyspace)
+
+                rf2 = self.make_response_future(session2)
+                assert rf2.send_request()
+
+                connection.send_msg.assert_not_called()
+                assert rf2._req_id is None
+                with pytest.raises(InvalidRequest, match='already attached'):
+                    rf2.result()
 
     def test_control_connection_fallback_when_no_usable_pools(self):
         session = self.make_basic_session()
@@ -611,6 +709,23 @@ class ResponseFutureTests(unittest.TestCase):
 
         assert connection.in_flight == 0
         assert rf.result()[0] == expected_result
+
+    def test_control_connection_fallback_reprepare_send_failure_retries(self):
+        session = self.make_basic_session()
+        session.cluster.allow_control_connection_query_fallback = \
+            ControlConnectionQueryFallback.Fallback
+        session.cluster._default_load_balancing_policy.make_query_plan.return_value = []
+        session._pools = {}
+        connection = self.make_control_connection()
+        connection.send_msg.side_effect = ConnectionBusy()
+        session.cluster.control_connection._connection = connection
+        host = Mock(endpoint=connection.endpoint)
+
+        rf = self.make_response_future(session)
+        rf.send_request = Mock()
+        rf._reprepare(PrepareMessage("SELECT * FROM foo"), host, connection, None)
+
+        rf.send_request.assert_called_once_with()
 
     def test_control_connection_fallback_not_used_when_pool_can_serve(self):
         session = self.make_basic_session()

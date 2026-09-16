@@ -16,6 +16,7 @@ import unittest
 
 import pytest
 
+from cassandra import InvalidRequest
 from cassandra.cluster import ControlConnectionQueryFallback, NoHostAvailable
 
 from tests.integration import TestCluster, local, remove_cluster, use_cluster
@@ -104,3 +105,53 @@ class ControlConnectionQueryFallbackIntegrationTests(unittest.TestCase):
             "SELECT release_version, rpc_address FROM system.local WHERE key='local'").one()
         assert str(row.rpc_address) == _UNREACHABLE_BROADCAST_RPC_ADDRESS
         assert row.release_version
+
+    def test_shared_control_connection_accepts_only_one_session_keyspace(self):
+        bootstrap_cluster = TestCluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
+            connect_timeout=1,
+        )
+        try:
+            setup_session = bootstrap_cluster.connect()
+            for keyspace in ('fallback_ks_one', 'fallback_ks_two'):
+                setup_session.execute("DROP KEYSPACE IF EXISTS {}".format(keyspace))
+                setup_session.execute(
+                    "CREATE KEYSPACE {} WITH replication = "
+                    "{{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}}".format(keyspace))
+            setup_session.execute(
+                "CREATE TABLE fallback_ks_one.items (id int PRIMARY KEY, value text)")
+        finally:
+            bootstrap_cluster.shutdown()
+
+        self.cluster = TestCluster(
+            allow_control_connection_query_fallback=ControlConnectionQueryFallback.SkipPoolCreation,
+            connect_timeout=1,
+        )
+        session_one = self.cluster.connect('fallback_ks_one')
+        session_one_peer = self.cluster.connect('fallback_ks_one')
+        control_connection = self.cluster.control_connection._connection
+
+        assert list(session_one.get_pools()) == []
+        assert list(session_one_peer.get_pools()) == []
+        with pytest.raises(InvalidRequest, match='already attached'):
+            self.cluster.connect('fallback_ks_two')
+        with pytest.raises(InvalidRequest, match='already attached'):
+            self.cluster.connect()
+
+        insert_one = session_one.execute_async(
+            "INSERT INTO items (id, value) VALUES (1, 'one')")
+        insert_two = session_one_peer.execute_async(
+            "INSERT INTO items (id, value) VALUES (2, 'two')")
+        insert_one.result()
+        insert_two.result()
+
+        prepared_one = session_one.prepare(
+            "INSERT INTO items (id, value) VALUES (?, ?)")
+        prepared_insert_one = session_one.execute_async(prepared_one, (2, 'prepared-one'))
+        prepared_insert_one.result()
+
+        select_one = session_one_peer.execute_async(
+            "SELECT value FROM items WHERE id IN (1, 2)")
+
+        assert {row.value for row in select_one.result()} == {'one', 'prepared-one'}
+        assert self.cluster.control_connection._connection is control_connection
