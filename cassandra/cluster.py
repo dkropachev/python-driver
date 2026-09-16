@@ -2662,9 +2662,13 @@ class Session(object):
                     msg += " using keyspace '%s'" % self.keyspace
                 raise NoHostAvailable(msg, [h.address for h in hosts])
 
-        if fallback_mode is not ControlConnectionQueryFallback.Disabled and \
-                (fallback_mode is ControlConnectionQueryFallback.SkipPoolCreation or
-                 not any(pool and not pool.is_shutdown for pool in self._pools.values())):
+        # Only SkipPoolCreation is a fallback Session for its whole life, so
+        # only it takes the binding up front. Under Fallback the pools may well
+        # come up moments later, and _query_control_connection() takes the
+        # binding if and when a query actually needs the shared connection;
+        # claiming it here would fail connect() over a transient blip and then
+        # hold the binding for the Session's lifetime.
+        if fallback_mode is ControlConnectionQueryFallback.SkipPoolCreation:
             control_connection = self.cluster.control_connection
             conflict = control_connection._attach_application_session(self.keyspace, self)
             if conflict is not None:
@@ -3899,7 +3903,9 @@ class ControlConnection(object):
         with self._application_query_lock:
             self._prune_application_sessions()
 
-            if self._application_sessions:
+            # A Session already holding the binding is not in conflict with
+            # itself: it may rebind to the keyspace it switched to.
+            if any(other is not session for other in self._application_sessions):
                 if self._application_keyspace != keyspace:
                     return ("Control-connection fallback is already attached to "
                             "keyspace %r; cannot use it from a Session using "
@@ -5109,7 +5115,9 @@ class ResponseFuture(object):
                 if req_id is _NOT_SET:
                     return True
                 if req_id is not None:
-                    self._req_id = req_id
+                    # _send_control_connection_message() already recorded the
+                    # id of the message actually in flight. Re-assigning here
+                    # would clobber it with the USE id on the keyspace path.
                     return True
 
             self._set_final_exception(NoHostAvailable(
@@ -5266,16 +5274,16 @@ class ResponseFuture(object):
                 "Control connection is not connected")
             return None
 
-        keyspace = self.session.keyspace
-        conflict = control_connection._attach_application_session(keyspace, self.session)
-        if conflict is not None:
-            self._set_final_exception(InvalidRequest(conflict))
-            return _NOT_SET
-
         if self._is_keyspace_change_query(message):
             self._set_final_exception(InvalidRequest(
                 "Cannot change keyspace while using control-connection fallback; "
                 "create a Session with the attached keyspace instead"))
+            return _NOT_SET
+
+        keyspace = self.session.keyspace
+        conflict = control_connection._attach_application_session(keyspace, self.session)
+        if conflict is not None:
+            self._set_final_exception(InvalidRequest(conflict))
             return _NOT_SET
 
         if connection is None:
