@@ -598,10 +598,11 @@ class ControlConnectionQueryFallback(enum.Enum):
     keyspace, including :const:`None`. Other sessions may use fallback only
     while their keyspace matches that binding; a different keyspace is
     rejected. The binding is released once every session holding it has been
-    shut down or garbage collected, after which a later session may take it
-    over. A session without a keyspace cannot take over a binding that left
-    the shared connection in a keyspace, because CQL offers no way back to
-    "no keyspace"; that case is rejected with :class:`.InvalidRequest`.
+    shut down or garbage collected and its fallback requests have drained,
+    after which a later session may take it over. A session without a keyspace
+    cannot take over a binding that left the shared connection in a keyspace,
+    because CQL offers no way back to "no keyspace"; that case is rejected with
+    :class:`.InvalidRequest`.
 
     An explicit ``USE`` statement -- including the one
     :meth:`.Session.set_keyspace` executes -- is rejected with
@@ -3874,9 +3875,12 @@ class ControlConnection(object):
         # control connection to one keyspace (including None). Keeping that
         # binding stable avoids connection-level USE state leaking between
         # Sessions without adding a dispatcher to this exceptional path.
-        # The binding is released once every Session holding it is gone, so a
-        # later Session can take it over.
-        self._application_query_lock = Lock()
+        # The binding is released once every Session holding it is gone and its
+        # requests have drained, so a later Session can take it over. Response
+        # callbacks keep this lock while handing one fallback request off to
+        # the next; it must be re-entrant because some connections deliver a
+        # response synchronously from send_msg().
+        self._application_query_lock = RLock()
         self._application_keyspace = _NOT_SET
         self._application_sessions = WeakSet()
 
@@ -3906,8 +3910,9 @@ class ControlConnection(object):
 
         The first fallback ``Session`` takes the binding; other Sessions may
         share it while they use the same keyspace. Once every Session holding
-        the binding has been shut down or collected, the binding is reclaimed
-        and a later Session can take it over.
+        the binding has been shut down or collected and its fallback requests
+        have drained, the binding is reclaimed and a later Session can take it
+        over.
 
         Returns ``None`` when the binding was taken or shared, otherwise a
         message explaining the conflict.
@@ -3937,7 +3942,10 @@ class ControlConnection(object):
             return None
 
     def _prune_application_sessions(self):
-        """Drop shut-down owners; collected ones leave the WeakSet on their own."""
+        """Drop shut-down owners after shared-connection requests have drained."""
+        connection = self._connection
+        if connection is not None and connection.in_flight:
+            return
         for session in tuple(self._application_sessions):
             if session.is_shutdown:
                 self._application_sessions.discard(session)
@@ -5176,17 +5184,28 @@ class ResponseFuture(object):
             connection._requests.pop(request_id, None)
 
     def _handle_control_connection_response(self, connection, cb, response):
-        with connection.lock:
-            connection.in_flight -= 1
-        cb(response)
+        control_connection = self.session.cluster.control_connection
+        # Keep the binding stable while a response callback may synchronously
+        # hand off from one physical fallback request to another. This closes
+        # the zero-in-flight window between the driver's USE response and the
+        # application query it sends next.
+        with control_connection._application_query_lock:
+            with connection.lock:
+                connection.in_flight -= 1
+            cb(response)
 
     def _is_keyspace_change_query(self, message=None):
         message = self.message if message is None else message
         if not isinstance(message, QueryMessage):
             return False
         query = getattr(message.query, 'query_string', message.query)
+        if isinstance(query, (bytes, bytearray)):
+            try:
+                query = query.decode('utf8')
+            except UnicodeDecodeError:
+                return False
         return isinstance(query, str) and \
-            re.match(r'^(?:\s|(?:--|//)[^\r\n]*(?:\r?\n|$)|/\*(?:[^*]|\*(?!/))*\*/)*USE\b',
+            re.match(r'^(?:\s|(?:--|//)[^\r\n]*(?:\r\n?|\n|$)|/\*(?:[^*]|\*(?!/))*\*/)*USE\b',
                      query, re.IGNORECASE) is not None
 
     def _control_connection_failed(self):
@@ -5309,28 +5328,32 @@ class ResponseFuture(object):
                 "create a Session with the attached keyspace instead"))
             return _NOT_SET
 
-        keyspace = self.session.keyspace
-        conflict = control_connection._attach_application_session(keyspace, self.session)
-        if conflict is not None:
-            self._set_final_exception(InvalidRequest(conflict))
-            return _NOT_SET
+        # Hold this from binding through borrowing a stream. Otherwise a
+        # concurrent shutdown can expose a zero-in-flight owner, allowing a
+        # different Session to reclaim the binding before this request is sent.
+        with control_connection._application_query_lock:
+            keyspace = self.session.keyspace
+            conflict = control_connection._attach_application_session(keyspace, self.session)
+            if conflict is not None:
+                self._set_final_exception(InvalidRequest(conflict))
+                return _NOT_SET
 
-        if connection is None:
-            connection = control_connection._connection
-        if connection is None:
-            self._errors['control connection'] = ConnectionException(
-                "Control connection is not connected")
-            return None
+            if connection is None:
+                connection = control_connection._connection
+            if connection is None:
+                self._errors['control connection'] = ConnectionException(
+                    "Control connection is not connected")
+                return None
 
-        if host is None:
-            host = self.session.cluster.get_control_connection_host() or connection.endpoint
+            if host is None:
+                host = self.session.cluster.get_control_connection_host() or connection.endpoint
 
-        if keyspace is not None and connection.keyspace != keyspace:
-            return self._set_control_connection_keyspace(
-                connection, host, keyspace, message=message, cb=cb)
+            if keyspace is not None and connection.keyspace != keyspace:
+                return self._set_control_connection_keyspace(
+                    connection, host, keyspace, message=message, cb=cb)
 
-        return self._send_control_connection_message(
-            message=message, cb=cb, connection=connection, host=host)
+            return self._send_control_connection_message(
+                message=message, cb=cb, connection=connection, host=host)
 
     def _query(self, host, message=None, cb=None):
         if message is None:

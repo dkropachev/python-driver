@@ -444,8 +444,11 @@ class ResponseFutureTests(unittest.TestCase):
         for query_string in (
                 "USE newks",
                 "-- select another keyspace\nUSE newks",
+                "-- select another keyspace\rUSE newks",
                 "// select another keyspace\nUSE newks",
-                "/* select another keyspace */ USE newks"):
+                "/* select another keyspace */ USE newks",
+                b"USE newks",
+                b"-- select another keyspace\rUSE newks"):
             with self.subTest(query_string=query_string):
                 session = self.make_basic_session()
                 session.cluster.allow_control_connection_query_fallback = \
@@ -667,8 +670,11 @@ class ResponseFutureTests(unittest.TestCase):
         assert connection.send_msg.call_args_list[0][0][0].query == 'USE ks1'
         connection.send_msg.call_args_list[0][1]['cb'](
             Mock(spec=ResultMessage, kind=RESULT_KIND_SET_KEYSPACE, new_keyspace='ks1'))
+        connection.send_msg.call_args_list[1][1]['cb'](
+            self.make_mock_response(['value'], [('one',)]))
 
-        # the binding is released once its only owner is gone
+        # the binding is released once its only owner is gone and its request
+        # has drained
         session1.is_shutdown = True
 
         session2 = self._make_fallback_session(cluster=session1.cluster, keyspace='ks2')
@@ -677,6 +683,49 @@ class ResponseFutureTests(unittest.TestCase):
 
         assert rf2._final_exception is None
         assert connection.send_msg.call_args_list[-1][0][0].query == 'USE ks2'
+        assert session1.cluster.control_connection._get_application_keyspace() == 'ks2'
+
+    def test_control_connection_fallback_keeps_shutdown_owner_until_requests_drain(self):
+        session1 = self._make_fallback_session(keyspace='ks1')
+        connection = self.make_control_connection()
+        connection.get_request_id.side_effect = [7, 8, 9]
+        session1.cluster.control_connection._connection = connection
+        session1.cluster.get_control_connection_host.return_value = Mock(endpoint=connection.endpoint)
+
+        rf1 = self.make_response_future(session1)
+        assert rf1.send_request()
+        assert connection.send_msg.call_args_list[0][0][0].query == 'USE ks1'
+        session1.is_shutdown = True
+
+        # The driver's USE is still in flight, so shutdown cannot release the
+        # binding to a Session using another keyspace.
+        session2 = self._make_fallback_session(cluster=session1.cluster, keyspace='ks2')
+        rf2 = self.make_response_future(session2)
+        assert rf2.send_request()
+        with pytest.raises(InvalidRequest, match='already attached'):
+            rf2.result()
+
+        connection.send_msg.call_args_list[0][1]['cb'](
+            Mock(spec=ResultMessage, kind=RESULT_KIND_SET_KEYSPACE, new_keyspace='ks1'))
+        assert connection.send_msg.call_args_list[1][0][0] is rf1.message
+
+        # USE drained, but application query remains in flight and keeps the
+        # shutdown owner bound.
+        session3 = self._make_fallback_session(cluster=session1.cluster, keyspace='ks2')
+        rf3 = self.make_response_future(session3)
+        assert rf3.send_request()
+        with pytest.raises(InvalidRequest, match='already attached'):
+            rf3.result()
+
+        connection.send_msg.call_args_list[1][1]['cb'](
+            self.make_mock_response(['value'], [('one',)]))
+
+        # Once both physical requests drain, another keyspace can take over.
+        session4 = self._make_fallback_session(cluster=session1.cluster, keyspace='ks2')
+        rf4 = self.make_response_future(session4)
+        assert rf4.send_request()
+        assert rf4._final_exception is None
+        assert connection.send_msg.call_args_list[2][0][0].query == 'USE ks2'
         assert session1.cluster.control_connection._get_application_keyspace() == 'ks2'
 
     def test_control_connection_fallback_reclaim_without_keyspace_rejected(self):
