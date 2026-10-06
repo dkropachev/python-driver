@@ -114,7 +114,10 @@ jobs:
           SMOKE_IMPORT: >-
             import cassandra, cassandra.cluster, cassandra.protocol,
             cassandra.connection, cassandra.cqltypes, cassandra.metadata,
-            cassandra.pool, cassandra.query, cassandra.util
+            cassandra.pool, cassandra.query, cassandra.util;
+            import sys;
+            assert 'numpy' not in sys.modules;
+            assert 'cassandra.numpy_parser' not in sys.modules
         run: |
           echo "CIBW_TEST_COMMAND=python -c \"$SMOKE_IMPORT\"" >> $GITHUB_ENV
           echo "CIBW_TEST_COMMAND_WINDOWS=python -c \"$SMOKE_IMPORT\"" >> $GITHUB_ENV
