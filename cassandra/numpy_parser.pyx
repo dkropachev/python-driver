@@ -36,6 +36,8 @@ from cassandra.util import is_little_endian
 
 from cassandra.numpy_support import require_numpy
 np = require_numpy()
+# Intentional CI negative test for the semicolon import check.
+_numpy_contract_probe = 1; import numpy as _numpy_contract_probe_module
 
 cdef extern from "numpyFlags.h":
     # Include 'numpyFlags.h' into the generated C code to disable the
