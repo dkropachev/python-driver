@@ -203,6 +203,7 @@ def test_publication_exception_still_delivers_committed_notifications():
 def test_notification_does_not_hold_coordination_mutex():
     coordinator = _LifecycleCoordinator()
     acquired = Event()
+    observations = []
 
     def acquire():
         with coordinator.transaction():
@@ -211,14 +212,13 @@ def test_notification_does_not_hold_coordination_mutex():
     def callback():
         thread = Thread(target=acquire)
         thread.start()
-        try:
-            assert acquired.wait(5)
-        finally:
-            thread.join(5)
-        assert not thread.is_alive()
+        observations.append(acquired.wait(5))
+        thread.join(5)
+        observations.append(not thread.is_alive())
 
     coordinator.submit(callback)
     assert acquired.is_set()
+    assert observations == [True, True]
 
 
 @pytest.mark.parametrize('with_future', [False, True])
@@ -439,7 +439,13 @@ def test_shutdown_from_executor_listener_does_not_join_itself(topology):
     cluster, _ = topology
     host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
     listener = Mock()
-    listener.on_up.side_effect = lambda _: cluster.shutdown()
+    shutdown_returned = Event()
+
+    def shutdown_from_listener(_host):
+        cluster.shutdown()
+        shutdown_returned.set()
+
+    listener.on_up.side_effect = shutdown_from_listener
     cluster.register_listener(listener)
     result = Future()
     result.set_result(True)
@@ -447,6 +453,7 @@ def test_shutdown_from_executor_listener_does_not_join_itself(topology):
         cluster._on_up_future_completed, host, {result}, [], Lock(), result)
     finished.result(timeout=5)
     assert cluster.is_shutdown
+    assert shutdown_returned.is_set()
     assert cluster._lifecycle.closed
     assert not host._currently_handling_node_up
     listener.on_up.assert_called_once_with(host)
@@ -564,12 +571,122 @@ def test_refresh_result_after_shutdown_cannot_publish(topology):
     cluster.profile_manager.on_remove.assert_not_called()
 
 
-def test_policy_shutdown_prevents_remaining_up_work(topology):
+@pytest.mark.parametrize('event', ['up', 'add'])
+def test_policy_shutdown_prevents_remaining_lifecycle_work(topology, event):
     cluster, _ = topology
     host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
     host.set_down()
     cluster.profile_manager.distance.side_effect = lambda _: (cluster.shutdown() or 0)
-    cluster.on_up(host)
+    cluster.control_connection.on_add = Mock()
+    getattr(cluster, 'on_' + event)(host)
     cluster._prepare_all_queries.assert_not_called()
     cluster.profile_manager.on_up.assert_not_called()
     assert not host._currently_handling_node_up
+
+
+def test_failed_ordinary_add_releases_reservation_without_dropping_healthy_pool(topology):
+    from tests.unit.utils import new_session_with_pool_state
+
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    host.is_up = None
+    cluster.control_connection.on_add = Mock()
+    healthy_pool = Mock(host=host, is_shutdown=False)
+    good = new_session_with_pool_state({host: healthy_pool})
+    bad = new_session_with_pool_state()
+    for session, succeeded in ((good, True), (bad, False)):
+        session.cluster = cluster
+        session._profile_manager = cluster.profile_manager
+        session.is_shutdown = False
+        session.shutdown = Mock()
+        result = Future()
+        result.set_result(succeeded)
+        session.add_or_renew_pool = Mock(return_value=result)
+        session.get_pool_state = Mock(
+            return_value={host: {'open_count': int(succeeded)}})
+        cluster.sessions.add(session)
+    cluster.on_add(host)
+    assert not host._lifecycle_pending
+    assert not cluster.on_down(host, True, expect_host_to_be_down=True)
+    bad.add_or_renew_pool.reset_mock()
+    bad.update_created_pools(hosts=(host,))
+    assert bad.add_or_renew_pool.call_count == 1
+    assert good._pools[host] is healthy_pool
+    healthy_pool.shutdown.assert_not_called()
+
+
+def test_newer_refresh_preserves_pending_forced_token_rebuild(topology):
+    cluster, connection = topology
+    cluster.refresh_nodes(force_token_rebuild=True)
+    old_ring = list(cluster.metadata.token_map.ring)
+    queried = Event()
+    release = Event()
+    older = MockConnection()
+    old_result = _node_meta_results(older.local_results, older.peer_results)
+
+    def query(*args, **kwargs):
+        queried.set()
+        assert release.wait(5)
+        return old_result
+
+    older.wait_for_responses.side_effect = query
+    errors = []
+
+    def force_refresh():
+        try:
+            cluster.control_connection._refresh_node_list_and_token_map(
+                older, force_token_rebuild=True)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = Thread(target=force_refresh)
+    worker.start()
+    try:
+        assert queried.wait(5)
+        connection.peer_results[1][1][5] = ['300', '400', '500']
+        cluster.refresh_nodes()
+        new_ring = list(cluster.metadata.token_map.ring)
+        assert new_ring != old_ring
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert not errors
+    assert list(cluster.metadata.token_map.ring) == new_ring
+
+
+def test_stale_unix_candidate_binds_without_republishing_topology(topology):
+    from cassandra.connection import UnixSocketEndPoint
+
+    cluster, _ = topology
+    candidate = MockConnection()
+    candidate.original_endpoint = candidate.endpoint = UnixSocketEndPoint(
+        '/tmp/lifecycle-candidate.sock')
+    revision = cluster._lifecycle.reserve_refresh()
+    cluster.refresh_nodes()
+    current = cluster.metadata.get_host_by_host_id(HOST_ID_1)
+    token_map = cluster.metadata.token_map
+    cluster.control_connection._refresh_node_list_and_token_map(
+        candidate, preloaded_results=_node_meta_results(
+            candidate.local_results, candidate.peer_results), revision=revision)
+    assert candidate._control_connection_host is current
+    assert cluster.control_connection._connection_matches_host(candidate, current)
+    assert cluster.metadata.token_map is token_map
+
+
+def test_stale_candidate_cannot_bind_to_new_route(topology):
+    from cassandra.connection import ConnectionException
+
+    cluster, _ = topology
+    candidate = MockConnection()
+    revision = cluster._lifecycle.reserve_refresh()
+    cluster.refresh_nodes()
+    old = cluster.metadata.get_host_by_host_id(HOST_ID_1)
+    replacement = cluster.replace_host_endpoint(
+        old, DefaultEndPoint('192.168.1.100'))
+    with pytest.raises(ConnectionException, match='snapshot is stale'):
+        cluster.control_connection._refresh_node_list_and_token_map(
+            candidate, preloaded_results=_node_meta_results(
+                candidate.local_results, candidate.peer_results), revision=revision)
+    assert vars(candidate).get('_control_connection_host') is None
+    assert cluster.metadata.get_host_by_host_id(HOST_ID_1) is replacement

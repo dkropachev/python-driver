@@ -590,10 +590,12 @@ class ClusterTest(unittest.TestCase):
                     host_id=uuid.uuid4())
         cluster.metadata.add_or_return_host(host)
         lock_acquired = Event()
+        observations = []
 
         def on_listener_remove(_host):
-            assert cluster.metadata.get_host_by_host_id(host.host_id) is None
-            assert host._is_removed
+            observations.extend((
+                cluster.metadata.get_host_by_host_id(host.host_id) is None,
+                host._is_removed))
 
             def acquire_callback_lock():
                 with cluster._lifecycle.transaction():
@@ -601,9 +603,9 @@ class ClusterTest(unittest.TestCase):
 
             lock_thread = Thread(target=acquire_callback_lock)
             lock_thread.start()
-            assert lock_acquired.wait(2)
+            observations.append(lock_acquired.wait(2))
             lock_thread.join(2)
-            assert not lock_thread.is_alive()
+            observations.append(not lock_thread.is_alive())
 
         listener = Mock()
         listener.on_remove.side_effect = on_listener_remove
@@ -611,6 +613,7 @@ class ClusterTest(unittest.TestCase):
 
         cluster.remove_host(host)
 
+        assert observations == [True, True, True, True]
         listener.on_remove.assert_called_once_with(host)
         cluster.control_connection.on_remove.assert_called_once_with(
             host, trigger_reconciliation=True)

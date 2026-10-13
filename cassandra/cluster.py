@@ -190,6 +190,8 @@ class _LifecycleCoordinator:
         self._draining = False
         self._requested = 0
         self._published = 0
+        self._force_revision = 0
+        self._rebuilt_revision = 0
         self._closed = False
         self._retired = WeakValueDictionary()
 
@@ -292,10 +294,19 @@ class _LifecycleCoordinator:
             if not getattr(self._local, 'depth', 0):
                 self.drain()
 
-    def reserve_refresh(self):
+    def reserve_refresh(self, force_token_rebuild=False):
         with self._lock:
             self._requested += 1
+            if force_token_rebuild:
+                self._force_revision = self._requested
             return self._requested
+
+    def force_rebuild_required(self, revision):
+        """Keep force intent until this or a newer snapshot rebuilds tokens."""
+        return self._rebuilt_revision < self._force_revision <= revision
+
+    def complete_token_rebuild(self, revision):
+        self._rebuilt_revision = max(self._rebuilt_revision, revision)
 
     def accept_refresh(self, revision):
         # Called inside a publication transaction.
@@ -357,6 +368,12 @@ class _LifecycleCoordinator:
         host._pending_host_addition = True
         if on_reconnection is not None:
             host._pending_host_addition_callback = on_reconnection
+
+    def release_addition(self, host):
+        """Let session reconciliation resume after an ordinary ADD failure."""
+        with host.lock:
+            if self.is_current(host):
+                host._lifecycle_pending = False
 
     def mark_ready(self, host, set_up=True):
         if not self.is_current(host):
@@ -3088,6 +3105,8 @@ class Cluster(object):
             return
 
         distance = self.profile_manager.distance(host)
+        if not self._is_current_host(host):
+            return
         if distance != HostDistance.IGNORED:
             self._prepare_all_queries(host)
             log.debug("Done preparing queries for new host %r", host)
@@ -3128,6 +3147,13 @@ class Cluster(object):
                 self._finalize_add(host)
                 return
 
+            if not reconcile_pools_on_failure:
+                # A healthy sibling pool can discount DOWN. Once aggregate
+                # ADD has failed it no longer owns ordinary pool creation;
+                # let that session reconcile without tearing down live pools.
+                self._lifecycle.release_addition(host)
+                return
+
             # A same-endpoint replacement removes its predecessor without
             # reconciling pools because doing so can race this addition. If
             # the replacement fails, _finalize_add() cannot provide that
@@ -3157,6 +3183,7 @@ class Cluster(object):
                     # it managed to install, and allow a later DOWN event to
                     # start fresh handling.
                     old_reconnector = self._lifecycle.supersede_down(host)
+                    self._lifecycle.release_addition(host)
                     if old_reconnector:
                         old_reconnector.cancel()
                 else:
@@ -6483,7 +6510,7 @@ class ControlConnection(object):
     def _refresh_node_list_and_token_map(self, connection, preloaded_results=None,
                                          force_token_rebuild=False, revision=None):
         if revision is None:
-            revision = self._lifecycle.reserve_refresh()
+            revision = self._lifecycle.reserve_refresh(force_token_rebuild)
         if preloaded_results:
             log.debug("[control connection] Refreshing node list and token map using preloaded results")
             peers_result = preloaded_results[0]
@@ -6514,9 +6541,34 @@ class ControlConnection(object):
                     for row in rows if self._is_valid_peer(row)]
         with self._lifecycle.transaction():
             if not self._lifecycle.accept_refresh(revision):
+                if not self._lifecycle.closed:
+                    self._bind_stale_candidate(connection, prepared, local_row)
                 return
+            force_token_rebuild |= self._lifecycle.force_rebuild_required(revision)
             self._apply_node_list_and_token_map(
                 connection, prepared, local_row, force_token_rebuild)
+            if force_token_rebuild:
+                self._lifecycle.complete_token_rebuild(revision)
+
+    def _bind_stale_candidate(self, connection, prepared, local_row):
+        """Bind socket-local identity without publishing an older topology."""
+        if vars(connection).get('_control_connection_host') is not None:
+            return
+        for row, endpoint in prepared:
+            if row is not local_row:
+                continue
+            host_id = row.get('host_id')
+            host = self._cluster.metadata.get_host_by_host_id(host_id)
+            original = getattr(connection, 'original_endpoint', connection.endpoint)
+            if (host is not None and not host._is_removed and
+                    host.endpoint in (endpoint, original)):
+                connection._control_connection_host_id = host_id
+                connection._control_connection_host = host
+                return
+        # A candidate socket whose observed identity/route was superseded
+        # must be retried, not installed against the new endpoint owner.
+        raise ConnectionException("Control connection topology snapshot is stale",
+                                  connection.endpoint)
 
     def _apply_node_list_and_token_map(
             self, connection, prepared, local_row, force_token_rebuild):
