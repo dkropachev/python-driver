@@ -232,3 +232,33 @@ Clusters and Sessions
    :members:
 
 .. autoexception:: UserTypeDoesNotExist ()
+
+Topology publication and lifecycle notifications
+------------------------------------------------
+
+:meth:`Cluster.refresh_nodes` synchronously publishes node-list and token
+metadata. DC/rack attribute changes are delivered with their policy transition
+(remove from the old location, update the Host, add at the new location), and
+can lag node-list publication while a notification is running. The method does
+not wait for an already-running lifecycle notification.
+Policies, session pool management and registered host listeners receive queued
+notifications in order, with no topology or host callback lock held while they
+run. A replacement's removal notifications precede its addition notifications.
+
+A listener can call ``refresh_nodes()`` synchronously, including while another
+thread removes its host. The nested refresh publishes metadata and appends its
+notifications; it does not recursively invoke a replacement's addition inside
+an unfinished removal callback. Consequently metadata can be newer than the
+notifications currently being delivered, and pool availability can lag metadata
+publication. A newly published host remains reserved for its addition operation
+until lifecycle initialization finishes.
+
+Retirement is terminal for a Host object. An already-running callback may
+finish after retirement, but queued stale UP, DOWN and ADD work is discarded.
+A callback must return before later notifications can run; do not wait for
+another lifecycle notification from the same cluster. Callback exceptions are
+logged and do not strand the notification queue.
+
+Topology queries can overlap. A snapshot older than a newer accepted refresh
+is discarded instead of overwriting the newer topology. This orders client
+refresh requests; it does not establish a server-side topology version.

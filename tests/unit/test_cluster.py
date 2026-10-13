@@ -514,8 +514,7 @@ class ClusterTest(unittest.TestCase):
         cluster.sessions = (session,)
 
         with self.assertLogs('cassandra.cluster', level='ERROR'):
-            with self.assertRaisesRegex(RuntimeError, 'pool scheduling failed'):
-                cluster.on_up(host)
+            cluster.on_up(host)
 
         assert host.is_up is False
         assert not host._currently_handling_node_up
@@ -523,7 +522,7 @@ class ClusterTest(unittest.TestCase):
         cluster.control_connection.on_down.assert_not_called()
         cluster._start_reconnector.assert_not_called()
 
-    def test_remove_waits_for_inflight_up_completion(self):
+    def test_remove_orders_notifications_after_inflight_up_completion(self):
         cluster = Cluster()
         self.addCleanup(cluster.shutdown)
         cluster.profile_manager = Mock()
@@ -541,7 +540,6 @@ class ClusterTest(unittest.TestCase):
         cluster.sessions = (session,)
         callback_started = Event()
         release_callback = Event()
-        removal_attempted = Event()
         removal_finished = Event()
         callback_order = []
 
@@ -556,21 +554,6 @@ class ClusterTest(unittest.TestCase):
         cluster.register_listener(listener)
         cluster.on_up(host)
 
-        callback_lock = host._down_callbacks_lock
-        remove_thread = None
-
-        class AttemptTrackingLock(object):
-
-            def __enter__(self):
-                if threading.current_thread() is remove_thread:
-                    removal_attempted.set()
-                callback_lock.acquire()
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                callback_lock.release()
-
-        host._down_callbacks_lock = AttemptTrackingLock()
         completion_thread = Thread(target=lambda: future.set_result(True))
 
         def remove_host():
@@ -584,8 +567,9 @@ class ClusterTest(unittest.TestCase):
         try:
             assert callback_started.wait(5)
             remove_thread.start()
-            assert removal_attempted.wait(5)
-            assert not removal_finished.is_set()
+            assert removal_finished.wait(5)
+            assert host._is_removed
+            assert callback_order == []
         finally:
             release_callback.set()
             completion_thread.join(5)
@@ -595,10 +579,10 @@ class ClusterTest(unittest.TestCase):
         assert not completion_thread.is_alive()
         assert not remove_thread.is_alive()
         assert callback_order.index('up') < callback_order.index('remove')
-        session.update_created_pools.assert_called_once_with()
+        session.update_created_pools.assert_not_called()
         assert host._is_removed
 
-    def test_remove_releases_callback_lock_before_notifications(self):
+    def test_remove_releases_coordination_lock_before_notifications(self):
         cluster = Cluster()
         self.addCleanup(cluster.shutdown)
         cluster.control_connection.on_remove = Mock()
@@ -612,7 +596,7 @@ class ClusterTest(unittest.TestCase):
             assert host._is_removed
 
             def acquire_callback_lock():
-                with host._down_callbacks_lock:
+                with cluster._lifecycle.transaction():
                     lock_acquired.set()
 
             lock_thread = Thread(target=acquire_callback_lock)
@@ -631,7 +615,7 @@ class ClusterTest(unittest.TestCase):
         cluster.control_connection.on_remove.assert_called_once_with(
             host, trigger_reconciliation=True)
 
-    def test_replacement_waits_for_inflight_up_completion(self):
+    def test_replacement_orders_notifications_after_inflight_up_completion(self):
         cluster = Cluster()
         self.addCleanup(cluster.shutdown)
         cluster.profile_manager = Mock()
@@ -650,7 +634,6 @@ class ClusterTest(unittest.TestCase):
         cluster.sessions = (session,)
         callback_started = Event()
         release_callback = Event()
-        replacement_attempted = Event()
         replacement_finished = Event()
         callback_order = []
 
@@ -665,21 +648,6 @@ class ClusterTest(unittest.TestCase):
         cluster.register_listener(listener)
         cluster.on_up(host)
 
-        callback_lock = host._down_callbacks_lock
-        replacement_thread = None
-
-        class AttemptTrackingLock(object):
-
-            def __enter__(self):
-                if threading.current_thread() is replacement_thread:
-                    replacement_attempted.set()
-                callback_lock.acquire()
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                callback_lock.release()
-
-        host._down_callbacks_lock = AttemptTrackingLock()
         completion_thread = Thread(target=lambda: future.set_result(True))
 
         def replace_host():
@@ -693,9 +661,9 @@ class ClusterTest(unittest.TestCase):
         try:
             assert callback_started.wait(5)
             replacement_thread.start()
-            assert replacement_attempted.wait(5)
-            assert cluster.metadata.get_host_by_host_id(host.host_id) is host
-            assert not replacement_finished.is_set()
+            assert replacement_finished.wait(5)
+            assert host._is_removed
+            assert callback_order == []
         finally:
             release_callback.set()
             completion_thread.join(5)
@@ -709,7 +677,7 @@ class ClusterTest(unittest.TestCase):
         assert cluster.metadata.get_host_by_host_id(host.host_id) is None
         assert cluster.metadata.get_host(host.endpoint).host_id != host.host_id
 
-    def test_endpoint_move_waits_for_inflight_up_completion(self):
+    def test_endpoint_move_orders_notifications_after_inflight_up_completion(self):
         cluster = Cluster()
         self.addCleanup(cluster.shutdown)
         cluster.profile_manager = Mock()
@@ -728,7 +696,7 @@ class ClusterTest(unittest.TestCase):
         cluster.sessions = (session,)
         callback_started = Event()
         release_callback = Event()
-        move_attempted = Event()
+        move_finished = Event()
         callback_order = []
 
         def on_listener_up(_host):
@@ -742,21 +710,6 @@ class ClusterTest(unittest.TestCase):
         cluster.register_listener(listener)
         cluster.on_up(host)
 
-        callback_lock = host._down_callbacks_lock
-        move_thread = None
-
-        class AttemptTrackingLock(object):
-
-            def __enter__(self):
-                if threading.current_thread() is move_thread:
-                    move_attempted.set()
-                callback_lock.acquire()
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                callback_lock.release()
-
-        host._down_callbacks_lock = AttemptTrackingLock()
         completion_thread = Thread(target=lambda: future.set_result(True))
         move_errors = []
 
@@ -766,14 +719,17 @@ class ClusterTest(unittest.TestCase):
                     host, DefaultEndPoint('127.0.0.2'))
             except Exception as exc:
                 move_errors.append(exc)
+            finally:
+                move_finished.set()
 
         move_thread = Thread(target=move_host)
         completion_thread.start()
         try:
             assert callback_started.wait(5)
             move_thread.start()
-            assert move_attempted.wait(5)
-            assert cluster.metadata.get_host_by_host_id(host.host_id) is host
+            assert move_finished.wait(5)
+            assert host._is_removed
+            assert callback_order == []
         finally:
             release_callback.set()
             completion_thread.join(5)
@@ -1961,7 +1917,9 @@ class HostReconnectionHandlerTest(unittest.TestCase):
         cluster.control_connection.on_down.assert_called_once_with(self.host)
         session.on_down.assert_called_once_with(self.host)
         listener.on_down.assert_called_once_with(self.host)
-        cluster._start_reconnector.assert_called_once_with(self.host, False)
+        cluster._start_reconnector.assert_called_once_with(
+            self.host, False, on_add_reconnection=None,
+            down_event_generation=self.host._down_event_generation)
         assert not self.host._currently_handling_node_down
 
     def test_queued_reconnector_restart_skips_pending_up(self):
@@ -2134,7 +2092,7 @@ class HostReconnectionHandlerTest(unittest.TestCase):
 
         listener.on_add.side_effect = on_add
 
-        with pytest.raises(RuntimeError, match='listener failed'):
+        with self.assertLogs('cassandra.cluster', level='ERROR'):
             cluster.on_add(self.host)
 
         assert not self.host._pending_host_addition
@@ -2165,7 +2123,9 @@ class HostReconnectionHandlerTest(unittest.TestCase):
         down_task, *args = cluster.executor.submit.call_args.args
         down_task(*args)
 
-        cluster._start_reconnector.assert_called_once_with(self.host, False)
+        cluster._start_reconnector.assert_called_once_with(
+            self.host, False, on_add_reconnection=None,
+            down_event_generation=self.host._down_event_generation)
         assert not self.host._currently_handling_node_down
 
     def test_failed_down_submission_releases_pending_state(self):
@@ -5269,7 +5229,8 @@ class ClusterDownHandlingTest(unittest.TestCase):
 
         self.cluster.profile_manager.on_down.assert_called_once_with(self.host)
         self.cluster._start_reconnector.assert_called_once_with(
-            self.host, False)
+            self.host, False, on_add_reconnection=None,
+            down_event_generation=self.host._down_event_generation)
 
     def test_down_handling_continues_when_a_session_raises(self):
         del self.cluster.on_down_potentially_blocking  # use the real method
@@ -5286,7 +5247,8 @@ class ClusterDownHandlingTest(unittest.TestCase):
 
         following_session.on_down.assert_called_once_with(self.host)
         self.cluster._start_reconnector.assert_called_once_with(
-            self.host, False)
+            self.host, False, on_add_reconnection=None,
+            down_event_generation=self.host._down_event_generation)
 
     def test_down_handling_continues_when_a_listener_raises(self):
         del self.cluster.on_down_potentially_blocking  # use the real method
@@ -5303,7 +5265,8 @@ class ClusterDownHandlingTest(unittest.TestCase):
 
         following_listener.on_down.assert_called_once_with(self.host)
         self.cluster._start_reconnector.assert_called_once_with(
-            self.host, False)
+            self.host, False, on_add_reconnection=None,
+            down_event_generation=self.host._down_event_generation)
 
     def test_reentrant_removal_stops_remaining_down_callbacks(self):
         del self.cluster.on_down_potentially_blocking  # use the real method
@@ -5351,14 +5314,13 @@ class ClusterDownHandlingTest(unittest.TestCase):
         self.cluster.control_connection.on_down.assert_not_called()
         self.cluster._start_reconnector.assert_not_called()
 
-    def test_remove_waits_for_inflight_down_callback(self):
+    def test_remove_orders_notifications_after_inflight_down_callback(self):
         del self.cluster.on_down_potentially_blocking  # use the real method
         self.cluster.metadata.add_or_return_host(self.host)
         self.cluster.profile_manager.on_down = Mock()
         self.cluster._start_reconnector = Mock()
         callback_started = Event()
         release_callback = Event()
-        removal_attempted = Event()
         removal_finished = Event()
         callback_order = []
 
@@ -5376,21 +5338,6 @@ class ClusterDownHandlingTest(unittest.TestCase):
         self.host.set_down()
         self.host._currently_handling_node_down = True
 
-        callback_lock = self.host._down_callbacks_lock
-        remove_thread = None
-
-        class AttemptTrackingLock(object):
-
-            def __enter__(self):
-                if threading.current_thread() is remove_thread:
-                    removal_attempted.set()
-                callback_lock.acquire()
-                return self
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                callback_lock.release()
-
-        self.host._down_callbacks_lock = AttemptTrackingLock()
         body = Cluster.on_down_potentially_blocking.__wrapped__
         down_thread = Thread(
             target=body,
@@ -5407,13 +5354,13 @@ class ClusterDownHandlingTest(unittest.TestCase):
         down_thread.start()
         assert callback_started.wait(5)
         remove_thread.start()
-        assert removal_attempted.wait(5)
-        removal_was_blocked = not removal_finished.is_set()
+        assert removal_finished.wait(5)
+        assert self.host._is_removed
+        assert callback_order == []
         release_callback.set()
         down_thread.join(5)
         remove_thread.join(5)
 
-        assert removal_was_blocked
         assert not down_thread.is_alive()
         assert not remove_thread.is_alive()
         assert callback_order.index('down') < callback_order.index('remove')
