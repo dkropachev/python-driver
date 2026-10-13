@@ -24,13 +24,13 @@ from unittest.mock import Mock, ANY, call, patch
 from cassandra import (AuthenticationFailed, OperationTimedOut,
                        SchemaTargetType, SchemaChangeType,
                        UnresolvableContactPoints)
+from cassandra._lifecycle import LifecycleCoordinator, EndpointMoveRejected
 from cassandra.protocol import ResultMessage, RESULT_KIND_ROWS
 from cassandra.cluster import (Cluster, ControlConnection, _Scheduler,
                                ProfileManager, EXEC_PROFILE_DEFAULT,
-                               ExecutionProfile, _LifecycleCoordinator,
+                               ExecutionProfile,
                                ControlConnectionQueryFallback,
-                               NoHostAvailable, _ControlReconnectionHandler,
-                               _EndpointMoveRejected)
+                               NoHostAvailable, _ControlReconnectionHandler)
 from cassandra.pool import Host, _ReconnectionHandler
 from cassandra.metadata import Metadata
 from cassandra.connection import (ConnectionException, EndPoint, DefaultEndPoint,
@@ -164,7 +164,7 @@ class MockCluster(object):
     is_shutdown = False
 
     def __init__(self):
-        self._lifecycle = _LifecycleCoordinator(self)
+        self._lifecycle = LifecycleCoordinator(self)
         self.metadata = MockMetadata()
         self.sessions = []
         self.added_hosts = []
@@ -1954,7 +1954,7 @@ class ControlConnectionTest(unittest.TestCase):
         self.connection.wait_for_responses.return_value = _node_meta_results(
             self.connection.local_results, self.connection.peer_results)
         self.cluster.replace_hosts_endpoints = Mock(
-            side_effect=_EndpointMoveRejected('stale source'))
+            side_effect=EndpointMoveRejected('stale source'))
         self.cluster.remove_host = Mock(
             side_effect=lambda host, **kwargs: self.cluster.metadata.remove_host(host))
 
@@ -1986,7 +1986,7 @@ class ControlConnectionTest(unittest.TestCase):
 
         def reject_after_concurrent_move(_moves):
             self.cluster.metadata.replace_host_endpoint(old, current)
-            raise _EndpointMoveRejected('stale source')
+            raise EndpointMoveRejected('stale source')
 
         self.cluster.replace_hosts_endpoints = Mock(
             side_effect=reject_after_concurrent_move)

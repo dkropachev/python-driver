@@ -18,7 +18,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from cassandra.cluster import Cluster, ControlConnection, _LifecycleCoordinator
+from cassandra.cluster import Cluster, ControlConnection
+from cassandra._lifecycle import LifecycleCoordinator
 from cassandra.connection import DefaultEndPoint
 from tests.unit.test_control_connection import (
     HOST_ID_1, HOST_ID_2, HOST_ID_3, MockConnection, _node_meta_results)
@@ -176,7 +177,7 @@ def test_older_query_cannot_overwrite_newer_topology(topology):
 
 
 def test_dispatcher_releases_ownership_after_callback_errors():
-    coordinator = _LifecycleCoordinator()
+    coordinator = LifecycleCoordinator()
     observed = []
 
     def fail():
@@ -191,7 +192,7 @@ def test_dispatcher_releases_ownership_after_callback_errors():
 
 
 def test_publication_exception_still_delivers_committed_notifications():
-    coordinator = _LifecycleCoordinator()
+    coordinator = LifecycleCoordinator()
     observed = []
     with pytest.raises(ValueError):
         with coordinator.transaction():
@@ -201,7 +202,7 @@ def test_publication_exception_still_delivers_committed_notifications():
 
 
 def test_notification_does_not_hold_coordination_mutex():
-    coordinator = _LifecycleCoordinator()
+    coordinator = LifecycleCoordinator()
     acquired = Event()
     observations = []
 
@@ -364,7 +365,7 @@ def test_repeated_location_destination_keeps_latest_reservation(topology):
 
 @pytest.mark.parametrize('deferred', [False, True])
 def test_notification_submission_never_returns_callback_result(deferred):
-    coordinator = _LifecycleCoordinator()
+    coordinator = LifecycleCoordinator()
     observed = []
 
     def callback():
@@ -517,7 +518,7 @@ def test_shutdown_cancels_retired_reconnector_before_queued_removal(topology):
 
 
 def test_close_does_not_wait_for_active_notification():
-    coordinator = _LifecycleCoordinator()
+    coordinator = LifecycleCoordinator()
     entered = Event()
     release = Event()
     later = Mock()
