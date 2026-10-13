@@ -557,7 +557,18 @@ def test_refresh_result_after_shutdown_cannot_publish(topology):
         return result
 
     connection.wait_for_responses.side_effect = query
-    worker = Thread(target=cluster.refresh_nodes)
+    apply_topology = Mock(
+        wraps=cluster.control_connection._apply_node_list_and_token_map)
+    cluster.control_connection._apply_node_list_and_token_map = apply_topology
+    errors = []
+
+    def refresh():
+        try:
+            cluster.control_connection._refresh_node_list_and_token_map(connection)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = Thread(target=refresh)
     worker.start()
     try:
         assert queried.wait(5)
@@ -567,6 +578,8 @@ def test_refresh_result_after_shutdown_cannot_publish(topology):
         worker.join(5)
         connection.wait_for_responses.side_effect = old_query
     assert not worker.is_alive()
+    assert not errors
+    apply_topology.assert_not_called()
     assert cluster.metadata.get_host_by_host_id(host.host_id) is host
     cluster.profile_manager.on_remove.assert_not_called()
 
@@ -690,3 +703,178 @@ def test_stale_candidate_cannot_bind_to_new_route(topology):
                 candidate.local_results, candidate.peer_results), revision=revision)
     assert vars(candidate).get('_control_connection_host') is None
     assert cluster.metadata.get_host_by_host_id(HOST_ID_1) is replacement
+
+
+def test_duplicate_up_does_not_schedule_another_pool_creation(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    host.set_down()
+    cluster.control_connection.on_up = Mock()
+    pool_ready = Future()
+    session = Mock()
+    session.add_or_renew_pool.return_value = pool_ready
+    cluster.sessions.add(session)
+    cluster.on_up(host)
+    cluster.on_up(host)
+    session.add_or_renew_pool.assert_called_once_with(host, is_host_addition=False)
+    assert host._currently_handling_node_up
+    pool_ready.set_result(True)
+    assert host.is_up
+    assert not host._currently_handling_node_up
+
+
+def test_superseded_down_does_not_reach_later_callbacks(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    generation = host._down_event_generation
+    cluster.profile_manager.on_down.side_effect = (
+        lambda current: cluster._lifecycle.supersede_down(current))
+    cluster.control_connection.on_down = Mock()
+    session = Mock()
+    cluster.sessions.add(session)
+    listener = Mock()
+    cluster.register_listener(listener)
+    Cluster.on_down_potentially_blocking.__wrapped__(
+        cluster, host, False, generation)
+    cluster.profile_manager.on_down.assert_called_once_with(host)
+    cluster.control_connection.on_down.assert_not_called()
+    session.on_down.assert_not_called()
+    listener.on_down.assert_not_called()
+    cluster._start_reconnector.assert_not_called()
+
+
+def test_later_failed_force_does_not_hide_earlier_force_intent(topology):
+    cluster, connection = topology
+    cluster.refresh_nodes(force_token_rebuild=True)
+    old_ring = list(cluster.metadata.token_map.ring)
+    older_force = cluster._lifecycle.reserve_refresh(force_token_rebuild=True)
+    middle_refresh = cluster._lifecycle.reserve_refresh()
+    failing_connection = MockConnection()
+    failing_connection.wait_for_responses.side_effect = RuntimeError('query failed')
+    with pytest.raises(RuntimeError, match='query failed'):
+        cluster.control_connection._refresh_node_list_and_token_map(
+            failing_connection, force_token_rebuild=True)
+    connection.peer_results[1][1][5] = ['300', '400', '500']
+    cluster.control_connection._refresh_node_list_and_token_map(
+        connection, preloaded_results=_node_meta_results(
+            connection.local_results, connection.peer_results), revision=middle_refresh)
+    middle_ring = list(cluster.metadata.token_map.ring)
+    assert middle_ring != old_ring
+    cluster.control_connection._refresh_node_list_and_token_map(
+        connection, preloaded_results=_node_meta_results(
+            connection.local_results, connection.peer_results), revision=older_force)
+    assert list(cluster.metadata.token_map.ring) == middle_ring
+    connection.peer_results[1][1][5] = ['600', '700', '800']
+    cluster.refresh_nodes()
+    assert list(cluster.metadata.token_map.ring) != middle_ring
+
+
+def test_pool_failure_policy_refresh_runs_without_session_or_host_lock(topology):
+    from tests.unit.utils import new_session_with_pool_state
+
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    session = new_session_with_pool_state()
+    session.cluster = cluster
+    session.shutdown = Mock()
+    session.get_pool_state = Mock(return_value={})
+    cluster.sessions.add(session)
+    cluster.on_down_potentially_blocking = Mock(return_value=Future())
+    with session._lock:
+        intent = session._claim_pool_intent_locked(host)
+        generation = object()
+        session._pool_generations[host] = generation
+    observations = []
+
+    def distance(_host):
+        def publication():
+            with cluster._lifecycle.transaction():
+                session_locked = session._lock.acquire(timeout=2)
+                host_locked = host.lock.acquire(timeout=2)
+                observations.extend((session_locked, host_locked))
+                if host_locked:
+                    host.lock.release()
+                if session_locked:
+                    session._lock.release()
+
+        worker = Thread(target=publication)
+        worker.start()
+        worker.join(5)
+        observations.append(not worker.is_alive())
+        cluster.refresh_nodes()
+        return 0
+
+    cluster.profile_manager.distance.side_effect = distance
+    session._handle_pool_creation_failure(
+        host, generation, None, intent, 0,
+        lambda reservation: cluster.on_down(
+            host, False, _pool_failure=reservation), False)
+    assert observations == [True, True, True]
+    cluster.on_down_potentially_blocking.assert_called_once()
+
+
+def test_pool_failure_rechecks_ownership_after_policy_callback(topology):
+    from tests.unit.utils import new_session_with_pool_state
+
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    session = new_session_with_pool_state()
+    session.cluster = cluster
+    session.shutdown = Mock()
+    session.get_pool_state = Mock(return_value={})
+    cluster.sessions.add(session)
+    cluster.on_down_potentially_blocking = Mock(return_value=Future())
+    with session._lock:
+        intent = session._claim_pool_intent_locked(host)
+        generation = object()
+        session._pool_generations[host] = generation
+    winner = Mock(host=host, is_shutdown=False)
+
+    def publish_new_pool(_host):
+        with session._lock:
+            with host.lock:
+                session._pools[host] = winner
+                session._pool_generations[host] = object()
+        return 0
+
+    cluster.profile_manager.distance.side_effect = publish_new_pool
+    session._handle_pool_creation_failure(
+        host, generation, None, intent, 0,
+        lambda reservation: cluster.on_down(
+            host, False, _pool_failure=reservation), False)
+    assert host.is_up
+    assert session._pools[host] is winner
+    cluster.on_down_potentially_blocking.assert_not_called()
+    winner.shutdown.assert_not_called()
+
+
+def test_shutdown_flag_racing_replacement_does_not_skip_old_retirement(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    handler = Mock()
+    host._reconnection_handler = handler
+    with cluster._lifecycle.transaction():
+        cluster.metadata.remove_host(host)
+        cluster.is_shutdown = True
+        cluster.on_remove(host)
+        assert host._is_removed
+        cluster._shutdown(wait_for_executor=True)
+    handler.cancel.assert_called_once_with()
+
+
+def test_removal_cancels_detached_reconnector_even_if_shutdown_wins(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    handler = Mock()
+    host._reconnection_handler = handler
+    take_handler = host.get_and_set_reconnection_handler
+
+    def take_then_shutdown(replacement):
+        previous = take_handler(replacement)
+        if previous is handler:
+            cluster.shutdown()
+        return previous
+
+    host.get_and_set_reconnection_handler = take_then_shutdown
+    cluster.remove_host(host, refresh_nodes=False)
+    handler.cancel.assert_called_once_with()

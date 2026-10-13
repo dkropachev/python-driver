@@ -172,6 +172,28 @@ def _cancel_and_notify(future):
             pass  # already notified
 
 
+class _PoolFailureReservation:
+    """Fence an admitted pool failure without locking across policy callbacks."""
+
+    def __init__(self, session, host, generation, expected_pool, intent, endpoint):
+        self.session = session
+        self.host = host
+        self.generation = generation
+        self.expected_pool = expected_pool
+        self.intent = intent
+        self.endpoint = endpoint
+
+    def owns_locked(self):
+        return (self.session._pool_intents_locked().get(self.host) is self.intent and
+                self.session._owns_pool_generation_locked(
+                    self.host, self.generation, self.expected_pool, self.endpoint))
+
+    def is_current(self):
+        with self.session._lock:
+            with self.host.lock:
+                return self.owns_locked()
+
+
 class _LifecycleCoordinator:
     """Own host admission, readiness, retirement and notification ordering.
 
@@ -190,8 +212,7 @@ class _LifecycleCoordinator:
         self._draining = False
         self._requested = 0
         self._published = 0
-        self._force_revision = 0
-        self._rebuilt_revision = 0
+        self._force_revisions = deque()
         self._closed = False
         self._retired = WeakValueDictionary()
 
@@ -212,6 +233,7 @@ class _LifecycleCoordinator:
                 return
             self._closed = True
             self._events.clear()
+            self._force_revisions.clear()
             hosts = list(self._retired.values())
             if self._cluster is not None:
                 hosts.extend(self._cluster.metadata.all_hosts())
@@ -249,19 +271,23 @@ class _LifecycleCoordinator:
         with host.lock:
             host._currently_handling_node_up = False
 
-    def begin_down(self, host, connected=False, expect_down=False):
+    def begin_down(self, host, connected=False, expect_down=False, pool_failure=None):
         """Return (generation, retry_only), or None if DOWN is discounted."""
-        with host.lock:
-            if self.closed or host._is_removed or connected:
-                return None
-            was_up = host.is_up
-            host.set_down()
-            if (not was_up and (host.is_currently_reconnecting() or
-                                host._currently_handling_node_down)):
-                return None
-            host._currently_handling_node_down = True
-            host._down_event_generation += 1
-            return host._down_event_generation, not was_up and not expect_down
+        failure_lock = (pool_failure.session._lock
+                        if pool_failure is not None else nullcontext())
+        with failure_lock:
+            with host.lock:
+                if (self.closed or host._is_removed or connected or
+                        (pool_failure is not None and not pool_failure.owns_locked())):
+                    return None
+                was_up = host.is_up
+                host.set_down()
+                if (not was_up and (host.is_currently_reconnecting() or
+                                    host._currently_handling_node_down)):
+                    return None
+                host._currently_handling_node_down = True
+                host._down_event_generation += 1
+                return host._down_event_generation, not was_up and not expect_down
 
     @staticmethod
     def finish_down(host, generation):
@@ -298,15 +324,16 @@ class _LifecycleCoordinator:
         with self._lock:
             self._requested += 1
             if force_token_rebuild:
-                self._force_revision = self._requested
+                self._force_revisions.append(self._requested)
             return self._requested
 
     def force_rebuild_required(self, revision):
         """Keep force intent until this or a newer snapshot rebuilds tokens."""
-        return self._rebuilt_revision < self._force_revision <= revision
+        return bool(self._force_revisions and self._force_revisions[0] <= revision)
 
     def complete_token_rebuild(self, revision):
-        self._rebuilt_revision = max(self._rebuilt_revision, revision)
+        while self._force_revisions and self._force_revisions[0] <= revision:
+            self._force_revisions.popleft()
 
     def accept_refresh(self, revision):
         # Called inside a publication transaction.
@@ -413,7 +440,7 @@ class _LifecycleCoordinator:
 
     def retire(self, host, trigger_reconciliation=True, refresh_nodes=True):
         with self.transaction():
-            if self.closed or not self._retire(host):
+            if not self._retire(host):
                 return
             self.submit(self._cluster._notify_host_removed, host,
                         trigger_reconciliation, True, refresh_nodes)
@@ -3006,7 +3033,7 @@ class Cluster(object):
             self._lifecycle.finish_down(host, down_event_generation)
 
     def on_down(self, host, is_host_addition, expect_host_to_be_down=False,
-                on_add_reconnection=None):
+                on_add_reconnection=None, _pool_failure=None):
         """
         Intended for internal use only.
 
@@ -3026,7 +3053,8 @@ class Cluster(object):
                     connected |= pool_state['open_count'] > 0
 
         admission = self._lifecycle.begin_down(
-            host, connected=connected, expect_down=expect_host_to_be_down)
+            host, connected=connected, expect_down=expect_host_to_be_down,
+            pool_failure=_pool_failure)
         if admission is None:
             return False
         down_event_generation, restart_reconnector = admission
@@ -3308,22 +3336,28 @@ class Cluster(object):
 
         reconnection_handler = host.get_and_set_reconnection_handler(None)
         if reconnection_handler:
-            notify(reconnection_handler.cancel)
+            try:
+                reconnection_handler.cancel()
+            except Exception:
+                log.exception("Error cancelling removed host reconnector")
 
     def signal_connection_failure(self, host, connection_exc,
                                   is_host_addition,
                                   expect_host_to_be_down=False,
-                                  on_add_reconnection=None):
+                                  on_add_reconnection=None, _pool_failure=None):
         """Return whether the failure caused DOWN handling to be dispatched."""
+        if _pool_failure is not None and not _pool_failure.is_current():
+            return False
         is_down = host.signal_connection_failure(connection_exc)
         if not is_down:
             return False
+        options = {} if _pool_failure is None else {'_pool_failure': _pool_failure}
         if on_add_reconnection is None:
             return self.on_down(
-                host, is_host_addition, expect_host_to_be_down)
+                host, is_host_addition, expect_host_to_be_down, **options)
         return self.on_down(
             host, is_host_addition, expect_host_to_be_down,
-            on_add_reconnection=on_add_reconnection)
+            on_add_reconnection=on_add_reconnection, **options)
 
     @_lifecycle_transaction
     def add_host(self, endpoint, datacenter=None, rack=None, signal=True,
@@ -4879,8 +4913,14 @@ class Session(object):
                             host, generation, expected_pool, endpoint)):
                     return self._stale_pool_creation_result_locked(
                         host, expected_pool, intent, distance)
-                self._pool_generations[host] = object()
-                dispatch_failure()
+                failure_generation = object()
+                self._pool_generations[host] = failure_generation
+                reservation = _PoolFailureReservation(
+                    self, host, failure_generation, expected_pool, intent, endpoint)
+        # Conviction/distance callbacks can refresh topology. Retain ownership
+        # in a token and recheck it atomically with DOWN admission instead of
+        # holding session/host locks through arbitrary policy code.
+        dispatch_failure(reservation)
         return owning_result
 
     def add_or_renew_pool(self, host, is_host_addition,
@@ -5050,7 +5090,7 @@ class Session(object):
 
             connection_errors = []
 
-            def dispatch_connection_failure():
+            def dispatch_connection_failure(reservation):
                 connection_exc = connection_errors[0]
                 log.warning(
                     "Failed to create connection pool for new host %s:",
@@ -5060,12 +5100,13 @@ class Session(object):
                 if on_add_reconnection is None:
                     self.cluster.signal_connection_failure(
                         host, connection_exc, is_host_addition,
-                        expect_host_to_be_down=True)
+                        expect_host_to_be_down=True, _pool_failure=reservation)
                 else:
                     self.cluster.signal_connection_failure(
                         host, connection_exc, is_host_addition,
                         expect_host_to_be_down=True,
-                        on_add_reconnection=on_add_reconnection)
+                        on_add_reconnection=on_add_reconnection,
+                        _pool_failure=reservation)
 
             try:
                 new_pool = HostConnection(host, distance, self)
@@ -5073,14 +5114,16 @@ class Session(object):
                 authentication_exc = ConnectionException(
                     str(auth_exc), endpoint=host)
 
-                def dispatch_authentication_failure():
+                def dispatch_authentication_failure(reservation):
                     if on_add_reconnection is None:
                         self.cluster.signal_connection_failure(
-                            host, authentication_exc, is_host_addition)
+                            host, authentication_exc, is_host_addition,
+                            _pool_failure=reservation)
                     else:
                         self.cluster.signal_connection_failure(
                             host, authentication_exc, is_host_addition,
-                            on_add_reconnection=on_add_reconnection)
+                            on_add_reconnection=on_add_reconnection,
+                            _pool_failure=reservation)
 
                 # Replacement aggregation uses None to distinguish a
                 # non-retryable authentication failure from other falsey
@@ -5146,18 +5189,20 @@ class Session(object):
                 new_pool._set_keyspace_for_all_conns(keyspace, callback)
                 set_keyspace_event.wait(self.cluster.connect_timeout)
                 if not set_keyspace_event.is_set() or errors_returned:
-                    def dispatch_keyspace_failure():
+                    def dispatch_keyspace_failure(reservation):
                         log.warning(
                             "Failed setting keyspace for pool after "
                             "keyspace changed during connect: %s",
                             errors_returned)
                         if on_add_reconnection is None:
-                            self.cluster.on_down(host, is_host_addition)
+                            self.cluster.on_down(
+                                host, is_host_addition, _pool_failure=reservation)
                         else:
                             self.cluster.on_down(
                                 host, is_host_addition,
                                 expect_host_to_be_down=True,
-                                on_add_reconnection=on_add_reconnection)
+                                on_add_reconnection=on_add_reconnection,
+                                _pool_failure=reservation)
 
                     try:
                         return self._handle_pool_creation_failure(
