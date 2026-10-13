@@ -878,3 +878,48 @@ def test_removal_cancels_detached_reconnector_even_if_shutdown_wins(topology):
     host.get_and_set_reconnection_handler = take_then_shutdown
     cluster.remove_host(host, refresh_nodes=False)
     handler.cancel.assert_called_once_with()
+
+
+def test_down_is_queued_before_executor_handoff(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    cluster._discount_down_events = False
+    cluster.control_connection.on_down = Mock()
+    cluster.control_connection.on_up = Mock()
+    original_submit = cluster.executor.submit
+    scheduled = []
+
+    def delayed_submit(fn, *args, **kwargs):
+        scheduled.append((fn, args, kwargs))
+        return Future()
+
+    cluster.executor.submit = delayed_submit
+    order = []
+    cluster.profile_manager.on_down.side_effect = lambda _: order.append('down')
+    cluster.profile_manager.on_up.side_effect = lambda _: order.append('up')
+    try:
+        assert cluster.on_down(host, False)
+        assert order == []
+        cluster.on_up(host)
+        assert order == ['down', 'up']
+        for fn, args, kwargs in scheduled:
+            fn(*args, **kwargs)
+        assert order == ['down', 'up']
+        assert host.is_up
+    finally:
+        cluster.executor.submit = original_submit
+
+
+def test_rejected_executor_handoff_removes_queued_down(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    cluster._discount_down_events = False
+    original_submit = cluster.executor.submit
+    cluster.executor.submit = Mock(side_effect=RuntimeError('executor stopped'))
+    try:
+        assert not cluster.on_down(host, False)
+        assert not host._currently_handling_node_down
+        cluster._lifecycle.drain()
+        cluster.profile_manager.on_down.assert_not_called()
+    finally:
+        cluster.executor.submit = original_submit

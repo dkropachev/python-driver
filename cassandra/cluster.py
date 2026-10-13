@@ -289,6 +289,45 @@ class _LifecycleCoordinator:
                 host._down_event_generation += 1
                 return host._down_event_generation, not was_up and not expect_down
 
+    def dispatch_down(self, host, is_host_addition, connected, expect_host_to_be_down,
+                      on_add_reconnection, pool_failure=None):
+        # Publish DOWN state and FIFO admission together. Do not drain on
+        # this caller; the executor (or another drainer) owns delivery.
+        with self.transaction(drain=False):
+            admission = self.begin_down(
+                host, connected=connected, expect_down=expect_host_to_be_down,
+                pool_failure=pool_failure)
+            if admission is None:
+                return False
+            down_event_generation, restart_reconnector = admission
+
+            if restart_reconnector:
+                if on_add_reconnection is None:
+                    future = self._cluster._restart_reconnector(
+                        host, is_host_addition, down_event_generation)
+                else:
+                    future = self._cluster._restart_reconnector(
+                        host, is_host_addition, down_event_generation,
+                        on_add_reconnection=on_add_reconnection)
+                if future is None:
+                    self.finish_down(host, down_event_generation)
+                # Restarting the host reconnector does not dispatch the DOWN
+                # callbacks that reconnect the control connection.
+                return False
+
+            log.warning("Host %s has been marked down", host)
+
+            if on_add_reconnection is None:
+                future = self._cluster.on_down_potentially_blocking(
+                    host, is_host_addition, down_event_generation)
+            else:
+                future = self._cluster.on_down_potentially_blocking(
+                    host, is_host_addition, down_event_generation,
+                    on_add_reconnection=on_add_reconnection)
+            if future is None:
+                self.finish_down(host, down_event_generation)
+            return future is not None
+
     @staticmethod
     def finish_down(host, generation):
         with host.lock:
@@ -308,7 +347,7 @@ class _LifecycleCoordinator:
             return host.get_and_set_reconnection_handler(None)
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, drain=True):
         try:
             with self._lock:
                 self._local.depth = getattr(self._local, 'depth', 0) + 1
@@ -317,7 +356,7 @@ class _LifecycleCoordinator:
                 finally:
                     self._local.depth -= 1
         finally:
-            if not getattr(self._local, 'depth', 0):
+            if drain and not getattr(self._local, 'depth', 0):
                 self.drain()
 
     def reserve_refresh(self, force_token_rebuild=False):
@@ -350,6 +389,31 @@ class _LifecycleCoordinator:
             self._events.append(partial(callback, *args, **kwargs))
         if not getattr(self._local, 'depth', 0):
             self.drain()
+
+    def submit_async(self, executor, callback, *args, **kwargs):
+        """Queue before executor handoff so later notifications cannot overtake."""
+        event = partial(callback, *args, **kwargs)
+        with self._lock:
+            if self.closed:
+                return None
+            self._events.append(event)
+        try:
+            return executor.submit(self.drain)
+        except Exception:
+            log.exception("Failed to schedule host lifecycle notifications")
+            # If no drainer has claimed this event, failed handoff cancels
+            # admission. Otherwise a concurrent submit already delivered it.
+            with self._lock:
+                try:
+                    self._events.remove(event)
+                except ValueError:
+                    if self.closed:
+                        return None
+                else:
+                    return None
+            completed = Future()
+            completed.set_result(None)
+            return completed
 
     def is_current(self, host):
         """Check that this exact, nonterminal Host owns its metadata entry."""
@@ -599,6 +663,7 @@ def _lifecycle_event(method):
     @wraps(method)
     def dispatch(self, *args, **kwargs):
         return self._lifecycle.submit(method, self, *args, **kwargs)
+    dispatch._lifecycle_method = method
     return dispatch
 
 
@@ -824,7 +889,14 @@ def run_in_executor(f):
         if self.is_shutdown:
             return
         try:
-            future = self.executor.submit(f, self, *args, **kwargs)
+            lifecycle_method = getattr(f, '_lifecycle_method', None)
+            if lifecycle_method is not None:
+                future = self._lifecycle.submit_async(
+                    self.executor, lifecycle_method, self, *args, **kwargs)
+                if future is None:
+                    return None
+            else:
+                future = self.executor.submit(f, self, *args, **kwargs)
             future.add_done_callback(_future_completed)
             return future
         except Exception:
@@ -3052,39 +3124,9 @@ class Cluster(object):
                 if pool_state:
                     connected |= pool_state['open_count'] > 0
 
-        admission = self._lifecycle.begin_down(
-            host, connected=connected, expect_down=expect_host_to_be_down,
-            pool_failure=_pool_failure)
-        if admission is None:
-            return False
-        down_event_generation, restart_reconnector = admission
-
-        if restart_reconnector:
-            if on_add_reconnection is None:
-                future = self._restart_reconnector(
-                    host, is_host_addition, down_event_generation)
-            else:
-                future = self._restart_reconnector(
-                    host, is_host_addition, down_event_generation,
-                    on_add_reconnection=on_add_reconnection)
-            if future is None:
-                self._lifecycle.finish_down(host, down_event_generation)
-            # Restarting the host reconnector does not dispatch the DOWN
-            # callbacks that reconnect the control connection.
-            return False
-
-        log.warning("Host %s has been marked down", host)
-
-        if on_add_reconnection is None:
-            future = self.on_down_potentially_blocking(
-                host, is_host_addition, down_event_generation)
-        else:
-            future = self.on_down_potentially_blocking(
-                host, is_host_addition, down_event_generation,
-                on_add_reconnection=on_add_reconnection)
-        if future is None:
-            self._lifecycle.finish_down(host, down_event_generation)
-        return future is not None
+        return self._lifecycle.dispatch_down(
+            host, is_host_addition, connected, expect_host_to_be_down,
+            on_add_reconnection, _pool_failure)
 
     def on_add(self, host, refresh_nodes=True,
                reconcile_pools_on_failure=False,
