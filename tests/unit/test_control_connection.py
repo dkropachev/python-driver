@@ -164,7 +164,7 @@ class MockCluster(object):
     is_shutdown = False
 
     def __init__(self):
-        self._lifecycle = _LifecycleCoordinator()
+        self._lifecycle = _LifecycleCoordinator(self)
         self.metadata = MockMetadata()
         self.sessions = []
         self.added_hosts = []

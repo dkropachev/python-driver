@@ -360,3 +360,47 @@ def test_repeated_location_destination_keeps_latest_reservation(topology):
             assert control._update_location_info(host, dc, 'rack1')
     assert host.datacenter == 'dc3'
     assert host._pending_location is None
+
+
+@pytest.mark.parametrize('deferred', [False, True])
+def test_notification_submission_never_returns_callback_result(deferred):
+    coordinator = _LifecycleCoordinator()
+    observed = []
+
+    def callback():
+        observed.append('delivered')
+        return 'not a synchronous result'
+
+    if deferred:
+        with coordinator.transaction():
+            assert coordinator.submit(callback) is None
+            assert observed == []
+    else:
+        assert coordinator.submit(callback) is None
+    assert observed == ['delivered']
+
+
+def test_queued_addition_checks_identity_at_delivery(topology):
+    cluster, _ = topology
+    old = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    callback = Mock()
+    with cluster._lifecycle.transaction():
+        cluster._lifecycle.submit_current(old, callback)
+        replacement = cluster.replace_host_endpoint(
+            old, DefaultEndPoint('192.168.1.9'))
+        assert replacement.host_id == old.host_id
+        assert old._is_removed
+    callback.assert_not_called()
+    assert cluster.metadata.get_host_by_host_id(old.host_id) is replacement
+
+
+def test_retirement_during_readiness_reset_cannot_mark_host_ready(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    cluster._lifecycle.reserve_addition(host)
+    host.conviction_policy.reset = Mock(
+        side_effect=lambda: cluster.remove_host(host))
+    assert not cluster._lifecycle.mark_ready(host)
+    assert host._is_removed
+    assert not host.is_up
+    assert host._lifecycle_pending
