@@ -403,4 +403,173 @@ def test_retirement_during_readiness_reset_cannot_mark_host_ready(topology):
     assert not cluster._lifecycle.mark_ready(host)
     assert host._is_removed
     assert not host.is_up
-    assert host._lifecycle_pending
+    assert not host._lifecycle_pending
+
+
+@pytest.mark.parametrize('event', ['location', 'up', 'down', 'add'])
+def test_shutdown_discards_pending_notifications(topology, event):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    original_location = (host.datacenter, host.rack)
+    host.set_down()
+    with cluster._lifecycle.transaction():
+        if event == 'location':
+            cluster._lifecycle.update_location(host, 'later_dc', 'later_rack')
+        elif event == 'up':
+            cluster.on_up(host)
+        elif event == 'down':
+            Cluster.on_down_potentially_blocking.__wrapped__(
+                cluster, host, False, host._down_event_generation)
+        else:
+            cluster.on_add(host)
+        cluster.shutdown()
+    cluster.profile_manager.on_up.assert_not_called()
+    cluster.profile_manager.on_down.assert_not_called()
+    cluster.profile_manager.on_add.assert_not_called()
+    assert (host.datacenter, host.rack) == original_location
+    assert host._pending_location is None
+    assert not host._lifecycle_pending
+    assert not cluster._lifecycle._events
+    callback = Mock()
+    cluster._lifecycle.submit(callback)
+    callback.assert_not_called()
+
+
+def test_shutdown_from_executor_listener_does_not_join_itself(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    listener = Mock()
+    listener.on_up.side_effect = lambda _: cluster.shutdown()
+    cluster.register_listener(listener)
+    result = Future()
+    result.set_result(True)
+    finished = cluster.executor.submit(
+        cluster._on_up_future_completed, host, {result}, [], Lock(), result)
+    finished.result(timeout=5)
+    assert cluster.is_shutdown
+    assert cluster._lifecycle.closed
+    assert not host._currently_handling_node_up
+    listener.on_up.assert_called_once_with(host)
+
+
+def test_location_listener_shutdown_stops_location_publication(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    original_location = (host.datacenter, host.rack)
+    cluster.profile_manager.on_down.side_effect = lambda _: cluster.shutdown()
+    cluster._lifecycle.update_location(host, 'later_dc', 'later_rack')
+    assert (host.datacenter, host.rack) == original_location
+    cluster.profile_manager.on_up.assert_not_called()
+    assert host._pending_location is None
+
+
+def test_late_up_pool_completion_after_shutdown_is_discarded(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    host.set_down()
+    session = Mock()
+    pool_ready = Future()
+    session.add_or_renew_pool.return_value = pool_ready
+    cluster.sessions.add(session)
+    listener = Mock()
+    cluster.register_listener(listener)
+    cluster.on_up(host)
+    assert host._currently_handling_node_up
+    cluster.shutdown()
+    pool_ready.set_result(True)
+    listener.on_up.assert_not_called()
+    assert not host.is_up
+    assert not host._currently_handling_node_up
+    session.update_created_pools.assert_not_called()
+
+
+def test_repeated_retirement_delivers_removal_once(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    listener = Mock()
+    cluster.register_listener(listener)
+    with cluster._lifecycle.transaction():
+        cluster.remove_host(host, refresh_nodes=False)
+        cluster.on_remove(host, refresh_nodes=False)
+        cluster.remove_host(host, refresh_nodes=False)
+    listener.on_remove.assert_called_once_with(host)
+    assert host._is_removed
+    assert not host._lifecycle_pending
+
+
+def test_shutdown_cancels_retired_reconnector_before_queued_removal(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    handler = Mock()
+    host._reconnection_handler = handler
+    with cluster._lifecycle.transaction():
+        cluster.remove_host(host, refresh_nodes=False)
+        cluster.shutdown()
+    handler.cancel.assert_called_once_with()
+    assert host._reconnection_handler is None
+
+
+def test_close_does_not_wait_for_active_notification():
+    coordinator = _LifecycleCoordinator()
+    entered = Event()
+    release = Event()
+    later = Mock()
+
+    def callback():
+        entered.set()
+        assert release.wait(5)
+        coordinator.submit(later)
+
+    worker = Thread(target=coordinator.submit, args=(callback,))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        coordinator.submit(later)
+        coordinator.close()
+        assert worker.is_alive()
+        assert coordinator.closed
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    later.assert_not_called()
+
+
+def test_refresh_result_after_shutdown_cannot_publish(topology):
+    cluster, connection = topology
+    queried = Event()
+    release = Event()
+    old_query = connection.wait_for_responses.side_effect
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    del connection.peer_results[1][1]
+    result = _node_meta_results(connection.local_results, connection.peer_results)
+
+    def query(*args, **kwargs):
+        queried.set()
+        assert release.wait(5)
+        return result
+
+    connection.wait_for_responses.side_effect = query
+    worker = Thread(target=cluster.refresh_nodes)
+    worker.start()
+    try:
+        assert queried.wait(5)
+        cluster.shutdown()
+    finally:
+        release.set()
+        worker.join(5)
+        connection.wait_for_responses.side_effect = old_query
+    assert not worker.is_alive()
+    assert cluster.metadata.get_host_by_host_id(host.host_id) is host
+    cluster.profile_manager.on_remove.assert_not_called()
+
+
+def test_policy_shutdown_prevents_remaining_up_work(topology):
+    cluster, _ = topology
+    host = cluster.metadata.get_host_by_host_id(HOST_ID_3)
+    host.set_down()
+    cluster.profile_manager.distance.side_effect = lambda _: (cluster.shutdown() or 0)
+    cluster.on_up(host)
+    cluster._prepare_all_queries.assert_not_called()
+    cluster.profile_manager.on_up.assert_not_called()
+    assert not host._currently_handling_node_up

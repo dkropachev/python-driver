@@ -262,3 +262,11 @@ logged and do not strand the notification queue.
 Topology queries can overlap. A snapshot older than a newer accepted refresh
 is discarded instead of overwriting the newer topology. This orders client
 refresh requests; it does not establish a server-side topology version.
+
+Shutdown closes lifecycle admission and discards queued notifications without
+waiting for an active listener to finish. A listener can call ``shutdown()``
+from a cluster executor thread without joining itself. Already-admitted user
+callbacks may finish, but later notifications, refresh publication and late
+pool-completion callbacks cannot restart the closed lifecycle. Pending addition
+and location reservations are cleared, and current or retired host reconnectors
+are cancelled.
